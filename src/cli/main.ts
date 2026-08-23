@@ -2327,7 +2327,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
       investigationWorker: sharedInvestigationWorkers.investigationWorker,
       materializeExecution: phase2MaterializeExecution,
       settleInvestigation: async ({ investigation, result, signal: settleSignal, assertActive }) => {
-        if (result.outcome !== "invalid" && result.outcome !== "decompose") return;
+        if (result.outcome !== "invalid" && result.outcome !== "decompose" && result.outcome !== "decomposed") return;
         assertActive?.();
         if (settleSignal?.aborted) throw settleSignal.reason ?? new Error("Investigation settlement cancelled");
         const subject = { repo: repository.repo, issue: investigation.issue };

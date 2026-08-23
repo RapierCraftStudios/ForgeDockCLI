@@ -215,7 +215,7 @@ export function createInvestigationFirstWorkers(
     }
     const nextInvestigationItems: ScheduledWorkItem[] = [];
     const decompositionReplacements: { parentNodeId: string; childIssues: number[]; childNodeIds: string[] }[] = [];
-    for (const entry of allInvestigations.filter((candidate) => candidate.wave === orchestration.investigationWave && candidate.outcome === "decompose")) {
+    for (const entry of allInvestigations.filter((candidate) => candidate.wave === orchestration.investigationWave && (candidate.outcome === "decompose" || candidate.outcome === "decomposed"))) {
       assertMaterializationActive();
       const parent = orchestration.nodes.find((node) => node.id === entry.nodeId);
       if (!parent) throw new Error(`Decomposition parent ${entry.nodeId} is missing from the durable investigation set`);

@@ -3172,7 +3172,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         investigationWorker: tuiInvestigationWorker,
         materializeExecution: tuiMaterializeExecution,
         settleInvestigation: async ({ investigation, result, signal: settleSignal, assertActive }) => {
-          if (result.outcome !== "invalid" && result.outcome !== "decompose") return;
+          if (result.outcome !== "invalid" && result.outcome !== "decompose" && result.outcome !== "decomposed") return;
           assertActive?.();
           if (settleSignal?.aborted) throw settleSignal.reason ?? new Error("Investigation settlement cancelled");
           const investigationRepository = schedule.items.find((item) => item.id === investigation.nodeId)?.repository ?? readyRepository.repo;
@@ -4169,7 +4169,7 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord,
   }, items) : undefined;
   const resumedSettleInvestigation: NonNullable<VisibleDagInput["settleInvestigation"]> | undefined = resumedStore && resumedInvestigationRuntime
     ? async ({ investigation, result, signal: settleSignal, assertActive }) => {
-        if (result.outcome !== "invalid" && result.outcome !== "decompose") return;
+        if (result.outcome !== "invalid" && result.outcome !== "decompose" && result.outcome !== "decomposed") return;
         assertActive?.();
         if (settleSignal?.aborted) throw settleSignal.reason ?? new Error("Investigation settlement cancelled");
         const investigationRepository = record.nodes.find((node) => node.id === investigation.nodeId)?.repository ?? record.repository;

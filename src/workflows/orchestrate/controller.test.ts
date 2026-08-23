@@ -1825,5 +1825,53 @@ describe("OrchestrationController", () => {
     assert.equal(materialized, true);
     assert.deepEqual(executed, ["issue-1", "issue-2"]);
     assert.deepEqual(result.record.investigations?.map((entry) => entry.baseSha), ["a".repeat(40), "a".repeat(40)]);
+    assert.ok(result.record.investigations?.every((entry) => entry.settlementReceipt?.outcome === "confirmed"));
+  });
+
+  it("records configured investigation exhaustion without admitting materialization", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    let materialized = false;
+    const service = controller(repository, async () => undefined, {
+      investigationMaxAttempts: 1,
+      investigationWorker: async () => {
+        throw new ExternalOperationRetryError("investigation unavailable", {
+          attempts: 1,
+          failures: [new Error("503")],
+          classification: { kind: "http", status: 503 },
+          cause: new Error("503"),
+        });
+      },
+      materializeExecution: async () => { materialized = true; return { items: [item("one", 1)] }; },
+    });
+    await assert.rejects(service.createAndRun({ repository: "owner/repo", maxParallel: 1, investigationFirst: true, items: [item("one", 1)] }));
+    const failed = await repository.loadOrchestration("dag-test");
+    assert.equal(materialized, false);
+    assert.equal(failed?.investigations?.[0]?.status, "failed");
+    assert.equal(failed?.investigations?.[0]?.settlementStatus, "failed");
+  });
+
+  it("durably cancels an active investigation and never admits phase two", async () => {
+    const repository = new RecordingOrchestrationRepository();
+    const started = deferred<void>();
+    let materialized = false;
+    const service = controller(repository, async () => undefined, {
+      investigationWorker: async (_item, context) => {
+        started.resolve();
+        await new Promise<never>((_resolve, reject) => {
+          context.signal?.addEventListener("abort", () => reject(context.signal?.reason ?? new Error("cancelled")), { once: true });
+        });
+        return { outcome: "confirmed" as const };
+      },
+      materializeExecution: async () => { materialized = true; return { items: [item("one", 1)] }; },
+    });
+    const running = service.createAndRun({ repository: "owner/repo", maxParallel: 1, investigationFirst: true, items: [item("one", 1)] });
+    await started.promise;
+    service.requestStop("dag-test", true);
+    await assert.rejects(running);
+    const cancelled = await repository.loadOrchestration("dag-test");
+    assert.equal(materialized, false);
+    assert.equal(cancelled?.status, "cancelled");
+    assert.equal(cancelled?.investigations?.[0]?.status, "cancelled");
+    assert.equal(cancelled?.investigations?.[0]?.settlementStatus, "cancelled");
   });
 });

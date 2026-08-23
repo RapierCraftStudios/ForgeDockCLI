@@ -40,29 +40,84 @@ export type OrchestrationRecoveryMode = "initial" | "resume" | "relaunch" | "rea
 /** Durable phases for the investigation-first native orchestrator. */
 export type OrchestrationPhase = "investigating" | "executing";
 
-export type OrchestrationInvestigationOutcome = "confirmed" | "invalid" | "decompose";
+/** Durable semantic settlement values. `decompose` is accepted only as a legacy worker/storage value. */
+export type OrchestrationInvestigationOutcome = "confirmed" | "invalid" | "decomposed" | "failed" | "retrying";
+export type LegacyOrchestrationInvestigationOutcome = OrchestrationInvestigationOutcome | "decompose";
+export type OrchestrationInvestigationSettlementStatus = OrchestrationInvestigationOutcome | "cancelled" | "interrupted";
+
+export interface OrchestrationInvestigationReceipt {
+  /** Stable identity used to recover a side effect that completed before a crash. */
+  receiptId: string;
+  outcome: OrchestrationInvestigationOutcome;
+  recordedAt: string;
+  claimId?: string;
+  childIssues?: number[];
+}
 
 export interface OrchestrationInvestigationRecord {
   issue: number;
   nodeId: string;
-  /** Exact durable run and artifact identities for settlement scoping. */
+  /** Exact durable repository/route/run/artifact identities for settlement scoping. */
+  repository?: string;
   runId?: string;
   investigationArtifactId?: string;
   wave: number;
   baseSha?: string;
   targetBranch?: string;
   lane?: "fast" | "feature";
-  status: "queued" | "running" | "completed" | "failed" | "cancelled";
-  outcome?: OrchestrationInvestigationOutcome;
+  /** Worker lifecycle is operational; settlementStatus is the semantic barrier state. */
+  status: "queued" | "running" | "retrying" | "completed" | "failed" | "cancelled" | "interrupted";
+  outcome?: LegacyOrchestrationInvestigationOutcome;
+  settlementStatus?: OrchestrationInvestigationSettlementStatus;
   evidence?: OrchestrationPlanMetadata;
   attemptCount: number;
+  retryAttempt?: number;
+  retryMaxAttempts?: number;
+  retryNextAt?: string;
+  retryAfterMs?: number;
+  retryDomain?: string;
+  retryCode?: string;
+  retryError?: string;
   startedAt?: string;
   completedAt?: string;
   /** Idempotent controller settlement receipt, written after semantic side effects succeed. */
   settledAt?: string;
-  settlementOutcome?: OrchestrationInvestigationOutcome;
+  settlementOutcome?: LegacyOrchestrationInvestigationOutcome;
   settlementChildIssues?: number[];
+  settlementReceipt?: OrchestrationInvestigationReceipt;
+  cancellationState?: "cancelled" | "interrupted";
   error?: string;
+}
+
+/** Normalize additive investigation fields at every resume boundary. */
+export function normalizeOrchestrationInvestigationRecord(
+  input: OrchestrationInvestigationRecord,
+): OrchestrationInvestigationRecord {
+  const outcome = input.outcome === "decompose" ? "decomposed" as const : input.outcome;
+  const settlementOutcome = input.settlementOutcome === "decompose" ? "decomposed" as const : input.settlementOutcome;
+  return {
+    ...structuredClone(input),
+    ...(outcome !== undefined ? { outcome } : {}),
+    ...(settlementOutcome !== undefined ? { settlementOutcome } : {}),
+    ...(input.settlementStatus === undefined && input.settledAt !== undefined && settlementOutcome !== undefined
+      ? { settlementStatus: settlementOutcome } : {}),
+    ...(input.settlementReceipt === undefined && input.settledAt !== undefined && settlementOutcome !== undefined
+      ? { settlementReceipt: {
+          receiptId: `${input.nodeId}:${input.wave}:${settlementOutcome}`,
+          outcome: settlementOutcome,
+          recordedAt: input.settledAt,
+          ...(input.settlementChildIssues !== undefined ? { childIssues: [...input.settlementChildIssues] } : {}),
+        } } : {}),
+  };
+}
+
+export function normalizeOrchestrationRecord(input: OrchestrationRecord): OrchestrationRecord {
+  return {
+    ...structuredClone(input),
+    ...(input.investigations !== undefined
+      ? { investigations: input.investigations.map(normalizeOrchestrationInvestigationRecord) }
+      : {}),
+  };
 }
 
 export interface OrchestrationShadowContractionProposal {

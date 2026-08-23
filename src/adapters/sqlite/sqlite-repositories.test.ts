@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
-import { OrchestrationIssueOwnershipConflictError, type OrchestrationRecord } from "../../core/ports/orchestration.js";
+import { OrchestrationIssueOwnershipConflictError, normalizeOrchestrationRecord, type OrchestrationRecord } from "../../core/ports/orchestration.js";
 import { ConcurrentPromotionUpdateError, type PromotionRecord } from "../../core/ports/promotion.js";
 import { ConcurrentRunUpdateError } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt } from "../../core/ports/telemetry.js";
@@ -272,6 +272,41 @@ describe("SQLite operational repositories", () => {
       const completed = { ...record, status: "completed" as const, updatedAt: "2026-01-01T00:01:00.000Z" };
       await store.saveOrchestration(completed);
       assert.equal((await store.listOrchestrations())[0]?.status, "completed");
+    } finally {
+      store.close();
+    }
+  });
+
+  it("round-trips additive investigation settlement fields and normalizes legacy decompose on resume", async () => {
+    const store = new SqliteRepositories(":memory:");
+    const record: OrchestrationRecord = {
+      schema: "forgedock.orchestration/v1",
+      orchestrationId: "dag_legacy_investigation",
+      repository: "a/b",
+      issueNumbers: [9],
+      maxParallel: 1,
+      autoMerge: true,
+      status: "running",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      nodes: [{ id: "issue-9", issue: 9, priority: 1, dependencies: [], claims: [], status: "completed", childRunIds: [] }],
+      phase: "investigating",
+      investigationWave: 1,
+      investigations: [{
+        issue: 9, nodeId: "issue-9", wave: 1, status: "completed", outcome: "decompose",
+        attemptCount: 1, settledAt: "2026-01-01T00:00:01.000Z", settlementOutcome: "decompose",
+        retryAttempt: 1, retryMaxAttempts: 2,
+      }],
+      investigationBarrier: { expected: 1, completed: 1, startedAt: "2026-01-01T00:00:00.000Z" },
+    };
+    try {
+      await store.createOrchestration(record);
+      const loaded = await store.loadOrchestration(record.orchestrationId);
+      assert.equal(loaded?.investigations?.[0]?.outcome, "decompose");
+      const normalized = normalizeOrchestrationRecord(loaded!);
+      assert.equal(normalized.investigations?.[0]?.outcome, "decomposed");
+      assert.equal(normalized.investigations?.[0]?.settlementReceipt?.outcome, "decomposed");
+      assert.equal(normalized.investigations?.[0]?.retryMaxAttempts, 2);
     } finally {
       store.close();
     }
