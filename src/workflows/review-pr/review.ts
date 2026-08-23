@@ -788,6 +788,13 @@ export async function reviewPullRequest(
       remediationDeltaHunks,
       changedRemediationAuthorityReferences,
     });
+    // Source verification may downgrade an otherwise current blocker to an
+    // advisory finding. Capture eligibility before that downgrade: findings
+    // already rejected or moved to follow-up scope must never block merely
+    // because they also lack an exact source anchor.
+    const sourceVerificationCandidates = new Set(prefiltered
+      .filter((finding) => finding.scopeDisposition === "in_scope" && (finding.mustFix ?? finding.blocking))
+      .map((finding) => finding.id));
     const sourceVerified = await verifyFindingSourceAnchors(prefiltered, {
       reviewedHeadSha: frozen.headSha,
       changedPaths,
@@ -795,17 +802,6 @@ export async function reviewPullRequest(
       ...(input.readExactBlob ? { readBlob: input.readExactBlob } : {}),
       verifiedAuthorityReferences,
     });
-    const rawSourceVerified = await verifyFindingSourceAnchors(
-      reviewerResults.flatMap((result) => result.output.findings),
-      {
-        reviewedHeadSha: frozen.headSha,
-        changedPaths,
-        expectedPaths: input.packet.payload.expectedPaths,
-        ...(input.readExactBlob ? { readBlob: input.readExactBlob } : {}),
-        verifiedAuthorityReferences,
-      },
-    );
-    const unverifiedRawSourceClaim = rawSourceVerified.some(isUnverifiedSourceFinding);
     const adjudicationCandidates = sourceVerified.filter((finding) => finding.confidence !== "low"
       && finding.scopeDisposition === "in_scope"
       && (finding.mustFix ?? finding.blocking));
@@ -873,10 +869,10 @@ export async function reviewPullRequest(
         ...(priorRootLedger ? { supersedes: priorRootLedger.id } : {}),
       },
     });
-    const unverifiedSourceFindings = scopedFindings.some(isUnverifiedSourceFinding);
+    const unverifiedSourceFindings = scopedFindings.some((finding) => sourceVerificationCandidates.has(finding.id) && isUnverifiedSourceFinding(finding));
     // Missing/stale source proof is a review admission failure, not a
     // remediation obligation: retain the finding as advisory but block closure.
-    const disposition = unverifiedSourceFindings || unverifiedRawSourceClaim
+    const disposition = unverifiedSourceFindings
       ? "blocked" as const
       : openFindings.some((finding) => finding.mustFix ?? finding.blocking) ? "request_changes" as const : "approve" as const;
     const finalSnapshot = await dependencies.host.getPullRequest(frozen.repo, frozen.number);
@@ -891,8 +887,9 @@ export async function reviewPullRequest(
       || findingIssuePolicy === "impact-gated"
       || findingIssuePolicy === "shadow-impact-gated"
       || (findingIssuePolicy === "approved-only" && disposition === "approve");
-    const candidateProjectionFindings = terminalReviewFindings(findings);
-    const impactGatedFindings = terminalReviewFindings(findings, "impact-gated");
+    const projectionFindings = findings.filter((finding) => !isUnverifiedSourceFinding(finding));
+    const candidateProjectionFindings = terminalReviewFindings(projectionFindings);
+    const impactGatedFindings = terminalReviewFindings(projectionFindings, "impact-gated");
     const projectionMode: FindingProjectionMode = findingIssuePolicy === "impact-gated" ? "impact-gated" : "all";
     const activeProjectionFindings = projectionEnabled
       ? findingIssuePolicy === "impact-gated" ? impactGatedFindings : candidateProjectionFindings

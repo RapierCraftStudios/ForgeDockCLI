@@ -2295,6 +2295,7 @@ async function continueBuildDelivery(
     run = reviewed.run;
     verdict = reviewed.verdict;
     priorVerdict = verdict;
+    if (isTerminalReviewCheckpoint(run, verdict)) return { run, pullRequest };
     const scopeViolation = blockingFindingOutsidePacket(
       verdict, input.packet, undefined, input.scopeExpansion === "recursive",
     );
@@ -2719,6 +2720,7 @@ export async function resumeReviewWorkOn(
       });
       run = reassessed.run;
       verdict = reassessed.verdict;
+      if (isTerminalReviewCheckpoint(run, verdict)) return { run, pullRequest };
       const scopeViolation = blockingFindingOutsidePacket(
         verdict, input.packet, undefined, input.scopeExpansion === "recursive",
       );
@@ -2971,6 +2973,9 @@ export async function resumeExpandedReviewWorkOn(
     runs: dependencies.runs,
     ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
   });
+  if (isTerminalReviewCheckpoint(reviewed.run, reviewed.verdict)) {
+    return { run: reviewed.run, pullRequest: input.pullRequest };
+  }
   const expandedViolation = blockingFindingOutsidePacket(
     reviewed.verdict, input.packet, input.checkpoint, input.scopeExpansion === "recursive",
   );
@@ -3099,6 +3104,7 @@ export async function resumePublicationWorkOn(
       run = resumedProjectionReview.run;
       verdict = resumedProjectionReview.verdict;
       priorVerdict = verdict;
+      if (isTerminalReviewCheckpoint(run, verdict)) return { run, pullRequest };
     }
     while (true) {
       if (resumedProjectionReview) {
@@ -3515,6 +3521,13 @@ export async function resumeConflictRecoveryWorkOn(
   }
 }
 
+function isTerminalReviewCheckpoint(
+  run: RunState,
+  verdict: DurableArtifact<"ReviewVerdict">,
+): boolean {
+  return run.state === "blocked" || verdict.payload.disposition === "blocked";
+}
+
 function blockingFindingOutsidePacket(
   verdict: DurableArtifact<"ReviewVerdict">,
   packet: DurableArtifact<"BuildPacket">,
@@ -3668,6 +3681,7 @@ async function blockForScopeViolation(
   options: ScopeExpansionOptions,
   dependencies: WorkOnDependencies,
 ): Promise<RunState> {
+  if (run.state === "blocked" || verdict.payload.disposition === "blocked") return run;
   if (options.scopeExpansion === "recursive") {
     return blockForRecursiveRemediation(run, pullRequest, packet, verdict, dependencies, {
       ...(options.remediationDepth !== undefined ? { depth: options.remediationDepth } : {}),
@@ -3737,6 +3751,7 @@ async function blockForReviewFindings(
 }
 
 async function blockForBudget(run: RunState, dependencies: WorkOnDependencies, reason: string): Promise<RunState> {
+  if (run.state === "blocked") return run;
   const outcome = createArtifact({
     kind: "Outcome", runId: run.runId, subject: run.subject,
     producer: { role: "controller", runtime: "forgedock" },

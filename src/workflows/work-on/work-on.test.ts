@@ -1657,6 +1657,7 @@ describe("complete work-on trajectory", () => {
     const finding = {
       id: "correctness-resume", causalRoot: "guard misses an accepted case", severity: "high" as const, confidence: "high" as const, blocking: true,
       title: "Guard is incomplete", evidence: "The accepted path still misses one case", location: "src/a.js:1",
+      sourceSnapshot: { reviewedHeadSha: sha, path: "src/a.js", excerpt: "guard()" },
       intentRelevance: "The guard must cover the accepted behavior", remediation: "Complete the guard in src/a.js",
     };
     const priorVerdict = createArtifact({
@@ -1745,8 +1746,7 @@ describe("complete work-on trajectory", () => {
       verification: [targetedTestVerification],
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
 
-    assert.equal(resumed.run.state, "completed", "stale prior prose is advisory and cannot reopen remediation");
-    assert.equal(resumed.run.blockedReason, undefined);
+    assert.equal(resumed.run.state, "blocked", "stale unverified blocker is a terminal human checkpoint");
     assert.deepEqual(runtime.tasks.map((task) => task.role), ["reviewer"]);
   });
 
@@ -2001,8 +2001,7 @@ describe("complete work-on trajectory", () => {
       verification: [targetedTestVerification],
     }, { runtime: resumedRuntime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
 
-    assert.equal(resumed.run.state, "completed", "stale prior prose is advisory and cannot consume remediation budget");
-    assert.equal(resumed.run.blockedReason, undefined);
+    assert.equal(resumed.run.state, "blocked", "stale unverified blocker is a terminal human checkpoint");
     assert.deepEqual(resumedRuntime.tasks.map((task) => task.role), ["reviewer"]);
   });
 
