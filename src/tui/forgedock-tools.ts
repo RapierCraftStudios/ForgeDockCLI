@@ -1359,6 +1359,7 @@ interface ControllerTaskTransport {
 }
 
 type DagRecoveryMode = "initial" | "resume" | "rerun";
+type DagRecoveryResolution = DagRecoveryMode | { action: "skip"; runId: string; state: string } | { action: "block"; runId: string; reason: string };
 
 interface VisibleDagInput {
   /** Original operator-authorized scope; retained separately from contracted nodes. */
@@ -1396,7 +1397,7 @@ interface VisibleDagInput {
     serializationEdges?: readonly ClaimSerializationEdge[];
   } | undefined>;
   /** Reconcile explicit rerun admission against an existing durable subject run. */
-  resolveWorkerRecovery?: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode) => Promise<DagRecoveryMode>;
+  resolveWorkerRecovery?: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode) => Promise<DagRecoveryResolution>;
   taskFor: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode, adjudicationReason?: string, resolveConflict?: boolean) => { agent: string; task: string; cwd: string; model?: string };
   /** Optional direct typed-controller transport used by the live TUI. */
   controllerTaskFor?: (item: VisibleOrchestrationItem, recovery: DagRecoveryMode, adjudicationReason?: string, resolveConflict?: boolean) => ControllerTaskSpec;
@@ -1733,6 +1734,9 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         if (!params.resume) throw new Error("adjudicateVerification requires resume=true");
         args.push("--adjudicate-verification", params.adjudicateVerification);
       }
+      if (params.rerun) args.push("--rerun");
+      if (params.resume) args.push("--resume");
+      if (params.resolveConflict) args.push("--resolve-conflict");
       const background = params.background ?? process.env.PI_SUBAGENT_CHILD_AGENT !== "forgedock-issue-worker";
       return background
         ? runControllerToolBackground(pi, backgroundTasks, "work-on", args, ctx, options.controllerEntryPath)
@@ -3146,10 +3150,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           item,
           ...(childIssues !== undefined ? { childIssues } : {}),
         }),
-        resolveWorkerRecovery: async (item, recovery) => {
-          if (recovery !== "rerun" && !(rerun && recovery === "initial")) return recovery;
-          return admitExplicitRerunRecovery(item, "rerun", artifacts, readyRepository.repo);
-        },
+        resolveWorkerRecovery: async (item, recovery) => admitWorkerRecovery(item, rerun && recovery === "initial" ? "rerun" : recovery, artifacts, readyRepository.repo),
         taskFor: (item, recovery, adjudicationReason, resolveConflict) => {
           const policy = resolveIssueWorkerRecovery(item.labels, rerun, recovery);
           const itemRepository = item.repository ?? readyRepository.repo;
@@ -3974,29 +3975,48 @@ export function resolveIssueWorkerRecovery(
  * artifacts at dispatch time so native and Pi workers receive exactly one
  * recovery flag, including after a TUI rebuild.
  */
-export async function admitExplicitRerunRecovery(
+export async function admitWorkerRecovery(
   item: VisibleOrchestrationItem,
   recovery: DagRecoveryMode,
   artifacts: ArtifactRepository,
   repository: string,
-): Promise<DagRecoveryMode> {
-  if (recovery !== "rerun") return recovery;
+): Promise<DagRecoveryResolution> {
   const subjects = [...new Set([item.issue, ...(item.memberIssues ?? [])])];
-  let sawResume = false;
-  for (const issue of subjects) {
-    const decision = decideSubjectAdmission(
+  const decisions = await Promise.all(subjects.map(async (issue) => ({
+    issue,
+    decision: decideSubjectAdmission(
       await artifacts.list({ repo: item.repository ?? repository, issue }),
-      { rerun: true, ...(item.targetBranch !== undefined ? { currentTargetBranch: item.targetBranch } : {}) },
-    );
-    if (decision.action === "resume") {
-      sawResume = true;
-      continue;
-    }
-    if (decision.action === "start") continue;
-    throw new Error(`Cannot authorize explicit rerun for #${issue}: durable admission ${decision.action}${"reason" in decision ? ` (${decision.reason})` : ""}`);
+      {
+        // A rerun is only allowed to replace a terminal subject. For an
+        // in-flight subject, decideSubjectAdmission deliberately returns its
+        // typed checkpoint resume even when the parent recovery was rerun.
+        rerun: recovery === "rerun",
+        ...(item.targetBranch !== undefined ? { currentTargetBranch: item.targetBranch } : {}),
+      },
+    ),
+  })));
+  const blocked = decisions.find(({ decision }) => decision.action === "block");
+  if (blocked?.decision.action === "block") {
+    return { action: "block", runId: blocked.decision.runId, reason: `#${blocked.issue}: ${blocked.decision.reason}` };
   }
-  return sawResume ? "resume" : "rerun";
+  const actions = new Set(decisions.map(({ decision }) => decision.action));
+  if (actions.has("skip")) {
+    if (actions.size === 1) {
+      const first = decisions[0]!.decision;
+      if (first.action === "skip") return { action: "skip", runId: first.runId, state: first.state };
+    }
+    return { action: "block", runId: "composite", reason: "Composite work item has mixed terminal and runnable durable subjects" };
+  }
+  if (actions.size > 1) {
+    return { action: "block", runId: "composite", reason: "Composite work item has mixed durable admission decisions" };
+  }
+  if (actions.has("resume")) return "resume";
+  // A queued node can be reached while rebuilding a failed DAG without ever
+  // having launched a worker. It has no durable Intent, so it is a fresh
+  // semantic launch rather than an unsupported checkpoint resume.
+  return recovery === "rerun" ? "rerun" : "initial";
 }
+
 
 async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord, controllerEntryOverride?: string | null): Promise<VisibleDagInput> {
   if (!record) throw new Error("Durable orchestration record is required to rebuild a DAG");
@@ -4167,7 +4187,7 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord,
         ...(childIssues !== undefined ? { childIssues } : {}),
       });
     },
-    resolveWorkerRecovery: async (item, recovery) => admitExplicitRerunRecovery(item, recovery, artifacts, record.repository),
+    resolveWorkerRecovery: async (item, recovery) => admitWorkerRecovery(item, recovery, artifacts, record.repository),
     ...(resolveControllerEntry(controllerEntryOverride) !== undefined ? {
       controllerTaskFor: (item, recovery, adjudicationReason, resolveConflict) => {
         const policy = resolveIssueWorkerRecovery([], false, recovery);
@@ -4982,6 +5002,12 @@ export class VisibleDagDelegator {
         const resolvedRecovery = input.resolveWorkerRecovery
           ? await input.resolveWorkerRecovery(item, recovery)
           : recovery;
+        if (typeof resolvedRecovery !== "string") {
+          if (resolvedRecovery.action === "skip") {
+            return { status: "skipped", error: `#${item.issue} already has terminal durable run ${resolvedRecovery.runId} (${resolvedRecovery.state}); no duplicate worker launched` };
+          }
+          return { status: "blocked", error: resolvedRecovery.reason };
+        }
         const launchIdentity: OrchestrationTransportIdentity = {
           orchestrationId: stored.id,
           nodeId: item.id,

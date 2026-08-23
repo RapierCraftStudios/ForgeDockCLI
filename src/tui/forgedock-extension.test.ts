@@ -23,7 +23,7 @@ import forgedockExtension, { buildHarnessModePrompt, executeController, FORGEDOC
 import { NESTED_AGENT_BRIDGE_RESTART_REQUIRED } from "./background-tasks.js";
 import {
   bindOrchestrationInvocation,
-  admitExplicitRerunRecovery,
+  admitWorkerRecovery,
   buildOrchestrationPreviewCheckpointGuidance,
   buildOrchestrationPreviewConfirmationGuidance,
   buildNativeCommandPrompt,
@@ -2230,9 +2230,12 @@ test("explicit orchestration reruns admit recoverable runs as resume and termina
       { ...investigation, createdAt: "2026-01-01T00:03:00.000Z" },
     ],
   } as any;
-  const preparingRecovery = await admitExplicitRerunRecovery(item, "rerun", preparingArtifacts, "a/b");
+  const preparingRecovery = await admitWorkerRecovery(item, "initial", preparingArtifacts, "a/b");
   assert.equal(preparingRecovery, "resume");
+  if (preparingRecovery !== "resume") throw new Error("preparing recovery must resume");
   assert.deepEqual(resolveIssueWorkerRecovery([], false, preparingRecovery), { rerun: false, resume: true });
+  const freshRecovery = await admitWorkerRecovery(item, "resume", { list: async () => [] } as any, "a/b");
+  assert.equal(freshRecovery, "initial");
 
   const terminalRun = "run_terminal_509";
   const terminalIntent = createArtifact({
@@ -2243,9 +2246,12 @@ test("explicit orchestration reruns admit recoverable runs as resume and termina
     kind: "Outcome", runId: terminalRun, subject: { repo: "a/b", issue: 509 }, producer: { role: "controller" },
     payload: { status: "decomposed", reason: "already split", childIssues: [] },
   });
-  const terminalRecovery = await admitExplicitRerunRecovery(item, "rerun", { list: async () => [terminalIntent, terminal] } as any, "a/b");
+  const terminalRecovery = await admitWorkerRecovery(item, "rerun", { list: async () => [terminalIntent, terminal] } as any, "a/b");
   assert.equal(terminalRecovery, "rerun");
+  if (terminalRecovery !== "rerun") throw new Error("terminal rerun must launch fresh");
   assert.deepEqual(resolveIssueWorkerRecovery([], false, terminalRecovery), { rerun: true, resume: false });
+  const terminalSkip = await admitWorkerRecovery(item, "initial", { list: async () => [terminalIntent, terminal] } as any, "a/b");
+  assert.deepEqual(terminalSkip, { action: "skip", runId: terminalRun, state: "decomposed" });
 });
 
 
