@@ -3171,7 +3171,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         serializationEdges: schedule.edges,
         investigationFirst: true,
         investigationWorker: tuiInvestigationWorker,
-        packetWorker: hasDurableInvestigationRuns ? investigationWorkers.packetWorker : async (item, context) => ({ expectedPaths: item.affectedFiles ?? [], semanticDependencies: item.dependencies, baseSha: context.investigation.baseSha ?? "embedded-base" }),
+        ...(hasDurableInvestigationRuns ? { packetWorker: investigationWorkers.packetWorker } : {}),
         materializeExecution: tuiMaterializeExecution,
         settleInvestigation: async ({ investigation, result, signal: settleSignal, assertActive }) => {
           if (result.outcome !== "invalid" && result.outcome !== "decompose") return;

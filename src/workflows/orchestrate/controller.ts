@@ -865,7 +865,7 @@ export class OrchestrationController {
       orchestration: structuredClone(state.record),
       wave,
       investigations: latest.map((entry) => structuredClone(entry)),
-      ...(state.record.packets !== undefined ? { packets: structuredClone(state.record.packets) } : {}),
+      ...(this.dependencies.packetWorker && state.record.packets !== undefined ? { packets: structuredClone(state.record.packets) } : {}),
       ...(state.signal !== undefined ? { signal: state.signal } : {}),
       assertActive: assertInvestigationActive,
     });
