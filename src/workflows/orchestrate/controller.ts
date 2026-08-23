@@ -873,12 +873,18 @@ export class OrchestrationController {
     let nextItems = materialized.items.map(cloneScheduledItem);
     let nextEdges = (materialized.serializationEdges ?? materializeClaimDependencies(nextItems).edges).map(cloneSerializationEdge);
     if (this.dependencies.packetWorker && state.record.packets?.length) {
+      const confirmedPacketIds = new Set(nextItems.map((candidate) => candidate.id));
       const packetInputs = nextItems.map((item) => {
         const packet = state.record.packets?.find((candidate) => candidate.nodeId === item.id && candidate.status === "completed");
         if (!packet?.expectedPaths?.length || !packet.baseSha) throw new Error(`Packet barrier has no completed packet for ${item.id}`);
+        if (packet.semanticDependencies === undefined) throw new Error(`Packet ${item.id} lacks authoritative semantic dependency evidence`);
+        const semanticDependencies = [...new Set(packet.semanticDependencies)];
+        if (semanticDependencies.some((dependency) => !confirmedPacketIds.has(dependency))) {
+          throw new Error(`Packet ${item.id} references unknown semantic dependency`);
+        }
         return {
           id: item.id, issue: item.issue, expectedPaths: packet.expectedPaths, baseRef: packet.baseSha,
-          semanticDependencies: packet.semanticDependencies ?? item.dependencies,
+          semanticDependencies,
           ...(item.memberIssues !== undefined ? { childIssues: item.memberIssues } : {}),
         };
       });
@@ -970,7 +976,17 @@ export class OrchestrationController {
       updatedAt: this.now(),
     });
     await this.flush(state);
-    const packetItems = pending.map((entry) => itemFromNodeRecord(requiredNode(state.record, entry.nodeId)));
+    const confirmedIds = new Set((state.record.investigations ?? [])
+      .filter((entry) => entry.status === "completed" && entry.outcome === "confirmed")
+      .map((entry) => entry.nodeId));
+    const packetItems = pending.map((entry) => {
+      const item = itemFromNodeRecord(requiredNode(state.record, entry.nodeId));
+      return {
+        ...item,
+        dependencies: item.dependencies.filter((dependency) => confirmedIds.has(dependency)),
+        claims: [],
+      };
+    });
     const current = await runSchedule(
       packetItems,
       state.record.effectiveMaxParallel ?? state.record.maxParallel,
@@ -1001,10 +1017,14 @@ export class OrchestrationController {
           const paths = normalizePacketPaths(result.expectedPaths);
           if (!paths.length) throw new Error(`Packet ${item.id} has no bounded expected paths`);
           if (!result.baseSha.trim()) throw new Error(`Packet ${item.id} has no exact base SHA`);
+          const semanticDependencies = [...new Set(result.semanticDependencies)];
+          if (semanticDependencies.some((dependency) => !confirmedIds.has(dependency))) {
+            throw new Error(`Packet ${item.id} references unknown semantic dependency`);
+          }
           const completed: OrchestrationPacketRecord = {
             ...packet, status: "completed",
             ...(result.packetId !== undefined ? { packetId: result.packetId } : {}),
-            expectedPaths: paths, semanticDependencies: [...new Set(result.semanticDependencies)], baseSha: result.baseSha,
+            expectedPaths: paths, semanticDependencies, baseSha: result.baseSha,
             completedAt: this.now(),
           };
           byNode.set(item.id, completed);

@@ -1907,3 +1907,44 @@ it("runs a durable packet barrier before mutation workers", async () => {
   assert.equal(result.record.packetBarrier?.completed, 2);
   assert.equal(result.record.phase, "executing");
 });
+
+it("normalizes packet scheduler dependencies to confirmed investigations before the barrier", async () => {
+  const repository = new RecordingOrchestrationRepository();
+  const packetInputs: Array<{ id: string; dependencies: readonly string[]; claims: readonly string[] }> = [];
+  let mutationStarted = false;
+  const service = controller(repository, async (scheduled) => {
+    mutationStarted = true;
+    assert.equal(scheduled.id === "node-459" || scheduled.id === "node-460", true);
+  }, {
+    investigationWorker: async (scheduled) => ({
+      outcome: scheduled.id === "node-458" ? "invalid" as const : "confirmed" as const,
+      baseSha: "base-1",
+      evidence: { runId: `run-${scheduled.id}` },
+    }),
+    packetWorker: async (scheduled) => {
+      packetInputs.push({ id: scheduled.id, dependencies: [...scheduled.dependencies], claims: [...scheduled.claims] });
+      return {
+        packetId: `packet-${scheduled.id}`,
+        expectedPaths: [`src/${scheduled.id}.ts`],
+        semanticDependencies: scheduled.dependencies,
+        baseSha: "base-1",
+      };
+    },
+    materializeExecution: async () => ({
+      items: [item("node-459", 459), item("node-460", 460, ["node-459"])],
+    }),
+  });
+  const result = await service.createAndRun({
+    repository: "owner/repo", maxParallel: 2, investigationFirst: true,
+    items: [item("node-458", 458), item("node-459", 459, ["node-458"]), item("node-460", 460, ["node-458", "node-459"])],
+  });
+  assert.deepEqual(packetInputs.sort((left, right) => left.id.localeCompare(right.id)), [
+    { id: "node-459", dependencies: [], claims: [] },
+    { id: "node-460", dependencies: ["node-459"], claims: [] },
+  ]);
+  assert.equal(mutationStarted, true);
+  assert.deepEqual(result.record.nodes.map((node) => node.id).sort(), ["node-459", "node-460"]);
+  assert.deepEqual(result.record.nodes.find((node) => node.id === "node-459")?.dependencies, []);
+  assert.deepEqual(result.record.nodes.find((node) => node.id === "node-460")?.dependencies, ["node-459"]);
+  assert.equal(result.record.nodes.some((node) => node.dependencies.includes("node-458")), false);
+});

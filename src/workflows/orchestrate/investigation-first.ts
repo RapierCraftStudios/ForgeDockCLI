@@ -249,15 +249,21 @@ export function createInvestigationFirstWorkers(
     let executionEdges: ClaimSerializationEdge[];
     if (packets?.length) {
       const packetById = new Map(packets.filter((packet) => packet.status === "completed").map((packet) => [packet.nodeId, packet]));
+      const confirmedPacketIds = new Set(items.map((item) => item.id));
       const packetInputs = items.map((item) => {
         const packet = packetById.get(item.id);
         if (!packet?.expectedPaths?.length || !packet.baseSha) throw new Error(`Packet barrier has no durable packet for ${item.id}`);
+        if (packet.semanticDependencies === undefined) throw new Error(`Packet ${item.id} lacks authoritative semantic dependency evidence`);
+        const semanticDependencies = [...new Set(packet.semanticDependencies)];
+        if (semanticDependencies.some((dependency) => !confirmedPacketIds.has(dependency))) {
+          throw new Error(`Packet ${item.id} references unknown semantic dependency`);
+        }
         return {
           id: item.id,
           issue: item.issue,
           expectedPaths: packet.expectedPaths,
           baseRef: packet.baseSha,
-          semanticDependencies: packet.semanticDependencies ?? item.dependencies,
+          semanticDependencies,
           ...(item.memberIssues !== undefined ? { childIssues: item.memberIssues } : {}),
         };
       });
