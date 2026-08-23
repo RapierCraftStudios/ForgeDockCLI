@@ -115,6 +115,41 @@ describe("CLI decomposition materializer", () => {
     assert.deepEqual(resumed.items[0]?.dependencies, ["parent"]);
   });
 
+
+  it("hydrates closed decomposition children as terminal proof and materializes only open children", async () => {
+    const github = {
+      async getRepository(repository: string) { return { repo: repository, defaultBranch: "main" }; },
+      async getIssue(issueNumber: number, repository: string) {
+        return { ...issue(repository, issueNumber), state: issueNumber === 7 ? "CLOSED" as const : "OPEN" as const };
+      },
+      async listBranches() { return []; },
+      async getBranchHead() { return "head"; },
+    } as any;
+    const orchestration = { repository: "owner/root", nodes: [node("parent", "owner/root", 42)] } as any;
+    const base = {
+      github,
+      artifacts: { async list() { return []; } },
+      repository: "owner/root",
+      defaultBranch: "main",
+      effective: { fastLaneTarget: "staging" } as any,
+      orchestration,
+      node: node("parent", "owner/root", 42),
+      item: node("parent", "owner/root", 42),
+    } as any;
+    const mixed = await materializeCliDecomposition({ ...base, childIssues: [7, 8] });
+    assert.ok(mixed);
+    assert.deepEqual(mixed.childIssues, [7, 8]);
+    assert.deepEqual(mixed.items.map((item: any) => item.issue), [8]);
+    await assert.rejects(
+      () => materializeCliDecomposition({
+        ...base,
+        github: { ...github, async getIssue(issueNumber: number, repository: string) { return { ...issue(repository, issueNumber), state: "CLOSED" as const }; } },
+        childIssues: [7, 8],
+      }),
+      /no runnable open children.*all authoritative children are terminal/,
+    );
+  });
+
   it("keeps punctuation-distinct repositories on distinct qualified child IDs", async () => {
     const github = {
       async getRepository(repository: string) {
