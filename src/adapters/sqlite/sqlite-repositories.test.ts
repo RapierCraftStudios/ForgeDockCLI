@@ -240,8 +240,13 @@ describe("SQLite operational repositories", () => {
     }
   });
 
-  it("persists orchestration DAG records for restart inspection", async () => {
+  it("persists orchestration DAG semantic reservations in SQLite records", async () => {
     const store = new SqliteRepositories(":memory:");
+    const reservation = {
+      semanticAttemptId: "semantic-sqlite", orchestrationId: "dag_test", nodeId: "issue-9", wave: 1, attempt: 1,
+      repository: "a/b", issue: 9, baseSha: "a".repeat(40), runId: "run-9", intentId: "intent-9",
+      investigationId: "investigation-9", packetId: "packet-9",
+    } as const;
     const record: OrchestrationRecord = {
       schema: "forgedock.orchestration/v1",
       orchestrationId: "dag_test",
@@ -257,6 +262,10 @@ describe("SQLite operational repositories", () => {
         successor: "issue-10",
         overlappingClaims: ["src/**/*.ts ↔ src/foo.ts"],
       }],
+      phase: "investigating",
+      investigationWave: 1,
+      investigations: [{ issue: 9, nodeId: "issue-9", wave: 1, reservation, status: "running", attemptCount: 1 }],
+      packets: [{ nodeId: "issue-9", wave: 1, reservation, status: "queued", attemptCount: 0 }],
       nodes: [{
         id: "issue-9", issue: 9, priority: 1, dependencies: [], claims: ["src/**/*.ts"],
         repository: "a/b", targetBranch: "main",
@@ -269,7 +278,8 @@ describe("SQLite operational repositories", () => {
     try {
       await store.createOrchestration(record);
       const loaded = await store.loadOrchestration(record.orchestrationId);
-      assert.deepEqual(loaded, record);
+      assert.deepEqual(loaded?.investigations?.[0]?.reservation, reservation);
+      assert.deepEqual(loaded?.packets?.[0]?.reservation, reservation);
       const completed = { ...record, status: "completed" as const, updatedAt: "2026-01-01T00:01:00.000Z" };
       await store.saveOrchestration(completed);
       assert.equal((await store.listOrchestrations())[0]?.status, "completed");

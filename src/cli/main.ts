@@ -2784,6 +2784,10 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
       serializationEdges: scheduleItems.edges,
       maxParallel: effective.maxParallel,
       investigationFirst: true,
+      resolveExactBaseSha: async (item) => {
+        const routed = requiredOrchestrationRoute(routedIssues, { repository: repository.repo, issue: item.issue });
+        return github.getBranchHead(repository.repo, routed.lane.targetBranch);
+      },
       autoMerge,
       ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
       plan: {

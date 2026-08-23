@@ -5,6 +5,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { BuildPacketPayloadSchema, createArtifact, type BuildPacketPayload, type BuildContextPackage, type BuildComplexitySignal, type ControllerVerificationGate, type DurableArtifact, type VerificationRequirement, type InvestigationScopeReceipt } from "../../core/artifacts/schema.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
+import type { OrchestrationSemanticAttempt } from "../../core/ports/orchestration.js";
 import type { VerificationCommand } from "../../core/ports/verification.js";
 import {
   isVerificationCapabilityMismatchError,
@@ -177,6 +178,9 @@ export async function prepareBuildPacket(
     cwd: string;
     /** Exact frozen workspace base; required by production work-on callers. */
     baseSha?: string;
+    /** Controller-reserved BuildPacket identity reused after append/commit crashes. */
+    reservation?: OrchestrationSemanticAttempt;
+    packetId?: string;
     scopeHints?: ScopeHints;
     provider?: string;
     model?: string;
@@ -191,9 +195,18 @@ export async function prepareBuildPacket(
     artifacts: ArtifactRepository;
     runs: RunRepository;
     onAgentEvent?: AgentEventSink;
+    assertActive?: () => void;
   },
 ): Promise<{ run: RunState; packet: DurableArtifact<"BuildPacket">; sessionRef: string }> {
   if (input.run.state !== "preparing") throw new Error(`Build Packet requires preparing state, found ${input.run.state}`);
+  if (input.reservation) {
+    if (input.reservation.runId !== input.run.runId
+      || input.reservation.investigationId !== input.investigation.id
+      || input.reservation.repository !== input.run.subject.repo.trim().toLowerCase()
+      || input.reservation.issue !== input.run.subject.issue) {
+      throw new Error(`Build Packet reservation ${input.reservation.semanticAttemptId} does not match run/Investigation identity`);
+    }
+  }
   let run = input.run;
   let authorCorrectableAttempted = false;
   const investigationEvidencePaths = await resolveInvestigationEvidenceSources(
@@ -321,6 +334,7 @@ export async function prepareBuildPacket(
       }
     }
     const { expectedPaths, controllerVerifiedOutput, policyMetadata, invariantMatrices, evidenceContract, evidencePaths, relationGraph, relationGraphCheckpoint, investigationScopeReceipt, contextPackage, complexitySignal } = materialized!;
+    dependencies.assertActive?.();
     const packet = createArtifact({
       kind: "BuildPacket",
       runId: run.runId,
@@ -338,8 +352,12 @@ export async function prepareBuildPacket(
         ...(contextPackage ? { contextPackage } : {}),
         ...(complexitySignal ? { complexitySignal } : {}),
       },
-    });
+    }, { ...((input.packetId ?? input.reservation?.packetId) !== undefined
+      ? { id: input.packetId ?? input.reservation!.packetId }
+      : {}) });
+    dependencies.assertActive?.();
     await dependencies.artifacts.append(packet);
+    dependencies.assertActive?.();
     if (relationGraphCheckpoint) {
       const checkpoint = createArtifact({
         kind: "RelationGraphCheckpoint",
@@ -358,9 +376,21 @@ export async function prepareBuildPacket(
     });
     // This compare-and-swap is the handoff barrier: callers adopt the
     // returned version only after the packet and its frozen scope are durable.
+    dependencies.assertActive?.();
     await dependencies.runs.commit(run.version, advanced.state, advanced.record);
+    dependencies.assertActive?.();
     return { run: advanced.state, packet, sessionRef: result.sessionRef };
   } catch (error) {
+    // Preserve a resumable preparing checkpoint when the packet append itself
+    // succeeded but the caller lost the response at the next boundary.
+    const reservedPacketId = input.packetId ?? input.reservation?.packetId;
+    if (reservedPacketId && run.state === "preparing") {
+      const durable = await dependencies.artifacts.list(run.subject, "BuildPacket");
+      if (durable.some((artifact) => artifact.id === reservedPacketId && artifact.runId === run.runId)) {
+        if (error && typeof error === "object") Object.assign(error, { resumable: true, code: "ECONNRESET" });
+        throw error;
+      }
+    }
     const externalRetry = retryableExternalWorkflowError(error, run);
     if (externalRetry) throw externalRetry;
     if (error instanceof WorkflowExecutionError) throw error;

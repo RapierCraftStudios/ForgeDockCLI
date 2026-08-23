@@ -380,7 +380,10 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   async loadOrchestration(orchestrationId: string): Promise<OrchestrationRecord | undefined> {
     const row = this.#database.prepare("SELECT record_json FROM orchestrations WHERE orchestration_id = ?")
       .get(orchestrationId) as { record_json: string } | undefined;
-    return row ? JSON.parse(row.record_json) as OrchestrationRecord : undefined;
+    if (!row) return undefined;
+    const record = JSON.parse(row.record_json) as OrchestrationRecord;
+    if (record.orchestrationId !== orchestrationId) throw new Error(`Orchestration identity mismatch: ${orchestrationId}`);
+    return record;
   }
 
   async saveOrchestration(record: OrchestrationRecord): Promise<void> {
@@ -405,8 +408,13 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   }
 
   async listOrchestrations(limit = 50): Promise<OrchestrationRecord[]> {
-    const rows = this.#database.prepare("SELECT record_json FROM orchestrations ORDER BY updated_at DESC LIMIT ?").all(limit);
-    return rows.map((row) => JSON.parse(String((row as { record_json: string }).record_json)) as OrchestrationRecord);
+    const rows = this.#database.prepare("SELECT orchestration_id, record_json FROM orchestrations ORDER BY updated_at DESC LIMIT ?").all(limit);
+    return rows.map((row) => {
+      const candidate = row as { orchestration_id: string; record_json: string };
+      const record = JSON.parse(candidate.record_json) as OrchestrationRecord;
+      if (record.orchestrationId !== candidate.orchestration_id) throw new Error(`Orchestration identity mismatch: ${candidate.orchestration_id}`);
+      return record;
+    });
   }
 
   async listRunningOrchestrations(limit = 100, before?: OrchestrationListCursor): Promise<OrchestrationRecord[]> {
@@ -414,9 +422,16 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       throw new Error(`Orchestration page limit must be an integer from 1 to ${MAX_ORCHESTRATION_PAGE_SIZE}`);
     }
     const rows = before === undefined
-      ? this.#database.prepare("SELECT record_json FROM orchestrations WHERE status = 'running' ORDER BY updated_at DESC, orchestration_id DESC LIMIT ?").all(limit)
-      : this.#database.prepare("SELECT record_json FROM orchestrations WHERE status = 'running' AND (updated_at < ? OR (updated_at = ? AND orchestration_id < ?)) ORDER BY updated_at DESC, orchestration_id DESC LIMIT ?").all(before.updatedAt, before.updatedAt, before.orchestrationId, limit);
-    return rows.map((row) => JSON.parse(String((row as { record_json: string }).record_json)) as OrchestrationRecord);
+      ? this.#database.prepare("SELECT orchestration_id, record_json FROM orchestrations WHERE status = 'running' ORDER BY updated_at DESC, orchestration_id DESC LIMIT ?").all(limit)
+      : this.#database.prepare("SELECT orchestration_id, record_json FROM orchestrations WHERE status = 'running' AND (updated_at < ? OR (updated_at = ? AND orchestration_id < ?)) ORDER BY updated_at DESC, orchestration_id DESC LIMIT ?").all(before.updatedAt, before.updatedAt, before.orchestrationId, limit);
+    return rows.map((row) => {
+      const candidate = row as { orchestration_id?: string; record_json: string };
+      const record = JSON.parse(candidate.record_json) as OrchestrationRecord;
+      if (candidate.orchestration_id !== undefined && record.orchestrationId !== candidate.orchestration_id) {
+        throw new Error(`Orchestration identity mismatch: ${candidate.orchestration_id}`);
+      }
+      return record;
+    });
   }
 
   async createPromotion(record: PromotionRecord): Promise<void> {

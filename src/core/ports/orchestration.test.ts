@@ -10,6 +10,7 @@ import {
   orchestrationRecordIssueNumbers,
   normalizeOrchestrationRepository,
   orchestrationRepositoriesEqual,
+  assertOrchestrationSemanticAttempt,
   type OrchestrationNodeRecord,
   type OrchestrationRecord,
 } from "./orchestration.js";
@@ -19,6 +20,19 @@ test("repository identity comparison accepts GitHub case variants but rejects di
   assert.equal(normalizeOrchestrationRepository("RapierCraftStudios/ForgeDockCLI"), "rapiercraftstudios/forgedockcli");
   assert.equal(orchestrationRepositoriesEqual("RapierCraftStudios/ForgeDockCLI", "rapiercraftstudios/forgedockcli"), true);
   assert.equal(orchestrationRepositoriesEqual("RapierCraftStudios/ForgeDockCLI", "other/forgedockcli"), false);
+});
+
+test("invariant:matrix-identity-isolation-fbf8f8112cf1 rejects wrong semantic attempt evidence", () => {
+  const reservation = {
+    semanticAttemptId: "semantic-1", orchestrationId: "dag-1", nodeId: "node-1", wave: 1, attempt: 1,
+    repository: "owner/repo", issue: 535, runId: "run-1", intentId: "intent-1", investigationId: "investigation-1", packetId: "packet-1",
+  } as const;
+  assert.doesNotThrow(() => assertOrchestrationSemanticAttempt(reservation, {
+    orchestrationId: "dag-1", nodeId: "node-1", wave: 1, repository: "OWNER/REPO", issue: 535,
+  }));
+  assert.throws(() => assertOrchestrationSemanticAttempt({ ...reservation, nodeId: "other-node" }, {
+    orchestrationId: "dag-1", nodeId: "node-1", wave: 1, repository: "owner/repo", issue: 535,
+  }), /mismatched/);
 });
 
 function node(overrides: Partial<OrchestrationNodeRecord> = {}): OrchestrationNodeRecord {

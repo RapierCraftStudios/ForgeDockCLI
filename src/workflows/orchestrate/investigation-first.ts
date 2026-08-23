@@ -10,7 +10,7 @@ import type {
   OrchestrationInvestigationWorker,
   OrchestrationPacketWorker,
 } from "./controller.js";
-import type { OrchestrationRecord, OrchestrationInvestigationRecord, OrchestrationPacketIdentity } from "../../core/ports/orchestration.js";
+import type { OrchestrationRecord, OrchestrationInvestigationRecord, OrchestrationPacketIdentity, OrchestrationSemanticAttempt } from "../../core/ports/orchestration.js";
 import type { ScheduledWorkItem, ClaimSerializationEdge } from "./scheduler.js";
 import { investigateWorkItem, resumeInvestigationWorkItem } from "../work-on/investigate.js";
 import { prepareBuildPacket, type VerificationCatalog } from "../work-on/prepare.js";
@@ -83,10 +83,13 @@ export function createInvestigationFirstWorkers(
 ): InvestigationFirstWorkers {
   const investigationWorker: OrchestrationInvestigationWorker = async (item, context) => {
     const route = await options.resolveRoute(item);
+    const reservation = context.semanticAttempt;
+    if (reservation) assertSemanticReservation(reservation, context.orchestrationId, item, context.wave, route.baseSha, options.repository);
+    const subject = { repo: item.repository ?? options.repository, issue: item.issue };
     const intent = createArtifact({
       kind: "Intent",
-      runId: `run_${crypto.randomUUID()}`,
-      subject: { repo: item.repository ?? options.repository, issue: item.issue },
+      runId: reservation?.runId ?? `run_${crypto.randomUUID()}`,
+      subject,
       producer: { role: "controller", runtime: "forgedock" },
       payload: {
         title: route.issue.title,
@@ -96,9 +99,29 @@ export function createInvestigationFirstWorkers(
         dependencies: [...item.dependencies],
         sourceUrl: route.issue.url,
       },
-    });
+    }, { ...(reservation ? { id: reservation.intentId } : {}) });
     await context.recordTask({ runId: intent.runId });
-    const baseSha = await contextBaseSha(options, route, item);
+    const baseSha = reservation?.baseSha ?? await contextBaseSha(options, route, item);
+    if (reservation?.baseSha !== undefined && reservation.baseSha && reservation.baseSha.toLowerCase() !== baseSha.toLowerCase()) {
+      throw new Error(`Investigation ${item.id} exact base ${baseSha} does not match reserved base ${reservation.baseSha}`);
+    }
+    if (reservation) {
+      const existing = (await options.artifacts.list(subject, "Investigation"))
+        .filter((artifact): artifact is DurableArtifact<"Investigation"> => artifact.id === reservation.investigationId && artifact.runId === reservation.runId);
+      if (existing.length > 1) throw new Error(`Investigation ${item.id} has duplicate reserved Investigation ${reservation.investigationId}`);
+      if (existing.length === 1) {
+        const investigation = existing[0]!;
+        assertArtifact(investigation);
+        const run = await options.runs.load(reservation.runId);
+        if (!run) throw new Error(`Investigation ${item.id} reserved run ${reservation.runId} is missing while artifact exists`);
+        return {
+          outcome: investigation.payload.outcome,
+          baseSha,
+          evidence: { investigationId: investigation.id, runId: run.runId, baseSha, rootCause: investigation.payload.rootCause ?? null, summary: investigation.payload.summary, affectedSurfaces: investigation.payload.affectedSurfaces },
+          ...(investigation.payload.decomposition !== undefined ? { childIssues: [] } : {}),
+        };
+      }
+    }
     await assertExactCheckout(options.checkoutRoot, baseSha);
     const investigated = await investigateWorkItem({
       intent,
@@ -120,6 +143,7 @@ export function createInvestigationFirstWorkers(
       ...(options.thinking !== undefined ? { thinking: options.thinking } : {}),
       ...(options.planning ?? {}),
       ...(context.signal !== undefined ? { signal: context.signal } : {}),
+      ...(reservation ? { reservation, investigationId: reservation.investigationId } : {}),
     }, { runtime: options.runtime, artifacts: options.artifacts, runs: options.runs, ...(context.signal !== undefined ? { signal: context.signal } : {}), assertActive: context.assertActive });
     if (context.signal?.aborted) throw context.signal.reason ?? new Error("Investigation cancelled before interpretation");
     await assertExactCheckout(options.checkoutRoot, baseSha);
@@ -147,6 +171,8 @@ export function createInvestigationFirstWorkers(
 
   const packetWorker: OrchestrationPacketWorker = async (item, context) => {
     const route = await options.resolveRoute(item);
+    const reservation = context.semanticAttempt ?? context.investigation.reservation;
+    if (reservation) assertSemanticReservation(reservation, context.orchestrationId, item, context.wave, route.baseSha, options.repository);
     const checkpoint = await loadExactInvestigationCheckpoint(options, item, context.investigation);
     const baseSha = await resolveExactBaseSha(options, item, route, checkpoint.investigation, context.investigation);
     assertRouteMatchesCheckpoint(route, checkpoint.run, context.investigation, item.id);
@@ -185,14 +211,14 @@ export function createInvestigationFirstWorkers(
     }
 
     if (run.state === "building") {
-      const packet = reusableBuildPacket(checkpoint.artifacts, run, checkpoint.subject, baseSha, item.id, checkpoint.investigation);
+      const packet = reusableBuildPacket(checkpoint.artifacts, run, checkpoint.subject, baseSha, item.id, checkpoint.investigation, reservation);
       await assertExactCheckout(options.checkoutRoot, baseSha);
       const observed = await options.getBranchHead(item.repository ?? options.repository, route.targetBranch);
       assertExactSha(`Packet ${item.id} base`, baseSha, observed);
       await context.recordTask({ runId: run.runId });
       return {
         packetId: packet.id,
-        identity: packetIdentity(item, packet.id, run, checkpoint.investigation, baseSha),
+        identity: packetIdentity(item, packet.id, run, checkpoint.investigation, baseSha, reservation),
         expectedPaths: packet.payload.expectedPaths,
         semanticDependencies: item.dependencies,
         baseSha,
@@ -202,19 +228,21 @@ export function createInvestigationFirstWorkers(
     if (run.state !== "preparing") {
       throw new Error(`Packet ${item.id} requires preparing or building state, found ${run.state}`);
     }
-    const orphan = findReusableBuildPacket(checkpoint.artifacts, run, checkpoint.subject, baseSha, item.id, checkpoint.investigation);
+    const orphan = findReusableBuildPacket(checkpoint.artifacts, run, checkpoint.subject, baseSha, item.id, checkpoint.investigation, reservation);
     if (orphan) {
       const scopeManifest = scopeManifestForBuildPacket(
         normalizePacketPaths(orphan.payload.expectedPaths),
         (orphan.payload.evidencePaths ?? []).map(({ path }) => path),
       );
+      context.assertActive();
       const advanced = transition(run, "BUILD_PACKET_READY", { scopeManifest });
       await options.runs.commit(run.version, advanced.state, advanced.record);
+      context.assertActive();
       run = advanced.state;
       await context.recordTask({ runId: run.runId });
       return {
         packetId: orphan.id,
-        identity: packetIdentity(item, orphan.id, run, checkpoint.investigation, baseSha),
+        identity: packetIdentity(item, orphan.id, run, checkpoint.investigation, baseSha, reservation),
         expectedPaths: orphan.payload.expectedPaths,
         semanticDependencies: item.dependencies,
         baseSha,
@@ -234,14 +262,15 @@ export function createInvestigationFirstWorkers(
       ...(options.thinking !== undefined ? { planningThinking: options.thinking } : {}),
       ...(options.planning ?? {}),
       ...(context.signal !== undefined ? { signal: context.signal } : {}),
-    }, { runtime: options.runtime, artifacts: options.artifacts, runs: options.runs });
+      ...(reservation ? { reservation, packetId: reservation.packetId } : {}),
+    }, { runtime: options.runtime, artifacts: options.artifacts, runs: options.runs, assertActive: context.assertActive });
     await assertExactCheckout(options.checkoutRoot, baseSha);
     const observed = await options.getBranchHead(item.repository ?? options.repository, route.targetBranch);
     assertExactSha(`Packet ${item.id} base`, baseSha, observed);
     await context.recordTask({ runId: prepared.run.runId });
     return {
       packetId: prepared.packet.id,
-      identity: packetIdentity(item, prepared.packet.id, prepared.run, checkpoint.investigation, baseSha),
+      identity: packetIdentity(item, prepared.packet.id, prepared.run, checkpoint.investigation, baseSha, reservation),
       expectedPaths: prepared.packet.payload.expectedPaths,
       semanticDependencies: item.dependencies,
       baseSha,
@@ -408,15 +437,19 @@ async function loadExactInvestigationCheckpoint(
   record: OrchestrationInvestigationRecord,
 ): Promise<InvestigationCheckpoint> {
   const subject = { repo: item.repository ?? options.repository, issue: item.issue };
+  if (record.reservation && record.reservation.repository !== subject.repo.trim().toLowerCase()) {
+    throw new Error(`Packet ${item.id} investigation repository does not match reserved repository`);
+  }
   if (record.nodeId !== item.id) {
     throw new Error(`Packet ${item.id} investigation node ${record.nodeId} does not match scheduled node`);
   }
   if (record.issue !== item.issue) {
     throw new Error(`Packet ${item.id} investigation issue ${record.issue} does not match scheduled issue ${item.issue}`);
   }
-  const runId = record.runId?.trim();
+  const reservation = record.reservation;
+  const runId = (record.runId ?? reservation?.runId)?.trim();
   if (!runId) throw new Error(`Packet ${item.id} has no durable investigation run`);
-  const investigationId = record.investigationArtifactId?.trim();
+  const investigationId = (record.investigationArtifactId ?? reservation?.investigationId)?.trim();
   if (!investigationId) throw new Error(`Packet ${item.id} has no durable Investigation artifact identity`);
 
   const run = await options.runs.load(runId);
@@ -433,13 +466,18 @@ async function loadExactInvestigationCheckpoint(
   }
   const intent = intents[0]!;
   assertArtifact(intent);
+  if (reservation && intent.id !== reservation.intentId) {
+    throw new Error(`Packet ${item.id} Intent ${intent.id} does not match reserved Intent ${reservation.intentId}`);
+  }
   const investigations = artifacts.filter((artifact): artifact is DurableArtifact<"Investigation"> =>
     artifact.kind === "Investigation"
-      && artifact.id === investigationId
       && artifact.runId === runId
       && sameSubject(artifact.subject, subject));
   if (investigations.length !== 1) {
     throw new Error(`Packet ${item.id} requires exactly one durable Investigation ${investigationId} for run ${runId}; found ${investigations.length}`);
+  }
+  if (investigations[0]!.id !== investigationId) {
+    throw new Error(`Packet ${item.id} loaded Investigation ${investigations[0]!.id} instead of reserved ${investigationId}`);
   }
   const investigation = investigations[0]!;
   assertArtifact(investigation);
@@ -451,6 +489,11 @@ async function loadExactInvestigationCheckpoint(
   }
   assertOptionalIdentity(record.evidence?.runId, runId, `Packet ${item.id} investigation evidence run`);
   assertOptionalIdentity(record.evidence?.investigationId, investigationId, `Packet ${item.id} investigation evidence artifact`);
+  if (reservation) {
+    if (reservation.runId !== runId || reservation.investigationId !== investigationId || reservation.issue !== item.issue) {
+      throw new Error(`Packet ${item.id} investigation evidence does not match reserved semantic attempt ${reservation.semanticAttemptId}`);
+    }
+  }
   return { subject, run, intent, investigation, artifacts };
 }
 
@@ -507,8 +550,9 @@ function reusableBuildPacket(
   baseSha: string,
   itemId: string,
   investigation: DurableArtifact<"Investigation">,
+  reservation?: OrchestrationSemanticAttempt,
 ): DurableArtifact<"BuildPacket"> {
-  const packet = findReusableBuildPacket(artifacts, run, subject, baseSha, itemId, investigation);
+  const packet = findReusableBuildPacket(artifacts, run, subject, baseSha, itemId, investigation, reservation);
   if (!packet) throw new Error(`Packet ${itemId} building recovery requires exactly one attached BuildPacket`);
   return packet;
 }
@@ -521,13 +565,18 @@ function findReusableBuildPacket(
   baseSha: string,
   itemId: string,
   investigation: DurableArtifact<"Investigation">,
+  reservation?: OrchestrationSemanticAttempt,
 ): DurableArtifact<"BuildPacket"> | undefined {
   const attachedIds = run.artifactIds.BuildPacket ?? [];
   if (attachedIds.length > 1 || (attachedIds.length === 1 && !attachedIds[0])) {
     throw new Error(`Packet ${itemId} has an ambiguous durable BuildPacket attachment`);
   }
-  const candidates = artifacts.filter((artifact): artifact is DurableArtifact<"BuildPacket"> =>
+  const allCandidates = artifacts.filter((artifact): artifact is DurableArtifact<"BuildPacket"> =>
     artifact.kind === "BuildPacket" && artifact.runId === run.runId && sameSubject(artifact.subject, subject));
+  if (allCandidates.length > 1) throw new Error(`Packet ${itemId} has ambiguous durable BuildPacket artifacts`);
+  const candidates = reservation === undefined
+    ? allCandidates
+    : allCandidates.filter((artifact) => artifact.id === reservation.packetId);
   const selected = attachedIds.length === 1
     ? candidates.filter((candidate) => candidate.id === attachedIds[0])
     : candidates;
@@ -549,11 +598,15 @@ function findReusableBuildPacket(
   }
   const investigationDigest = createHash("sha256").update(JSON.stringify(investigation.payload)).digest("hex");
   const receipt = packet.payload.investigationScopeReceipt;
+  if (reservation && !receipt) throw new Error(`Packet ${itemId} reserved BuildPacket lacks investigation digest evidence`);
   if (receipt) {
     if (receipt.runId !== run.runId) throw new Error(`Packet ${itemId} BuildPacket scope receipt run identity drifted`);
     if (!sameSubject(receipt.subject, subject)) throw new Error(`Packet ${itemId} BuildPacket scope receipt subject drifted`);
     if (receipt.investigationId !== investigation.id) throw new Error(`Packet ${itemId} BuildPacket scope receipt investigation identity drifted`);
     if (receipt.investigationDigest !== investigationDigest) throw new Error(`Packet ${itemId} BuildPacket investigation digest drifted`);
+  }
+  if (reservation && packet.id !== reservation.packetId) {
+    throw new Error(`Packet ${itemId} BuildPacket ${packet.id} is outside reserved packet identity ${reservation.packetId}`);
   }
   if (packet.payload.contextPackage?.investigationDigest !== undefined
     && packet.payload.contextPackage.investigationDigest !== investigationDigest) {
@@ -568,7 +621,9 @@ function packetIdentity(
   run: RunState,
   investigation: DurableArtifact<"Investigation">,
   baseSha: string,
+  reservation?: OrchestrationSemanticAttempt,
 ): OrchestrationPacketIdentity {
+  if (reservation && packetId !== reservation.packetId) throw new Error(`Packet ${item.id} packet identity is not reserved`);
   return {
     nodeId: item.id,
     packetId,
@@ -576,7 +631,35 @@ function packetIdentity(
     investigationId: investigation.id,
     subject: { repo: run.subject.repo, issue: item.issue },
     baseSha,
+    ...(reservation ? { orchestrationId: reservation.orchestrationId, wave: reservation.wave, attempt: reservation.attempt, repository: reservation.repository } : {}),
   };
+}
+
+function assertSemanticReservation(
+  reservation: OrchestrationSemanticAttempt,
+  orchestrationId: string,
+  item: ScheduledWorkItem,
+  wave: number,
+  routeBaseSha?: string,
+  fallbackRepository = "",
+): void {
+  const repository = (item.repository ?? fallbackRepository).trim().toLowerCase();
+  if (reservation.orchestrationId !== orchestrationId || reservation.nodeId !== item.id
+    || reservation.wave !== wave || reservation.issue !== item.issue
+    || reservation.repository !== repository) {
+    throw new Error(`Semantic attempt ${reservation.semanticAttemptId} has wrong orchestration/node/wave/repository/issue identity`);
+  }
+  if (reservation.baseSha !== undefined && !/^[0-9a-f]{7,64}$/i.test(reservation.baseSha)) {
+    throw new Error(`Semantic attempt ${reservation.semanticAttemptId} has malformed exact base`);
+  }
+  if (routeBaseSha !== undefined && reservation.baseSha && reservation.baseSha.toLowerCase() !== routeBaseSha.toLowerCase()) {
+    throw new Error(`Semantic attempt ${reservation.semanticAttemptId} has exact-base drift`);
+  }
+  for (const key of ["runId", "intentId", "investigationId", "packetId"]) {
+    const value = reservation[key as keyof OrchestrationSemanticAttempt];
+    if (typeof value !== "string" || !value.trim()) throw new Error(`Semantic attempt ${reservation.semanticAttemptId} lacks ${key}`);
+  }
+  if (!Number.isSafeInteger(reservation.attempt) || reservation.attempt < 1) throw new Error(`Semantic attempt ${reservation.semanticAttemptId} has invalid attempt`);
 }
 
 function assertOptionalIdentity(value: unknown, expected: string, label: string): void {
