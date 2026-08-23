@@ -3,6 +3,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { findArtifacts } from "../../core/artifacts/codec.js";
 import type { ArtifactKind } from "../../core/artifacts/schema.js";
 import type { OrchestrationNodeRecord, OrchestrationRecord } from "../../core/ports/orchestration.js";
 import type { SqliteRepositoryPurgeManifest, SqliteRepositoryPurgeResult } from "../../adapters/sqlite/sqlite-repositories.js";
@@ -31,6 +32,12 @@ export interface ResetCommentIdentity {
   runId?: string;
   artifactId?: string;
   bodySha256: string;
+  /** Exact remote body, retained so canonical projections cannot be rewritten in a manifest. */
+  body?: string;
+  /** Subject identity decoded from a canonical artifact projection. */
+  subjectRepo?: string;
+  subjectIssue?: number;
+  subjectPr?: number;
   occurredAt?: string;
   /** Original issue/review comments are evidence and are never selected. */
   managed: true;
@@ -84,7 +91,17 @@ export interface ResetArchiveIdentity {
 }
 
 export interface ResetRunIdentity { runId: string; version: number; state: string; }
-export interface ResetDagIdentity { orchestrationId: string; repository: string; status: string; updatedAt: string; recordSha256: string; }
+export interface ResetDagIdentity {
+  orchestrationId: string;
+  repository: string;
+  status: string;
+  updatedAt: string;
+  recordSha256: string;
+  /** Investigation artifact IDs selected by this DAG (aliases support persisted generations). */
+  investigationArtifactIds?: readonly string[];
+  investigationIds?: readonly string[];
+  investigationRunIds?: readonly string[];
+}
 /** Evidence for a DAG node intentionally left behind when its parent record is removed. */
 export interface ResetPreservedNodeIdentity {
   orchestrationId: string;
@@ -110,6 +127,10 @@ export interface ResetSelection {
   repo: string;
   issueNumbers: readonly number[];
   dagIds: readonly string[];
+  /** Optional explicit durable identities used to authorize remote-only comments. */
+  runIds?: readonly string[];
+  artifactIds?: readonly string[];
+  investigationIds?: readonly string[];
 }
 
 
@@ -279,9 +300,14 @@ export async function dryRunPristineReset(selection: ResetSelection, deps: Reset
   const refs = deps.host.listManagedRefs
     ? await deps.host.listManagedRefs(captureSelection, authorized)
     : [];
-  const selectedRunIds = new Set(captured.runs.map((run) => run.runId));
-  const selectedArtifactIds = new Set(captured.artifacts.map((artifact) => artifact.artifactId));
+  const selectedRunIds = new Set([...captured.runs.map((run) => run.runId), ...(selection.runIds ?? [])]);
+  const selectedArtifactIds = new Set([...captured.artifacts.map((artifact) => artifact.artifactId), ...(selection.artifactIds ?? [])]);
   const selectedDagIds = new Set(captured.dags.map((dag) => dag.orchestrationId));
+  const selectedInvestigationIds = new Set([
+    ...(selection.investigationIds ?? []),
+    ...captured.dags.flatMap((dag) => [...(dag.investigationArtifactIds ?? []), ...(dag.investigationIds ?? [])]),
+  ]);
+  const selectedInvestigationRunIds = new Set(captured.dags.flatMap((dag) => dag.investigationRunIds ?? []));
   const missingDags = dagIds.filter((dagId) => !selectedDagIds.has(dagId));
   if (missingDags.length) throw new Error(`Reset discovery is incomplete; selected DAGs were not found: ${missingDags.join(", ")}`);
   const issueState = new Map(issues.map((issue) => [issue.number, issue.state]));
@@ -290,9 +316,12 @@ export async function dryRunPristineReset(selection: ResetSelection, deps: Reset
   const pullComments = deps.host.listPullRequestComments
     ? (await Promise.all(pullRequests.filter((pr) => openPullRequests.has(pr.number)).map((pr) => deps.host.listPullRequestComments!(selection.repo, pr.number)))).flat()
     : [];
-  const allComments = [...comments.filter((comment) => mutableIssues.has(comment.issue) && issueState.get(comment.issue) === "OPEN"), ...pullComments];
+  const allComments = [
+    ...comments.filter((comment) => mutableIssues.has(comment.issue) && issueState.get(comment.issue) === "OPEN"),
+    ...pullComments,
+  ].map(normalizeResetComment);
   const managedComments = allComments.filter((comment) => comment.managed === true
-    && isSelectedResetComment(comment, selectedRunIds, selectedArtifactIds, selectedDagIds));
+    && isSelectedResetComment(comment, selection.repo, new Set(issueNumbers), selectedRunIds, selectedArtifactIds, selectedInvestigationIds, selectedInvestigationRunIds));
   const artifactCommentIds = new Map<string, number>();
   for (const comment of managedComments) {
     if (!comment.artifactId) continue;
@@ -506,9 +535,9 @@ async function rereadManifestIdentities(manifest: PristineResetManifest, deps: R
     if (current.number !== issue.number || sha256(current.body) !== issue.bodySha256 || current.state !== issue.state) throw new Error(`Reset identity drift for issue #${issue.number}`);
   }
   for (const comment of manifest.comments) {
-    const currentComments = comment.pr !== undefined && deps.host.listPullRequestComments
+    const currentComments = (comment.pr !== undefined && deps.host.listPullRequestComments
       ? await deps.host.listPullRequestComments(manifest.repo, comment.pr)
-      : await deps.host.listComments(manifest.repo, comment.issue);
+      : await deps.host.listComments(manifest.repo, comment.issue)).map(normalizeResetComment);
     const current = currentComments.find((candidate) => candidate.id === comment.id);
     if (phase === "after") {
       if (current) throw new Error(`Reset postcondition failed; comment remains: ${comment.id}`);
@@ -521,7 +550,8 @@ async function rereadManifestIdentities(manifest: PristineResetManifest, deps: R
   if (phase === "before") {
     const runIds = new Set(manifest.runs.map((run) => run.runId));
     const artifactIds = new Set(manifest.artifacts.map((artifact) => artifact.artifactId));
-    const dagIds = new Set(manifest.dags.map((dag) => dag.orchestrationId));
+    const investigationIds = new Set(manifest.dags.flatMap((dag) => [...(dag.investigationArtifactIds ?? []), ...(dag.investigationIds ?? [])]));
+    const investigationRunIds = new Set(manifest.dags.flatMap((dag) => dag.investigationRunIds ?? []));
     const selectedIds = new Set(manifest.comments.map((comment) => comment.id));
     const issueComments = (await Promise.all(manifest.selection.issueNumbers
       .filter((issue) => manifest.labels[String(issue)] !== undefined)
@@ -529,8 +559,8 @@ async function rereadManifestIdentities(manifest: PristineResetManifest, deps: R
     const pullComments = deps.host.listPullRequestComments
       ? (await Promise.all(manifest.pullRequests.filter((pr) => pr.state === "OPEN").map((pr) => deps.host.listPullRequestComments!(manifest.repo, pr.number)))).flat()
       : [];
-    for (const candidate of [...issueComments, ...pullComments]) {
-      if (candidate.managed && isSelectedResetComment(candidate, runIds, artifactIds, dagIds) && !selectedIds.has(candidate.id)) {
+    for (const candidate of [...issueComments, ...pullComments].map(normalizeResetComment)) {
+      if (candidate.managed && isSelectedResetComment(candidate, manifest.repo, new Set(manifest.selection.issueNumbers), runIds, artifactIds, investigationIds, investigationRunIds) && !selectedIds.has(candidate.id)) {
         throw new Error(`Reset discovery drift; newly appeared selected comment: ${candidate.id}`);
       }
     }
@@ -669,18 +699,68 @@ export function replayLabels(events: readonly ResetLabelEvent[], before?: string
 
 function isSelectedResetComment(
   comment: ResetCommentSnapshot,
-  _runIds: ReadonlySet<string>,
+  repo: string,
+  issueNumbers: ReadonlySet<number>,
+  runIds: ReadonlySet<string>,
   artifactIds: ReadonlySet<string>,
-  _dagIds: ReadonlySet<string>,
+  investigationIds: ReadonlySet<string>,
+  investigationRunIds: ReadonlySet<string>,
 ): boolean {
-  // An artifact publication is selected only when its exact canonical artifact
-  // marker names a locally persisted artifact. A copied body/run-id substring
-  // is not an authorization to delete a comment.
-  if (comment.artifactId !== undefined && artifactIds.has(comment.artifactId)
-    && comment.marker === `artifact:${comment.artifactId}`) return true;
-  // Reviewer/wave/trajectory markers have no deletion authority without a
-  // durable publication ledger; leave them for human review.
-  return false;
+  if (comment.artifactId === undefined || comment.marker !== `artifact:${comment.artifactId}`) return false;
+  // Canonical remote projections are authoritative only on issue comments. A
+  // valid artifact body must contain exactly one artifact and must prove the
+  // repository/issue it is being removed from.
+  const canonical = canonicalArtifact(comment);
+  if (hasArtifactProjection(comment.body) && canonical === undefined) return false;
+  if (canonical !== undefined) {
+    if (comment.pr === undefined) {
+      if (canonical.subject.issue !== comment.issue || !issueNumbers.has(comment.issue)) return false;
+    } else if (canonical.subject.pr !== comment.pr
+      || (canonical.subject.issue !== undefined && !issueNumbers.has(canonical.subject.issue))) {
+      return false;
+    }
+    if (canonical.subject.repo.trim().toLowerCase() !== repo.trim().toLowerCase()) return false;
+    if (!isControllerCompatibleArtifact(canonical)) return false;
+    return artifactIds.has(canonical.id) || runIds.has(canonical.runId)
+      || investigationIds.has(canonical.id) || investigationRunIds.has(canonical.runId);
+  }
+  // Compatibility path for adapter-provided identities whose local artifact
+  // row proves publication (including the historical PR projection).
+  return artifactIds.has(comment.artifactId) || runIds.has(comment.runId ?? "");
+}
+
+function normalizeResetComment(comment: ResetCommentSnapshot): ResetCommentSnapshot {
+  const artifact = canonicalArtifact(comment);
+  if (artifact === undefined) return comment;
+  return {
+    ...comment,
+    marker: `artifact:${artifact.id}`,
+    runId: artifact.runId,
+    artifactId: artifact.id,
+    subjectRepo: artifact.subject.repo,
+    ...(artifact.subject.issue !== undefined ? { subjectIssue: artifact.subject.issue } : {}),
+    ...(artifact.subject.pr !== undefined ? { subjectPr: artifact.subject.pr } : {}),
+  };
+}
+
+function canonicalArtifact(comment: ResetCommentSnapshot): import("../../core/artifacts/schema.js").DurableArtifact | undefined {
+  if (!comment.body) return undefined;
+  const candidates = comment.body.split(/\r?\n/).flatMap((line) => {
+    const candidate = line.trim();
+    if (!/^<!--\s*FORGEDOCK:ARTIFACT\s+v(?:2\s+b64|3\s+gz):[A-Za-z0-9_-]+\s*-->$/u.test(candidate)) return [];
+    return findArtifacts(candidate);
+  });
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+
+function hasArtifactProjection(body: string | undefined): boolean {
+  return body !== undefined && /<!--\s*FORGEDOCK:ARTIFACT\s+v(?:2|3)\s+(?:b64|gz):/i.test(body);
+}
+
+function isControllerCompatibleArtifact(artifact: import("../../core/artifacts/schema.js").DurableArtifact): boolean {
+  // Canonical workflow artifacts may be emitted by a bounded specialist, but
+  // never by an arbitrary human/agent projection.
+  return artifact.producer.role === "controller" || artifact.producer.role === "investigator";
 }
 
 function isResetManagedLabel(label: string): boolean {

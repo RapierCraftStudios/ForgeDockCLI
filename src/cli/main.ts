@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, unlinkSync, writeFileSync, copyFileSync, chmodSync, renameSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createArtifact, type ArtifactKind, type DurableArtifact } from "../core/artifacts/schema.js";
-import { findArtifacts, renderArtifactMarkdown } from "../core/artifacts/codec.js";
+import { renderArtifactMarkdown } from "../core/artifacts/codec.js";
 import { CachedArtifactRepository, ProjectedRunRepository, type ArtifactRepository, type RunProgressRecord, type RunRepository } from "../core/ports/repositories.js";
 import { orchestrationRepositoriesEqual, type OrchestrationNodeRecord, type OrchestrationRecord } from "../core/ports/orchestration.js";
 import { LeaseContinuityError } from "../core/ports/lease.js";
@@ -77,7 +77,7 @@ import { decompositionChildIssuesFromArtifacts, materializeCliDecomposition } fr
 import { resolveClaimPromotionConflictAtBoundary } from "./orchestration-claim-conflict.js";
 import { assertDispatchReady, resolveDispatchRuntime } from "../core/admission/dispatch-readiness.js";
 import { mapWithConcurrency } from "../core/concurrency.js";
-import { dryRunPristineReset, applyPristineReset, writeResetManifest, selectResetDagNodes, type PristineResetManifest, type ResetArchiveIdentity, type ResetPlanDependencies, type ResetProgressEvent, type ResetSelection } from "../workflows/reset/pristine-reset.js";
+import { assertResetManifestDigest, dryRunPristineReset, applyPristineReset, writeResetManifest, selectResetDagNodes, type PristineResetManifest, type ResetArchiveIdentity, type ResetPlanDependencies, type ResetProgressEvent, type ResetSelection } from "../workflows/reset/pristine-reset.js";
 import { installGracefulSignalHandlers } from "./process-signals.js";
 import { getOrchestrationRoute, orchestrationRouteCacheKey, requiredOrchestrationRoute, setOrchestrationRoute, type OrchestrationRouteCache } from "./orchestration-route-cache.js";
 import { createInvestigationFirstWorkers } from "../workflows/orchestrate/investigation-first.js";
@@ -1304,16 +1304,26 @@ async function resetIssue(argv: string[]): Promise<void> {
   const dagIds = parseResetDagArguments(argv);
   const applyDigest = option(argv, "--apply");
   if ((!issueNumbers.length && !dagIds.length) && applyDigest === undefined) {
-    throw new Error("Usage: forgedock-next reset <issue>... [--dag <id>[,<id>...]] --dry-run [--repo owner/repo] [--manifest path] | --apply <manifest-digest> --manifest path");
+    throw new Error("Usage: forgedock-next reset <issue>... [--dag <id>[,<id>...]] --dry-run [--repo owner/repo] [--manifest path] [--authority-manifest path] | --apply <manifest-digest> --manifest path");
   }
   const suppliedManifestPath = option(argv, "--manifest");
-  const repositoryOption = option(argv, "--repo");
+  const authorityManifestPath = option(argv, "--authority-manifest");
   const provisionalManifestPath = suppliedManifestPath ?? join(process.cwd(), ".forgedock", `reset-${issueNumbers.join("-") || dagIds.join("-") || "selection"}.manifest.json`);
   const manifest = applyDigest === undefined ? undefined : JSON.parse(readFileSync(provisionalManifestPath, "utf8")) as PristineResetManifest;
+  const authorityManifest = authorityManifestPath === undefined ? undefined : JSON.parse(readFileSync(authorityManifestPath, "utf8")) as PristineResetManifest;
+  if (authorityManifest) assertResetManifestDigest(authorityManifest);
+  const repositoryOption = option(argv, "--repo");
   const github = new GitHubClient(process.cwd());
   const repository = repositoryOption ?? manifest?.repo ?? (await github.getRepository()).repo;
+  if (authorityManifest && repository.toLowerCase() !== authorityManifest.repo.toLowerCase()) throw new Error("Reset authority manifest repository does not match target repository");
+
   const selectedIssues = manifest?.selection.issueNumbers ?? issueNumbers;
   const selectedDags = manifest?.selection.dagIds ?? dagIds;
+  if (authorityManifest) {
+    if (repositoryOption && repositoryOption.toLowerCase() !== authorityManifest.repo.toLowerCase()) throw new Error("Reset authority manifest repository does not match --repo");
+    if (issueNumbers.some((issue) => !authorityManifest.selection.issueNumbers.includes(issue))) throw new Error("Reset authority manifest does not authorize every requested issue");
+    if (dagIds.some((dag) => !authorityManifest.selection.dagIds.includes(dag))) throw new Error("Reset authority manifest does not authorize every requested DAG");
+  }
   if (applyDigest !== undefined && manifest && repository.toLowerCase() !== manifest.repo.toLowerCase()) throw new Error("Reset manifest repository does not match --repo");
   const statePath = join(process.cwd(), ".forgedock", "state.db");
   const sqliteModule = await import("../adapters/sqlite/sqlite-repositories.js");
@@ -1323,7 +1333,16 @@ async function resetIssue(argv: string[]): Promise<void> {
   const observationPath = join(process.cwd(), ".forgedock", "observations.db");
   const observationModule = await import("../observability/sqlite-store.js");
   const observations = existsSync(observationPath) ? new observationModule.SqliteObservationStore(observationPath, { readOnly: applyDigest === undefined }) : undefined;
-  const selection: ResetSelection = { repo: repository, issueNumbers: selectedIssues, dagIds: selectedDags };
+  const authorityRunIds = authorityManifest?.runs.map((run) => run.runId) ?? [];
+  const authorityArtifactIds = authorityManifest ? [
+    ...authorityManifest.artifacts.map((artifact) => artifact.artifactId),
+    ...authorityManifest.comments.flatMap((comment) => comment.artifactId ? [comment.artifactId] : []),
+  ] : [];
+  const authorityInvestigationIds = authorityManifest?.dags.flatMap((dag) => dag.investigationArtifactIds ?? []) ?? [];
+  const selection: ResetSelection = {
+    repo: repository, issueNumbers: selectedIssues, dagIds: selectedDags,
+    ...(authorityManifest ? { runIds: authorityRunIds, artifactIds: authorityArtifactIds, investigationIds: authorityInvestigationIds } : {}),
+  };
   const onResetProgress = applyDigest === undefined ? undefined : (event: ResetProgressEvent): void => {
     if (event.completed !== event.total) return;
     process.stdout.write(`[reset] ${event.stage} ${event.completed}/${event.total} in ${event.elapsedMs}ms\n`);
@@ -1362,20 +1381,12 @@ function createResetCliDependencies(
         const value = await github.getIssue(issue, repo);
         return { number: value.number, state: value.state, labels: value.labels, body: value.body };
       },
-      listComments: async (repo, issue) => (await github.listIssueCommentSnapshots({ repo, issue })).flatMap((comment) => {
-        const artifacts = findArtifacts(comment.body);
-        const markerMatch = comment.body.match(/<!--\\s*FORGEDOCK:(?:REVIEWER|REVIEW-WAVE|TRAJECTORY|FIX_CI|FIX-CI)\\b[^>]*-->/i);
-        if (!comment.id || (!artifacts.length && !markerMatch)) return [];
-        const artifact = artifacts[0];
-        return [{ id: comment.id, issue, marker: artifact ? `artifact:${artifact.id}` : markerMatch![0], ...(artifact ? { runId: artifact.runId, artifactId: artifact.id } : {}), bodySha256: sha256Reset(comment.body), ...(comment.createdAt ? { occurredAt: comment.createdAt } : {}), body: comment.body, managed: true as const }];
-      }),
-      listPullRequestComments: async (repo, number) => (await github.listIssueCommentSnapshots({ repo, pr: number })).flatMap((comment) => {
-        const artifacts = findArtifacts(comment.body);
-        const markerMatch = comment.body.match(/<!--\\s*FORGEDOCK:(?:REVIEWER|REVIEW-WAVE|TRAJECTORY|FIX_CI|FIX-CI)\\b[^>]*-->/i);
-        if (!comment.id || (!artifacts.length && !markerMatch)) return [];
-        const artifact = artifacts[0];
-        return [{ id: comment.id, issue: number, pr: number, marker: artifact ? `artifact:${artifact.id}` : markerMatch![0], ...(artifact ? { runId: artifact.runId, artifactId: artifact.id } : {}), bodySha256: sha256Reset(comment.body), ...(comment.createdAt ? { occurredAt: comment.createdAt } : {}), body: comment.body, managed: true as const }];
-      }),
+      listComments: async (repo, issue) => (await github.listCanonicalIssueCommentSnapshots({ repo, issue }))
+        .filter((comment) => comment.subjectRepo.trim().toLowerCase() === repo.trim().toLowerCase() && comment.subjectIssue === issue)
+        .map((comment) => ({ ...comment, managed: true as const })),
+      listPullRequestComments: async (repo, number) => (await github.listCanonicalIssueCommentSnapshots({ repo, pr: number }))
+        .filter((comment) => comment.subjectRepo.trim().toLowerCase() === repo.trim().toLowerCase() && comment.subjectPr === number)
+        .map((comment) => ({ ...comment, managed: true as const })),
       deleteComment: (repo, comment) => github.deleteIssueComment(repo, {
         id: comment.id, issue: comment.issue, ...(comment.pr !== undefined ? { pr: comment.pr } : {}),
         marker: comment.marker, bodySha256: comment.bodySha256,
@@ -1439,7 +1450,16 @@ function createResetCliDependencies(
             && (dag.issueNumbers.some((issue) => target.issueNumbers.includes(issue))
               || (selectedDagIds.size > 0 && dag.issueNumbers.some((issue) => selectedDagIssueIdentities.has(issue))))));
         const selectedDagRecords = discoveredDagRecords.filter((dag) => selectedDagIds.size === 0 || selectedDagIds.has(dag.orchestrationId));
-        const dags = selectedDagRecords.map((dag) => ({ orchestrationId: dag.orchestrationId, repository: dag.repository, status: dag.status, updatedAt: dag.updatedAt, recordSha256: sha256Reset(JSON.stringify(dag)) }));
+        const dags = selectedDagRecords.map((dag) => ({
+          orchestrationId: dag.orchestrationId, repository: dag.repository, status: dag.status, updatedAt: dag.updatedAt,
+          recordSha256: sha256Reset(JSON.stringify(dag)),
+          ...(dag.investigations?.some((investigation) => investigation.investigationArtifactId !== undefined)
+            ? { investigationArtifactIds: dag.investigations.flatMap((investigation) => investigation.investigationArtifactId ? [investigation.investigationArtifactId] : []) }
+            : {}),
+          ...(dag.investigations?.some((investigation) => investigation.runId !== undefined)
+            ? { investigationRunIds: dag.investigations.flatMap((investigation) => investigation.runId ? [investigation.runId] : []) }
+            : {}),
+        }));
         const dagIds = new Set(dags.map((dag) => dag.orchestrationId));
         const nodeSelection = selectResetDagNodes(discoveredDagRecords, target);
         const invalidIssueStates = new Map(await Promise.all(nodeSelection.selectedInvalid.map(async ({ node }) => {
@@ -3565,7 +3585,7 @@ function printHelp(): void {
   process.stdout.write("  forgedock-next work-on <issue> --through investigate --dry-run\n");
   process.stdout.write("  forgedock-next review-pr <pr> [--repo owner/repo] [--issue number] [--provider NAME] [--model NAME] [--thinking LEVEL]\n");
   process.stdout.write("  forgedock-next promote [--from branch] [--to branch] [--production] [--confirm] [--authorize-merge] [--resume promotion-id] [--cancel --reason text] [--repo owner/repo]\n");
-  process.stdout.write("  forgedock-next reset <issue>... [--dag <orchestration-id>] --dry-run [--repo owner/repo] [--manifest path]\n");
+  process.stdout.write("  forgedock-next reset <issue>... [--dag <orchestration-id>] --dry-run [--repo owner/repo] [--manifest path] [--authority-manifest path]\n");
   process.stdout.write("  forgedock-next reset --apply <manifest-digest> --manifest path [--repo owner/repo] [--reason text]\n");
   process.stdout.write("  forgedock-next orchestrate <issues> [--repo owner/repo] [--batching aggressive|conservative|none] [--priority P0,P1] [--milestone title|--no-milestone] [--max-parallel N] [--provider NAME] [--model NAME] [--thinking LEVEL] [--planning-model provider/model] [--planning-thinking LEVEL] [--dry-run|--confirm|--auto] [--rerun]\n");
   process.stdout.write("  forgedock-next orchestrate --resume <dag-id>\n");

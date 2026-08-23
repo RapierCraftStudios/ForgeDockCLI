@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import type { ArtifactKind } from "../../core/artifacts/schema.js";
+import { createArtifact } from "../../core/artifacts/schema.js";
+import { renderArtifactComment } from "../../core/artifacts/codec.js";
 import type { OrchestrationRecord } from "../../core/ports/orchestration.js";
 import { applyPristineReset, dryRunPristineReset, replayLabels, resetManifestDigest, selectResetDagNodes, sha256, type PristineResetManifest, type ResetPlanDependencies } from "./pristine-reset.js";
 
@@ -96,6 +98,27 @@ describe("typed pristine repository reset", () => {
     assert.deepEqual(workspaceBranches, ["forgedock/issue-1-run-1"]);
     assert.deepEqual(manifest.actions.filter((action) => action.type === "restore-labels"), [{ type: "restore-labels", issue: 1, labels: [] }]);
   });
+  it("selects an exact canonical remote artifact when its local row is absent", async () => {
+    const deps = fakeDeps();
+    const artifact = createArtifact({
+      kind: "Intent", runId: "run-remote", subject: { repo: "o/r", issue: 1 },
+      producer: { role: "controller" },
+      payload: { title: "Remote", problem: "Problem", desiredOutcome: "Done", constraints: [], acceptanceHints: [], dependencies: [] },
+    }, { id: "remote-artifact" });
+    const body = renderArtifactComment(artifact);
+    let deleted = false;
+    deps.state.capture = async () => ({
+      runs: [{ runId: "run-remote", version: 1, state: "building" }], artifacts: [], tasks: [], observations: [], fences: [], promotions: [], dags: [], leases: [], archive: [],
+    });
+    deps.host.listComments = async () => deleted ? [] : [{ id: 41, issue: 1, marker: "remote", body, bodySha256: sha256(body), managed: true as const }];
+    deps.host.deleteComment = async () => { deleted = true; };
+    const manifest = await dryRunPristineReset({ repo: "o/r", issueNumbers: [1], dagIds: [] }, deps);
+    assert.deepEqual(manifest.comments.map((comment) => comment.id), [41]);
+    assert.equal(manifest.comments[0]?.bodySha256, sha256(body));
+    await applyPristineReset(manifest, manifest.digest, deps);
+    assert.equal(deleted, true);
+  });
+
   it("dry-run is read-only and replays labels deterministically", async () => {
     assert.deepEqual(replayLabels([
       { name: "workflow:building", action: "labeled", occurredAt: "2026-01-02", eventId: 2 },

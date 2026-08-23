@@ -1750,6 +1750,29 @@ describe("GitHub reset safety", () => {
     assert.equal(artifactDeleted, true);
   });
 
+  it("discovers only exact canonical artifact comments for reset", async () => {
+    const artifact = createArtifact({
+      kind: "Intent", runId: "canonical-run", subject: { repo: "a/b", issue: 7 }, producer: { role: "controller" },
+      payload: { title: "Canonical", problem: "Reset", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+    const canonical = renderArtifactComment(artifact);
+    const copied = `copied prose ${canonical}`;
+    const malformed = `${canonical}\n${canonical}`;
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      if (args[0] === "api" && args[1]?.includes("/comments?")) {
+        return JSON.stringify([[{ id: 1, body: canonical }, { id: 2, body: copied }, { id: 3, body: malformed }]]);
+      }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    const [found] = await client.listCanonicalIssueCommentSnapshots({ repo: "a/b", issue: 7 });
+    assert.equal(found?.id, 1);
+    assert.equal(found?.artifactId, artifact.id);
+    assert.equal(found?.runId, "canonical-run");
+    assert.equal(found?.subjectIssue, 7);
+    assert.equal(found?.marker, `artifact:${artifact.id}`);
+  });
+
   it("authorizes managed PRs and refs by exact numbers and branches", async () => {
     const client = new GitHubClient();
     Object.defineProperty(client, "gh", { value: async (args: string[]) => {

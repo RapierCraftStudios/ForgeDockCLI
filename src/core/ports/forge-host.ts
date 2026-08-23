@@ -252,7 +252,26 @@ export function pullRequestMergeability(gate: Pick<PullRequestMergeGate, "mergea
 
 export interface PullRequestCheckDiagnostic { name: string; state: PullRequestMergeGate["requiredChecks"][number]["state"]; detailsUrl?: string; logExcerpt: string; }
 
+export interface RepositoryResetCommentSnapshot {
+  id: number;
+  issue: number;
+  pr?: number;
+  author: string;
+  createdAt: string;
+  body: string;
+  bodySha256: string;
+  marker: string;
+  artifactId: string;
+  runId: string;
+  subjectRepo: string;
+  subjectIssue?: number;
+  subjectPr?: number;
+  url?: string;
+}
+
 export interface RepositoryResetHost {
+  /** Discover exact, decodable ForgeDock artifact projections on the remote subject. */
+  listCanonicalIssueCommentSnapshots(subject: { repo: string; issue?: number; pr?: number }): Promise<readonly RepositoryResetCommentSnapshot[]>;
   listIssueCommentSnapshots(subject: { repo: string; issue?: number; pr?: number }): Promise<readonly {
     id?: number;
     author: string;
@@ -261,7 +280,13 @@ export interface RepositoryResetHost {
     url?: string;
     containsArtifact: boolean;
   }[]>;
-  deleteIssueComment(repo: string, commentId: number): Promise<void>;
+  deleteIssueComment(repo: string, expected: {
+    id: number;
+    issue: number;
+    pr?: number;
+    marker: string;
+    bodySha256: string;
+  }): Promise<void>;
   closePullRequest(repo: string, number: number, reason: string): Promise<void>;
   deleteExactRemoteRef(repo: string, ref: string, expectedSha: string): Promise<void>;
   listLabelEvents(repo: string, issue: number): Promise<readonly {

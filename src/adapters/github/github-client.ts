@@ -19,6 +19,7 @@ import type {
   PullRequestMergeGate,
   PullRequestMergeGateOptions,
   PullRequestSnapshot,
+  RepositoryResetCommentSnapshot,
   ReviewFindingInput,
   ReviewFindingPublicationFence,
 } from "../../core/ports/forge-host.js";
@@ -624,6 +625,42 @@ export class GitHubClient implements ForgeHost {
         ...(comment.html_url ? { url: comment.html_url } : {}),
         containsArtifact: findArtifacts(body).length > 0,
       };
+    });
+  }
+
+  /**
+   * Return only canonical, decodable artifact projections. The reset workflow
+   * still applies local authority selection; this boundary excludes copied
+   * prose and malformed/multi-artifact comments before they enter that logic.
+   */
+  async listCanonicalIssueCommentSnapshots(subject: Subject): Promise<RepositoryResetCommentSnapshot[]> {
+    const number = subject.pr ?? subject.issue;
+    if (!number) throw new Error("GitHub canonical comment discovery requires an issue or pull request number");
+    const comments = await this.listIssueCommentSnapshots(subject);
+    return comments.flatMap((comment) => {
+      if (!comment.id || !Number.isSafeInteger(comment.id) || comment.id < 1) return [];
+      const artifacts = findArtifacts(comment.body);
+      if (artifacts.length !== 1) return [];
+      const artifact = artifacts[0]!;
+      const markerLine = canonicalBodyLines(comment.body).find((line) =>
+        /^<!--\s*FORGEDOCK:ARTIFACT\s+v(?:2\s+b64|3\s+gz):[A-Za-z0-9_-]+\s*-->$/u.test(line));
+      if (!markerLine) return [];
+      return [{
+        id: comment.id,
+        issue: number,
+        ...(subject.pr !== undefined ? { pr: subject.pr } : {}),
+        author: comment.author,
+        createdAt: comment.createdAt,
+        body: comment.body,
+        bodySha256: sha256GitHubComment(comment.body),
+        marker: `artifact:${artifact.id}`,
+        artifactId: artifact.id,
+        runId: artifact.runId,
+        subjectRepo: artifact.subject.repo,
+        ...(artifact.subject.issue !== undefined ? { subjectIssue: artifact.subject.issue } : {}),
+        ...(artifact.subject.pr !== undefined ? { subjectPr: artifact.subject.pr } : {}),
+        ...(comment.url ? { url: comment.url } : {}),
+      }];
     });
   }
 
