@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { randomUUID } from "node:crypto";
+import { isCanonicalLifecycleState, type CanonicalLifecycleState, type LifecycleTransitionEvidence } from "../core/state/machine.js";
 
 export const OBSERVATION_SCHEMA_VERSION = "forgedock.observation/v1" as const;
 export const DEFAULT_OBSERVATION_MAX_STRING_BYTES = 8 * 1024;
@@ -86,6 +87,23 @@ export interface ObservationOutputChunk {
   bytes: number;
 }
 
+export interface ObservationLifecyclePayload {
+  state: CanonicalLifecycleState;
+  attempt: number;
+  version: number;
+  transition?: LifecycleTransitionEvidence;
+  phase?: string;
+  [key: string]: unknown;
+}
+
+export function isObservationLifecyclePayload(value: unknown): value is ObservationLifecyclePayload {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  return isCanonicalLifecycleState(candidate.state)
+    && Number.isSafeInteger(candidate.attempt) && Number(candidate.attempt) >= 0
+    && Number.isSafeInteger(candidate.version) && Number(candidate.version) >= 0;
+}
+
 export interface ObservationEnvelopeV1 {
   schemaVersion: typeof OBSERVATION_SCHEMA_VERSION;
   eventId: string;
@@ -100,6 +118,11 @@ export interface ObservationEnvelopeV1 {
   kind: string;
   severity: ObservationSeverity;
   payload: unknown;
+  /** Lifecycle envelopes duplicate evidence here for stores that index headers. */
+  lifecycleState?: CanonicalLifecycleState;
+  lifecycleAttempt?: number;
+  lifecycleVersion?: number;
+  lifecycleTransition?: LifecycleTransitionEvidence;
   delivery: ObservationDelivery;
   security: ObservationSecurity;
   output?: ObservationOutputChunk;

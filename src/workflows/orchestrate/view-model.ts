@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { DurableArtifact } from "../../core/artifacts/schema.js";
+import type { CanonicalLifecycleState, LifecycleTransitionEvidence } from "../../core/state/machine.js";
 import type { Lease } from "../../core/ports/lease.js";
 import { scheduledWorkItemIssueSlots, type ClaimSerializationEdge, type ScheduledWorkItem, type ScheduleResult, type ScheduledStatus, type WaitReason } from "./scheduler.js";
 import type { OrchestrationNode, OrchestrationRoute, OrchestrationSerializationChain, OrchestrationSerializationEdge, OrchestrationSnapshot } from "./events.js";
@@ -21,6 +22,10 @@ export function buildOrchestrationSnapshot(input: {
   effectiveMaxParallel?: number;
   updatedAt?: string;
   phase?: OrchestrationSnapshot["phase"];
+  lifecycleState?: CanonicalLifecycleState;
+  lifecycleAttempt?: number;
+  lifecycleVersion?: number;
+  lifecycleTransition?: LifecycleTransitionEvidence;
   investigationBarrier?: OrchestrationSnapshot["investigationBarrier"];
 }): OrchestrationSnapshot {
   const status = input.result?.status ?? new Map(input.items.map((item) => [item.id, "queued" as ScheduledStatus]));
@@ -34,6 +39,10 @@ export function buildOrchestrationSnapshot(input: {
       issue: item.issue,
       memberIssues: [...(item.memberIssues ?? [item.issue])],
       status: status.get(item.id) ?? "queued",
+      ...(item.lifecycleState !== undefined || input.phase !== undefined || waitReason !== undefined ? { lifecycleState: lifecycleStateForItem(item, status.get(item.id) ?? "queued", waitReason, input.phase) } : {}),
+      ...(item.lifecycleAttempt !== undefined ? { lifecycleAttempt: item.lifecycleAttempt } : {}),
+      ...(item.lifecycleVersion !== undefined ? { lifecycleVersion: item.lifecycleVersion } : {}),
+      ...(item.lifecycleTransition !== undefined ? { lifecycleTransition: structuredClone(item.lifecycleTransition) } : {}),
       dependencies: [...item.dependencies],
       claims: [...item.claims],
       ...(item.title !== undefined ? { title: item.title } : {}),
@@ -82,6 +91,10 @@ export function buildOrchestrationSnapshot(input: {
     orchestrationId: input.orchestrationId,
     ...(input.orchestrationStatus !== undefined ? { orchestrationStatus: input.orchestrationStatus } : {}),
     ...(input.phase !== undefined ? { phase: input.phase } : {}),
+    ...(input.lifecycleState !== undefined ? { lifecycleState: input.lifecycleState } : {}),
+    ...(input.lifecycleAttempt !== undefined ? { lifecycleAttempt: input.lifecycleAttempt } : {}),
+    ...(input.lifecycleVersion !== undefined ? { lifecycleVersion: input.lifecycleVersion } : {}),
+    ...(input.lifecycleTransition !== undefined ? { lifecycleTransition: structuredClone(input.lifecycleTransition) } : {}),
     ...(input.investigationBarrier !== undefined ? { investigationBarrier: input.investigationBarrier } : {}),
     nodes,
     readyNodes,
@@ -126,7 +139,7 @@ export function renderOrchestrationBoard(snapshot: OrchestrationSnapshot): strin
     const promotion = !node.route?.promotionTarget && node.promotionTarget ? ` promotion=${node.promotionTarget}` : "";
     const wait = node.waitReason ? ` wait=${renderWaitReason(node.waitReason)}` : "";
     const error = node.error ? ` — ${safeInline(node.error)}` : "";
-    lines.push(`${statusGlyph(node.status)} #${node.issue}${members}${title} [${node.status}] semantic-deps=${node.dependencies.join(",") || "none"}${route}${promotion}${wait}${error}`);
+    lines.push(`${statusGlyph(node.status)} #${node.issue}${members}${title} [${node.lifecycleState ?? node.status}] semantic-deps=${node.dependencies.join(",") || "none"}${route}${promotion}${wait}${error}`);
   }
   lines.push(...renderSerializationLines(snapshot));
   if (snapshot.remediationCheckpoints.length) {
@@ -149,6 +162,25 @@ export function renderSerializationLines(snapshot: Pick<OrchestrationSnapshot, "
       return `  ${issues} · route ${route ? renderRoute(route) : "legacy/unknown"} · paths ${paths.join(", ") || "unknown"}`;
     }),
   ];
+}
+
+export function lifecycleStateForItem(
+  item: Pick<ScheduledWorkItem, "lifecycleState" | "lifecycleAttempt" | "lifecycleVersion" | "lifecycleTransition">,
+  status: ScheduledStatus,
+  waitReason: WaitReason | undefined,
+  phase?: OrchestrationSnapshot["phase"],
+): CanonicalLifecycleState {
+  if (item.lifecycleState !== undefined) return item.lifecycleState;
+  if (status === "completed") return "completed";
+  if (status === "skipped") return "decomposed";
+  if (status === "invalid") return "investigation-failed";
+  if (status === "failed") return "failed";
+  if (status === "running" || phase === "executing") return "executing";
+  if (waitReason?.kind === "dependency" || waitReason?.kind === "suspended-predecessor") return "dependency-waiting";
+  if (waitReason?.kind === "claim-serialization" || waitReason?.kind === "active-claim-conflict" || waitReason?.kind === "capacity") return "claim-waiting";
+  if (waitReason?.kind === "retry") return phase === "investigating" ? "investigation-retry" : "claim-waiting";
+  if (phase === "investigating") return "investigating";
+  return "ready-to-build";
 }
 
 export function renderWaitReason(reason: WaitReason | { kind?: unknown; [key: string]: unknown }): string {

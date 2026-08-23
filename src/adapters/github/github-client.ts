@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { findArtifacts, renderArtifactComment } from "../../core/artifacts/codec.js";
 import type { ArtifactKind, DurableArtifact, Subject } from "../../core/artifacts/schema.js";
-import type { RunState, RunStateName } from "../../core/state/machine.js";
+import { canonicalLifecycleLabel, type CanonicalLifecycleState, type RunState, type RunStateName } from "../../core/state/machine.js";
 import { pullRequestMergeability } from "../../core/ports/forge-host.js";
 import type {
   BranchSnapshot,
@@ -35,14 +35,22 @@ export const repositoryFromRemote = parseRepositoryFromRemote;
 
 const WORKFLOW_LABELS = [
   { name: "workflow:investigating", color: "1D76DB", description: "ForgeDock investigation is active" },
+  { name: "workflow:investigation-retry", color: "FBCA04", description: "ForgeDock investigation is retrying" },
+  { name: "workflow:investigation-failed", color: "B60205", description: "ForgeDock investigation failed" },
+  { name: "workflow:decomposed", color: "C2E0C6", description: "ForgeDock split the issue into smaller delivery units" },
+  { name: "workflow:materializing", color: "FBCA04", description: "ForgeDock is materializing the execution plan" },
   { name: "workflow:ready-to-build", color: "0E8A16", description: "ForgeDock investigation is complete and build is ready" },
+  { name: "workflow:dependency-waiting", color: "C5DEF5", description: "ForgeDock is waiting on a semantic dependency" },
+  { name: "workflow:claim-waiting", color: "C5DEF5", description: "ForgeDock is waiting on an execution claim" },
+  { name: "workflow:executing", color: "FBCA04", description: "ForgeDock execution is active" },
+  { name: "workflow:cancelled", color: "B60205", description: "ForgeDock orchestration was cancelled" },
+  { name: "workflow:completed", color: "0E8A16", description: "ForgeDock orchestration completed" },
   { name: "workflow:building", color: "FBCA04", description: "ForgeDock build or verification is active" },
   { name: "workflow:waiting", color: "C5DEF5", description: "ForgeDock orchestration is queued or recovering automatically" },
   { name: "workflow:in-review", color: "5319E7", description: "ForgeDock pull-request review is active" },
   { name: "workflow:awaiting-merge", color: "D4C5F9", description: "ForgeDock review passed and awaits a human merge" },
   { name: "workflow:merged", color: "0E8A16", description: "ForgeDock delivery completed and merged" },
   { name: "workflow:invalid", color: "B60205", description: "ForgeDock investigation found the issue invalid" },
-  { name: "workflow:decomposed", color: "C2E0C6", description: "ForgeDock split the issue into smaller delivery units" },
   { name: "workflow:engine-error", color: "B60205", description: "ForgeDock runtime or tool failure requires recovery" },
   { name: "needs-human", color: "D93F0B", description: "ForgeDock requires a human decision or intervention" },
 ] as const;
@@ -121,6 +129,7 @@ const REVIEW_FINDING_LABELS = [
 ] as const;
 
 function orchestrationLabelForProjection(input: OrchestrationNodeProjectionInput): string | undefined {
+  if (input.node.lifecycleState !== undefined) return canonicalLifecycleLabel(input.node.lifecycleState);
   if (input.workflowLabel !== undefined) return input.workflowLabel;
   if (input.phase === "waiting") return "workflow:waiting";
   if (input.phase === "active") return undefined;
@@ -132,22 +141,28 @@ function orchestrationLabelForProjection(input: OrchestrationNodeProjectionInput
 }
 
 function acceptOrchestrationProjection(
-  current: { orchestrationId: string; nodeId: string; attempt: number; phase: "waiting" | "active" | "terminal"; status: OrchestrationNodeProjectionInput["node"]["status"] },
+  current: { orchestrationId: string; nodeId: string; attempt: number; version: number; phase: "waiting" | "active" | "terminal"; status: OrchestrationNodeProjectionInput["node"]["status"] },
   input: OrchestrationNodeProjectionInput,
   attempt: number,
 ): boolean {
+  const version = input.node.lifecycleVersion ?? 0;
   if (current.orchestrationId !== input.orchestrationId || current.nodeId !== input.node.id) {
     // A new DAG may replace a terminal projection, but an older DAG can never
     // reclaim an issue while a newer DAG still owns an active/waiting attempt.
     return current.phase === "terminal";
   }
   if (attempt !== current.attempt) return attempt > current.attempt;
+  if (version !== current.version) return version > current.version;
   if (current.phase === "terminal") return false;
   if (current.phase === "active" && input.phase === "waiting") {
     return input.attempt?.status !== "running" && input.attempt?.status !== "launching";
   }
   if (current.phase === "waiting" && input.phase === "waiting") return true;
   return input.phase !== "waiting";
+}
+
+export function workflowLabelForLifecycleState(state: CanonicalLifecycleState): string | undefined {
+  return canonicalLifecycleLabel(state);
 }
 
 export function workflowLabelForState(state: RunStateName): string | undefined {
@@ -481,7 +496,7 @@ export class GitHubClient implements ForgeHost {
   private readonly initializedLabelRepos = new Map<string, Promise<void>>();
   /** Per-issue serialization prevents stale DAG attempts racing newer projections. */
   private readonly orchestrationProjectionQueues = new Map<string, Promise<void>>();
-  private readonly orchestrationProjectionFences = new Map<string, { orchestrationId: string; nodeId: string; attempt: number; phase: "waiting" | "active" | "terminal"; status: OrchestrationNodeProjectionInput["node"]["status"] }>();
+  private readonly orchestrationProjectionFences = new Map<string, { orchestrationId: string; nodeId: string; attempt: number; version: number; phase: "waiting" | "active" | "terminal"; status: OrchestrationNodeProjectionInput["node"]["status"] }>();
   private readonly initializedReviewFindingRepos = new Map<string, Promise<void>>();
   /** Immutable SHA comparisons are shared only within this client/request lifetime. */
   private readonly comparisonReads = new Map<string, Promise<GitHubComparisonProjection>>();
@@ -1042,7 +1057,7 @@ export class GitHubClient implements ForgeHost {
     const key = `${input.repository.toLowerCase()}#${input.node.issue}`;
     const previous = this.orchestrationProjectionQueues.get(key) ?? Promise.resolve();
     const operation = previous.then(async () => {
-      const attempt = input.attempt?.attempt ?? 0;
+      const attempt = input.node.lifecycleAttempt ?? input.attempt?.attempt ?? 0;
       const current = this.orchestrationProjectionFences.get(key);
       if (current && !acceptOrchestrationProjection(current, input, attempt)) return;
       await this.ensureWorkflowLabels(input.repository);
@@ -1058,6 +1073,7 @@ export class GitHubClient implements ForgeHost {
         orchestrationId: input.orchestrationId,
         nodeId: input.node.id,
         attempt,
+        version: input.node.lifecycleVersion ?? 0,
         phase: input.phase,
         status: input.node.status,
       });
@@ -1088,7 +1104,9 @@ export class GitHubClient implements ForgeHost {
     const issue = state.subject.issue;
     if (!issue) return;
     await this.ensureWorkflowLabels(state.subject.repo);
-    const target = workflowLabelForState(state.state);
+    const target = state.lifecycleState === undefined
+      ? workflowLabelForState(state.state)
+      : workflowLabelForLifecycleState(state.lifecycleState);
     const labelResult = await this.gh(["issue", "view", String(issue), "--repo", state.subject.repo, "--json", "labels"]);
     const current = (JSON.parse(labelResult) as { labels?: Array<{ name?: string }> }).labels?.flatMap((label) => label.name ? [label.name] : []) ?? [];
     const remove = current.filter((label) => WORKFLOW_LABEL_NAMES.includes(label as (typeof WORKFLOW_LABEL_NAMES)[number]) && label !== target);

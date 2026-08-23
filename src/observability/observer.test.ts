@@ -10,6 +10,7 @@ import { test } from "node:test";
 import { observeAgentEvent, setAgentEventObservationIdentity, setAgentEventObservationSink } from "../cli/agent-event-stream.js";
 import { BackgroundTaskObservationAdapter, createAgentEventObservationSink } from "./adapters.js";
 import { ForgeDockObservationControlGateway } from "./control-gateway.js";
+import { ObservationProjector } from "./projections.js";
 import { createObservationProducer, createStreamingObservationText, observationStreamKey, retainObservationLogicalStreamId, sanitizeTerminalText, type ObservationEnvelopeV1, type ObservationDraft, type ObservationIdentity, type ObservationSink } from "./contracts.js";
 import { ForgeDockObserver } from "./observer.js";
 import { SqliteObservationStore } from "./sqlite-store.js";
@@ -532,6 +533,32 @@ test("observer never retains raw dropped output and quarantines the next chunk",
   assert.doesNotMatch(serialized, /drop-secret-value|next-secret-value/);
   assert.match(serialized, /quarantined after backpressure drop/);
   observer.close();
+});
+
+test("observation projection rejects stale canonical lifecycle evidence", () => {
+  const projector = new ObservationProjector();
+  const makeEvent = (version: number, state: "investigating" | "executing"): ObservationEnvelopeV1 => ({
+    schemaVersion: "forgedock.observation/v1",
+    eventId: `event-${version}`,
+    runSequence: version,
+    producerSequence: version,
+    occurredAt: `2026-01-01T00:00:0${version}.000Z`,
+    ingestedAt: `2026-01-01T00:00:0${version}.000Z`,
+    identity: { forgeRunId: "canonical-run" },
+    producer,
+    source: "workflow",
+    channel: "lifecycle",
+    kind: "orchestration.state.changed",
+    severity: "notice",
+    payload: { state, attempt: 1, version, transition: { state, attempt: 1, version, transition: "test", occurredAt: "2026-01-01T00:00:00.000Z" } },
+    delivery: {},
+    security: { redacted: false },
+  });
+  projector.apply(makeEvent(2, "executing"));
+  projector.apply(makeEvent(1, "investigating"));
+  const entity = projector.snapshot().entities.find((candidate) => candidate.id === "canonical-run");
+  assert.equal(entity?.workflow.canonicalState, "executing");
+  assert.equal(entity?.workflow.version, 2);
 });
 
 test("control gateway records rejection without mutating state when no adapter exists", async () => {

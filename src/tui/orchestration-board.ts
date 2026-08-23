@@ -136,6 +136,7 @@ export class OrchestrationBoardController {
     if (this.disposed) return;
     const previous = this.records.get(event.orchestrationId);
     if (previous && event.at < previous.updatedAt) return;
+    if (previous && staleLifecycleSnapshot(previous.snapshot, event.snapshot)) return;
     const record: BoardRecord = {
       orchestrationId: event.orchestrationId,
       phase: event.snapshot.orchestrationStatus === "cancelled" ? "cancelled" : "active",
@@ -159,6 +160,7 @@ export class OrchestrationBoardController {
   ): void {
     if (this.disposed) return;
     const previous = this.records.get(orchestrationId);
+    if (previous && staleLifecycleSnapshot(previous.snapshot, snapshot)) return;
     const record: BoardRecord = {
       orchestrationId,
       phase,
@@ -356,7 +358,14 @@ function renderNodeRow(node: OrchestrationNode, theme: Theme): string {
     : "";
   const wait = node.waitReason ? ` · wait=${renderWaitReason(node.waitReason)}` : "";
   const error = node.error ? ` · ${safeInline(node.error)}` : "";
-  return `${statusGlyph(node.status, theme)} #${node.issue} ${node.status}${members}${title}${dependencies}${route}${wait}${error}`;
+  return `${statusGlyph(node.status, theme)} #${node.issue} ${node.lifecycleState ?? node.status}${members}${title}${dependencies}${route}${wait}${error}`;
+}
+
+function staleLifecycleSnapshot(previous: OrchestrationSnapshot, next: OrchestrationSnapshot): boolean {
+  if (previous.lifecycleAttempt === undefined || previous.lifecycleVersion === undefined
+    || next.lifecycleAttempt === undefined || next.lifecycleVersion === undefined) return false;
+  return next.lifecycleAttempt < previous.lifecycleAttempt
+    || (next.lifecycleAttempt === previous.lifecycleAttempt && next.lifecycleVersion <= previous.lifecycleVersion);
 }
 
 function selectedIssueCount(snapshot: OrchestrationSnapshot): number {

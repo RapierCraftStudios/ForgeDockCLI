@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { AgentEvent, AgentEventSink } from "../runtime/agent-runtime.js";
-import { createObservationLogicalStreamId, createObservationProducer, createStreamingObservationText, type ObservationDraft, type ObservationIdentity, type ObservationSink, type ObservationSeverity, type StreamingObservationText } from "./contracts.js";
+import { createObservationLogicalStreamId, createObservationProducer, createStreamingObservationText, type ObservationDraft, type ObservationIdentity, type ObservationLifecyclePayload, type ObservationSink, type ObservationSeverity, type StreamingObservationText } from "./contracts.js";
 
 export interface ObservationAdapterContext {
   identity?: ObservationIdentity;
@@ -150,6 +150,11 @@ export class ControllerObservationAdapter {
 
   failed(error: unknown): void {
     this.emit("lifecycle", "controller.failed", { summary: error instanceof Error ? error.message : String(error) }, "error");
+  }
+
+  /** Emit lifecycle evidence using the same typed contract as orchestration events. */
+  lifecycle(input: ObservationLifecyclePayload): void {
+    this.emit("lifecycle", "controller.lifecycle.changed", input, "notice");
   }
 
   private emit(channel: "lifecycle" | "stdout" | "stderr" | "diagnostic", kind: string, payload: unknown, severity: ObservationSeverity = "info", output?: ObservationDraft["output"], delivery?: ObservationDraft["delivery"]): void {

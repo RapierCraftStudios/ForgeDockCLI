@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { RemediationBlockedPayload } from "../../core/artifacts/schema.js";
+import type { CanonicalLifecycleState, LifecycleTransitionEvidence } from "../../core/state/machine.js";
 import type { ScheduleEvent, ScheduledStatus, WaitReason } from "./scheduler.js";
 
 export type OrchestrationEventName = "queued" | "started" | "completed" | "skipped" | "failed" | "blocked" | "suspended" | "target_recovery" | "retry_wait" | "invalid" | "resumed" | "snapshot";
@@ -18,6 +19,11 @@ export interface OrchestrationNode {
   issue: number;
   memberIssues: readonly number[];
   status: ScheduledStatus;
+  /** Canonical state is additive so old serialized snapshots remain readable. */
+  lifecycleState?: CanonicalLifecycleState;
+  lifecycleAttempt?: number;
+  lifecycleVersion?: number;
+  lifecycleTransition?: LifecycleTransitionEvidence;
   dependencies: readonly string[];
   claims: readonly string[];
   /** Optional so snapshots serialized before route/title projection still render. */
@@ -61,6 +67,10 @@ export interface OrchestrationSnapshot {
   orchestrationStatus?: "running" | "completed" | "failed" | "cancelled";
   /** `investigating set` is distinct from the phase-2 executing DAG. */
   phase?: "investigating" | "executing";
+  lifecycleState?: CanonicalLifecycleState;
+  lifecycleAttempt?: number;
+  lifecycleVersion?: number;
+  lifecycleTransition?: LifecycleTransitionEvidence;
   investigationBarrier?: { expected: number; completed: number };
   nodes: OrchestrationNode[];
   readyNodes: string[];
@@ -82,6 +92,11 @@ export interface OrchestrationEvent {
   orchestrationId: string;
   itemId?: string;
   snapshot: OrchestrationSnapshot;
+  /** Event-level copy makes lifecycle identity available without unpacking the snapshot. */
+  lifecycleState?: CanonicalLifecycleState;
+  lifecycleAttempt?: number;
+  lifecycleVersion?: number;
+  lifecycleTransition?: LifecycleTransitionEvidence;
   at: string;
 }
 
@@ -96,6 +111,10 @@ export function orchestrationEventFromSchedule(
     orchestrationId: snapshot.orchestrationId,
     ...(scheduleEvent.itemId ? { itemId: scheduleEvent.itemId } : {}),
     snapshot,
+    ...(snapshot.lifecycleState !== undefined ? { lifecycleState: snapshot.lifecycleState } : {}),
+    ...(snapshot.lifecycleAttempt !== undefined ? { lifecycleAttempt: snapshot.lifecycleAttempt } : {}),
+    ...(snapshot.lifecycleVersion !== undefined ? { lifecycleVersion: snapshot.lifecycleVersion } : {}),
+    ...(snapshot.lifecycleTransition !== undefined ? { lifecycleTransition: structuredClone(snapshot.lifecycleTransition) } : {}),
     at: snapshot.updatedAt,
   };
 }

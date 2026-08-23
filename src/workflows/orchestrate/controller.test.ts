@@ -1793,6 +1793,7 @@ describe("OrchestrationController", () => {
     const release = deferred<void>();
     let materialized = false;
     const executed: string[] = [];
+    const lifecycleStates: string[] = [];
     const service = controller(repository, async (scheduled) => {
       assert.equal(materialized, true);
       executed.push(scheduled.id);
@@ -1809,6 +1810,9 @@ describe("OrchestrationController", () => {
         materialized = true;
         return { items: [item("issue-1", 1), item("issue-2", 2)], serializationEdges: [] };
       },
+      onEvent: (event) => {
+        if (event.snapshot.lifecycleState) lifecycleStates.push(event.snapshot.lifecycleState);
+      },
     });
     const execution = service.createAndRun({
       repository: "owner/repo", maxParallel: 2, investigationFirst: true,
@@ -1822,6 +1826,7 @@ describe("OrchestrationController", () => {
     release.resolve();
     const result = await execution;
     assert.equal(result.record.phase, "executing");
+    assert.deepEqual(["investigating", "materializing", "ready-to-build", "executing"].every((state) => lifecycleStates.includes(state)), true);
     assert.equal(materialized, true);
     assert.deepEqual(executed, ["issue-1", "issue-2"]);
     assert.deepEqual(result.record.investigations?.map((entry) => entry.baseSha), ["a".repeat(40), "a".repeat(40)]);

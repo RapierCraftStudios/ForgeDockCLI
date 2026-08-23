@@ -1,8 +1,21 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { InvalidTransitionError, attachArtifact, createRun, transition } from "./machine.js";
+import { InvalidTransitionError, attachArtifact, canonicalLifecycleStateForRunState, createRun, isCanonicalLifecycleState, transition } from "./machine.js";
 
 describe("workflow state machine", () => {
+  it("exports the canonical lifecycle vocabulary and monotonic transition evidence", () => {
+    const run = createRun({ workflow: "work-on", subject: { repo: "acme/widget", issue: 7 }, now: "2026-01-01T00:00:00.000Z" });
+    const next = transition(run, "START_INVESTIGATION", { now: "2026-01-01T00:00:01.000Z" }).state;
+    assert.equal(canonicalLifecycleStateForRunState(next.state), "investigating");
+    assert.equal(next.lifecycleState, "investigating");
+    assert.equal(next.lifecycleVersion, 1);
+    assert.equal(next.lifecycleTransition?.previousState, "queued");
+    assert.equal(next.lifecycleTransition?.transition, "START_INVESTIGATION");
+    for (const value of ["investigating", "investigation-retry", "investigation-failed", "decomposed", "materializing", "ready-to-build", "dependency-waiting", "claim-waiting", "executing", "cancelled", "completed"]) {
+      assert.equal(isCanonicalLifecycleState(value), true);
+    }
+  });
+
   it("routes confirmed work through the controlled happy path", () => {
     let run = createRun({ workflow: "work-on", subject: { repo: "acme/widget", issue: 7 }, runId: "run_7", now: "2026-01-01T00:00:00.000Z" });
     for (const event of [

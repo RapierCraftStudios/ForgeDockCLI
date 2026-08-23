@@ -3,6 +3,28 @@ import { describe, it } from "node:test";
 import { buildOrchestrationSnapshot, renderOrchestrationBoard, renderWaitReason } from "./view-model.js";
 
 describe("orchestration status presentation", () => {
+  it("projects dependency and claim waits into distinct canonical lifecycle labels", () => {
+    const snapshot = buildOrchestrationSnapshot({
+      orchestrationId: "orch-canonical-waits",
+      items: [
+        { id: "dependency", issue: 1, priority: 1, dependencies: ["owner"], claims: [] },
+        { id: "claim", issue: 2, priority: 1, dependencies: [], claims: ["src/shared"] },
+      ],
+      result: {
+        status: new Map([["dependency", "queued"], ["claim", "queued"]]),
+        errors: new Map(),
+        waitReasons: new Map([
+          ["dependency", { kind: "dependency", predecessor: "owner" }],
+          ["claim", { kind: "claim-serialization", predecessor: "owner", claims: ["src/shared"] }],
+        ]),
+      },
+    });
+    assert.equal(snapshot.nodes[0]?.lifecycleState, "dependency-waiting");
+    assert.equal(snapshot.nodes[1]?.lifecycleState, "claim-waiting");
+    assert.match(renderOrchestrationBoard(snapshot), /dependency-waiting/);
+    assert.match(renderOrchestrationBoard(snapshot), /claim-waiting/);
+  });
+
   it("keeps failed, blocked, invalid, and suspended nodes visibly distinct", () => {
     const snapshot = buildOrchestrationSnapshot({
       orchestrationId: "orch-status",

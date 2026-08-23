@@ -3,6 +3,75 @@
 import type { ArtifactKind, Subject } from "../artifacts/schema.js";
 
 export type Workflow = "work-on" | "review-pr" | "orchestrate";
+
+/**
+ * The one lifecycle vocabulary shared by orchestration persistence and its
+ * projections. The legacy RunStateName vocabulary remains readable at the
+ * workflow boundary, but new lifecycle evidence always uses this union.
+ */
+export type CanonicalLifecycleState =
+  | "queued"
+  | "investigating"
+  | "investigation-retry"
+  | "investigation-failed"
+  | "decomposed"
+  | "materializing"
+  | "ready-to-build"
+  | "dependency-waiting"
+  | "claim-waiting"
+  | "executing"
+  | "cancelled"
+  | "failed"
+  | "completed";
+
+export type OrchestrationLifecycleState = CanonicalLifecycleState;
+
+export interface LifecycleTransitionEvidence {
+  state: CanonicalLifecycleState;
+  previousState?: CanonicalLifecycleState;
+  attempt: number;
+  version: number;
+  transition: string;
+  occurredAt: string;
+}
+
+export function isCanonicalLifecycleState(value: unknown): value is CanonicalLifecycleState {
+  return typeof value === "string" && CANONICAL_LIFECYCLE_STATES.has(value as CanonicalLifecycleState);
+}
+
+const CANONICAL_LIFECYCLE_STATES = new Set<CanonicalLifecycleState>([
+  "queued", "investigating", "investigation-retry", "investigation-failed", "decomposed",
+  "materializing", "ready-to-build", "dependency-waiting", "claim-waiting", "executing",
+  "cancelled", "failed", "completed",
+]);
+
+/** Compatibility mapping for records written before canonical lifecycle evidence. */
+export function canonicalLifecycleStateForRunState(state: RunStateName): CanonicalLifecycleState {
+  switch (state) {
+    case "investigating": return "investigating";
+    case "preparing": return "materializing";
+    case "building":
+    case "verifying":
+    case "publishing":
+    case "reviewing":
+    case "remediating":
+    case "merging":
+    case "closing": return "executing";
+    case "decomposed": return "decomposed";
+    case "cancelled": return "cancelled";
+    case "failed": return "failed";
+    case "completed": return "completed";
+    case "queued": return "queued";
+    default: return "investigation-failed";
+  }
+}
+
+export function canonicalLifecycleLabel(state: CanonicalLifecycleState): string | undefined {
+  if (state === "queued") return "workflow:ready-to-build";
+  if (state === "completed") return "workflow:merged";
+  return `workflow:${state}`;
+}
+
 export type RunStateName =
   | "queued"
   | "investigating"
@@ -89,6 +158,11 @@ export interface RunState {
   workflow: Workflow;
   subject: Subject;
   state: RunStateName;
+  /** Canonical lifecycle projection; absent only on legacy rehydrated records. */
+  lifecycleState?: CanonicalLifecycleState;
+  lifecycleAttempt?: number;
+  lifecycleVersion?: number;
+  lifecycleTransition?: LifecycleTransitionEvidence;
   lane?: RunTarget["lane"];
   targetBranch?: string;
   promotionTarget?: RunTarget["promotionTarget"];
@@ -193,12 +267,24 @@ export function createRun(input: {
   if (input.target?.promotionTarget !== undefined && !input.target.promotionTarget.trim()) throw new Error("Run promotion target must not be blank");
   if (input.target?.productionTarget !== undefined && !input.target.productionTarget.trim()) throw new Error("Run production target must not be blank");
   if (input.target?.lane === "feature" && !input.target.milestone) throw new Error("Feature-lane runs require milestone identity");
+  const legacyState = input.workflow === "review-pr" ? "reviewing" : "queued";
+  const lifecycleState = canonicalLifecycleStateForRunState(legacyState);
   return {
     schema: "forgedock.run/v1",
     runId: input.runId ?? `run_${crypto.randomUUID()}`,
     workflow: input.workflow,
     subject: input.subject,
-    state: input.workflow === "review-pr" ? "reviewing" : "queued",
+    state: legacyState,
+    lifecycleState,
+    lifecycleAttempt: 1,
+    lifecycleVersion: 0,
+    lifecycleTransition: {
+      state: lifecycleState,
+      attempt: 1,
+      version: 0,
+      transition: "create",
+      occurredAt: now,
+    },
     ...(input.target ? {
       lane: input.target.lane,
       targetBranch: input.target.targetBranch,
@@ -233,8 +319,19 @@ export function transition(
   const nextState: RunState = {
     ...state,
     state: next,
+    lifecycleState: canonicalLifecycleStateForRunState(next),
+    lifecycleAttempt: (state.lifecycleAttempt ?? state.attempt) + 1,
+    lifecycleVersion: (state.lifecycleVersion ?? state.version) + 1,
     version: state.version + 1,
     updatedAt: now,
+  };
+  nextState.lifecycleTransition = {
+    state: nextState.lifecycleState!,
+    previousState: state.lifecycleState ?? canonicalLifecycleStateForRunState(state.state),
+    attempt: nextState.lifecycleAttempt!,
+    version: nextState.lifecycleVersion!,
+    transition: event,
+    occurredAt: now,
   };
   if (options.headSha !== undefined) nextState.headSha = options.headSha;
   if (options.scopeManifest !== undefined) nextState.scopeManifest = options.scopeManifest;

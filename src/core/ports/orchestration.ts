@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import type { CanonicalLifecycleState, LifecycleTransitionEvidence } from "../state/machine.js";
+
 export type DurableOrchestrationNodeStatus =
   | "queued"
   | "running"
@@ -217,6 +219,11 @@ export interface OrchestrationItemRecord {
 
 export interface OrchestrationNodeRecord extends OrchestrationItemRecord {
   status: DurableOrchestrationNodeStatus;
+  /** Shared lifecycle identity; optional for legacy durable records. */
+  lifecycleState?: CanonicalLifecycleState;
+  lifecycleAttempt?: number;
+  lifecycleVersion?: number;
+  lifecycleTransition?: LifecycleTransitionEvidence;
   error?: string;
   childRunIds: string[];
   /** Authoritative replacement issue numbers when this node was decomposed. */
@@ -263,6 +270,11 @@ export interface OrchestrationRecord {
   /** Non-secret identity of the controller claim used for the most recent execution. */
   executionClaimId?: string;
   status: "running" | "completed" | "failed" | "cancelled";
+  /** Shared lifecycle identity; optional for legacy durable records. */
+  lifecycleState?: CanonicalLifecycleState;
+  lifecycleAttempt?: number;
+  lifecycleVersion?: number;
+  lifecycleTransition?: LifecycleTransitionEvidence;
   createdAt: string;
   updatedAt: string;
   nodes: OrchestrationNodeRecord[];

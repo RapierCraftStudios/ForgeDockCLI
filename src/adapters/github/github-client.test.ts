@@ -9,7 +9,7 @@ import type { Subject } from "../../core/artifacts/schema.js";
 import { renderArtifactComment } from "../../core/artifacts/codec.js";
 import type { PlanMaterializationRequest, PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import { InMemoryRemediationAdmissionRepository } from "../../core/ports/repositories.js";
-import { GitHubArtifactRepository, GitHubClient, renderPaginatedPullRequestDiff, repositoryFromRemote, reviewFindingLaneMarker, reviewFindingMarker, reviewFindingReconciliationCandidates, reviewFindingSemanticMarker, workflowLabelForState } from "./github-client.js";
+import { GitHubArtifactRepository, GitHubClient, renderPaginatedPullRequestDiff, repositoryFromRemote, reviewFindingLaneMarker, reviewFindingMarker, reviewFindingReconciliationCandidates, reviewFindingSemanticMarker, workflowLabelForLifecycleState, workflowLabelForState } from "./github-client.js";
 
 class CommentClient {
   comments = new Map<string, string[]>();
@@ -513,6 +513,16 @@ describe("GitHub pull request admission", () => {
 });
 
 describe("GitHub workflow label projection", () => {
+  it("maps every canonical lifecycle state through the shared label contract", () => {
+    assert.equal(workflowLabelForLifecycleState("investigating"), "workflow:investigating");
+    assert.equal(workflowLabelForLifecycleState("materializing"), "workflow:materializing");
+    assert.equal(workflowLabelForLifecycleState("ready-to-build"), "workflow:ready-to-build");
+    assert.equal(workflowLabelForLifecycleState("dependency-waiting"), "workflow:dependency-waiting");
+    assert.equal(workflowLabelForLifecycleState("claim-waiting"), "workflow:claim-waiting");
+    assert.equal(workflowLabelForLifecycleState("executing"), "workflow:executing");
+    assert.equal(workflowLabelForLifecycleState("cancelled"), "workflow:cancelled");
+  });
+
   it("maps typed run states to the canonical legacy-compatible labels", () => {
     assert.equal(workflowLabelForState("investigating"), "workflow:investigating");
     assert.equal(workflowLabelForState("preparing"), "workflow:ready-to-build");

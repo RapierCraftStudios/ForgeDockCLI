@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { LeaseContinuityError } from "../../core/ports/lease.js";
+import type { CanonicalLifecycleState, LifecycleTransitionEvidence } from "../../core/state/machine.js";
 import type { OrchestrationPlanMetadata, OrchestrationWaitReason } from "../../core/ports/orchestration.js";
 
 export { InMemoryLeaseRepository } from "../../core/ports/lease.js";
@@ -10,6 +11,11 @@ export type { Lease, LeaseRepository } from "../../core/ports/lease.js";
 export interface ScheduledWorkItem {
   id: string;
   issue: number;
+  /** Canonical lifecycle evidence retained across scheduler passes. */
+  lifecycleState?: CanonicalLifecycleState;
+  lifecycleAttempt?: number;
+  lifecycleVersion?: number;
+  lifecycleTransition?: LifecycleTransitionEvidence;
   priority: number;
   dependencies: readonly string[];
   claims: readonly string[];

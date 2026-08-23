@@ -2672,7 +2672,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
           source: "workflow",
           channel: "lifecycle",
           kind: "orchestration.state.changed",
-          payload: { name: event.name, itemId: event.itemId, phase: snapshot.phase, investigationBarrier: snapshot.investigationBarrier, readyNodes: snapshot.readyNodes, blockedNodes: snapshot.blockedNodes, suspendedNodes: snapshot.suspendedNodes, waitingNodes: snapshot.nodes.filter((node) => node.status === "queued" && node.waitReason).map((node) => ({ id: node.id, reason: node.waitReason })) },
+          payload: { name: event.name, itemId: event.itemId, phase: snapshot.phase, state: snapshot.lifecycleState, attempt: snapshot.lifecycleAttempt, version: snapshot.lifecycleVersion, transition: snapshot.lifecycleTransition, investigationBarrier: snapshot.investigationBarrier, readyNodes: snapshot.readyNodes, blockedNodes: snapshot.blockedNodes, suspendedNodes: snapshot.suspendedNodes, waitingNodes: snapshot.nodes.filter((node) => node.status === "queued" && node.waitReason).map((node) => ({ id: node.id, reason: node.waitReason })) },
         });
         process.stdout.write(`  ${event.name}${event.itemId ? ` ${event.itemId}` : ""}${snapshot.phase === "investigating" ? ` · investigating set ${snapshot.investigationBarrier?.completed ?? 0}/${snapshot.investigationBarrier?.expected ?? 0}` : snapshot.phase === "executing" ? " · executing DAG" : ""} · ready=${snapshot.readyNodes.length} waiting=${snapshot.nodes.filter((node) => node.status === "queued" && node.waitReason).length} blocked=${snapshot.blockedNodes.length} invalid=${snapshot.nodes.filter((node) => node.status === "invalid").length} suspended=${snapshot.suspendedNodes.length}\n`);
       },
@@ -3211,6 +3211,10 @@ function renderCliOrchestrationEvent(event: OrchestrationEvent, repository: stri
     payload: {
       name: event.name,
       itemId: event.itemId,
+      state: snapshot.lifecycleState,
+      attempt: snapshot.lifecycleAttempt,
+      version: snapshot.lifecycleVersion,
+      transition: snapshot.lifecycleTransition,
       readyNodes: snapshot.readyNodes,
       blockedNodes: snapshot.blockedNodes,
       suspendedNodes: snapshot.suspendedNodes,

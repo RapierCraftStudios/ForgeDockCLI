@@ -49,7 +49,8 @@ import {
   normalizedDeliveryRouteClaim,
   rateLimitWindowKey,
 } from "./scheduler.js";
-import { buildOrchestrationSnapshot } from "./view-model.js";
+import { buildOrchestrationSnapshot, lifecycleStateForItem } from "./view-model.js";
+import type { CanonicalLifecycleState, LifecycleTransitionEvidence } from "../../core/state/machine.js";
 
 export interface CreateOrchestrationInput {
   orchestrationId?: string;
@@ -365,6 +366,16 @@ export class OrchestrationController {
       ...(input.productionTarget !== undefined ? { productionTarget: input.productionTarget } : {}),
       executionAttempt: 0,
       status: "running",
+      lifecycleState: input.investigationFirst ? "investigating" : "ready-to-build",
+      lifecycleAttempt: 1,
+      lifecycleVersion: 0,
+      lifecycleTransition: {
+        state: input.investigationFirst ? "investigating" : "ready-to-build",
+        attempt: 1,
+        version: 0,
+        transition: "create",
+        occurredAt: now,
+      },
       createdAt: now,
       updatedAt: now,
       serializationEdges: (input.investigationFirst ? [] : graph.edges).map((edge) => ({
@@ -372,9 +383,12 @@ export class OrchestrationController {
         successor: edge.successor,
         overlappingClaims: [...edge.overlappingClaims],
       })),
-      nodes: graph.items.map((item) => nodeRecordFromItem(input.investigationFirst
-        ? { ...item, dependencies: [], claims: [] }
-        : item)),
+      nodes: graph.items.map((item) => {
+        const node = nodeRecordFromItem(input.investigationFirst
+          ? { ...item, dependencies: [], claims: [] }
+          : item);
+        return input.investigationFirst ? withNodeLifecycle(node, "investigating", 1, 0, "create", now) : node;
+      }),
       ...(investigationWave !== undefined ? {
         phase: "investigating" as const,
         investigationWave,
@@ -720,11 +734,13 @@ export class OrchestrationController {
               status: retry.status === "retry_wait" ? "queued" : "failed",
               error: retry.error instanceof Error ? retry.error.message : String(retry.error ?? error),
             }));
+            this.advanceLifecycle(state, retry.status === "retry_wait" ? "investigation-retry" : "investigation-failed", "investigation-worker-retry");
             await this.flush(state);
             activeInvestigations -= 1;
             return retry;
           }
           this.updateInvestigation(state, item.id, (entry) => ({ ...entry, status: "failed", error: error instanceof Error ? error.message : String(error) }));
+          this.advanceLifecycle(state, "investigation-failed", "investigation-exhausted");
           await this.flush(state);
           activeInvestigations -= 1;
           throw error;
@@ -770,7 +786,7 @@ export class OrchestrationController {
       throw new Error(`Investigation barrier failed for wave ${wave}`);
     }
     if (await this.dependencies.isCancelled?.(record.orchestrationId)) {
-      this.replaceRecord(state, { ...state.record, status: "cancelled", updatedAt: this.now() });
+      this.replaceRecord(state, this.recordWithLifecycle({ ...state.record, status: "cancelled" }, "cancelled", "investigation-barrier-cancelled"));
       await this.flush(state);
       throw new Error(`Orchestration ${record.orchestrationId} was cancelled at the investigation barrier`);
     }
@@ -803,6 +819,12 @@ export class OrchestrationController {
       }
     }
     assertInvestigationActive();
+    // Materialization is its own durable lifecycle boundary. Persist it before
+    // invoking the side-effecting materializer so cancellation cannot later
+    // make an in-flight operation look like ready work.
+    this.advanceLifecycle(state, "materializing", "investigation-barrier-complete");
+    this.emitSnapshot(state.record, state);
+    await this.flush(state);
     const materialized = await materialize({
       orchestration: structuredClone(state.record),
       wave,
@@ -813,6 +835,9 @@ export class OrchestrationController {
     assertInvestigationActive();
     const nextItems = materialized.items.map(cloneScheduledItem);
     const nextEdges = (materialized.serializationEdges ?? materializeClaimDependencies(nextItems).edges).map(cloneSerializationEdge);
+    this.advanceLifecycle(state, "ready-to-build", "materialization-complete");
+    this.emitSnapshot(state.record, state);
+    await this.flush(state);
     validateGraph(nextItems, nextEdges);
     for (const item of nextItems) assertProtectedProductionRoute(item, state.record.productionTarget);
     const shadow = materialized.shadowContractionProposals ?? [];
@@ -846,9 +871,9 @@ export class OrchestrationController {
       return;
     }
     this.replaceRecord(state, {
-      ...state.record,
+      ...this.recordWithLifecycle(state.record, "executing", "execution-dispatch-admitted"),
       phase: "executing",
-      nodes: nextItems.map((item) => nodeRecordFromItem(item)),
+      nodes: nextItems.map((item) => withNodeLifecycle(nodeRecordFromItem(item), "executing", 1, 0, "execution-dispatch-admitted", this.now(), "ready-to-build")),
       serializationEdges: nextEdges.map((edge) => ({ predecessor: edge.predecessor, successor: edge.successor, overlappingClaims: [...edge.overlappingClaims] })),
       executionMaterializedAt: this.now(),
       shadowContractionProposals: [...(state.record.shadowContractionProposals ?? []), ...shadow],
@@ -2008,18 +2033,26 @@ export class OrchestrationController {
 
   private cancelState(state: PersistenceState, reason: string): void {
     const now = this.now();
-    this.replaceRecord(state, {
+    const cancelledRecord = this.recordWithLifecycle({
       ...state.record,
       status: "cancelled",
       updatedAt: now,
+    }, "cancelled", reason);
+    this.replaceRecord(state, {
+      ...cancelledRecord,
       nodes: state.record.nodes.map((node) => {
         const active = activeAttempt(node);
-        if (!active) return node;
+        if (!active) {
+          if (node.lifecycleState === "cancelled") return node;
+          const version = (node.lifecycleVersion ?? 0) + 1;
+          const attempt = node.lifecycleAttempt ?? 1;
+          return { ...node, lifecycleState: "cancelled" as const, lifecycleAttempt: attempt, lifecycleVersion: version, lifecycleTransition: { state: "cancelled" as const, ...(node.lifecycleState !== undefined ? { previousState: node.lifecycleState } : {}), attempt, version, transition: reason, occurredAt: now } };
+        }
         const attempts = (node.attempts ?? []).map((attempt) => attempt.attemptId === active.attemptId
           ? { ...attempt, status: "interrupted" as const, completedAt: now, updatedAt: now, error: reason }
           : attempt);
         const { activeAttemptId: _activeAttemptId, error: _error, waitReason: _waitReason, ...rest } = node;
-        return { ...rest, status: "queued" as const, attempts, lastRecovery: { mode: "relaunch" as const, reconciledAt: now, attemptId: active.attemptId, reason } };
+        return { ...rest, status: "queued" as const, lifecycleState: "cancelled" as const, lifecycleAttempt: node.lifecycleAttempt ?? active.attempt, lifecycleVersion: (node.lifecycleVersion ?? 0) + 1, lifecycleTransition: { state: "cancelled" as const, ...(node.lifecycleState !== undefined ? { previousState: node.lifecycleState } : {}), attempt: node.lifecycleAttempt ?? active.attempt, version: (node.lifecycleVersion ?? 0) + 1, transition: reason, occurredAt: now }, attempts, lastRecovery: { mode: "relaunch" as const, reconciledAt: now, attemptId: active.attemptId, reason } };
       }),
     });
   }
@@ -2107,7 +2140,33 @@ export class OrchestrationController {
     });
   }
 
+  private advanceLifecycle(state: PersistenceState, lifecycleState: CanonicalLifecycleState, transition: string): void {
+    this.replaceRecord(state, this.recordWithLifecycle(state.record, lifecycleState, transition));
+  }
+
+  private recordWithLifecycle(record: OrchestrationRecord, lifecycleState: CanonicalLifecycleState, transition: string): OrchestrationRecord {
+    const previousState = record.lifecycleState;
+    const version = (record.lifecycleVersion ?? 0) + 1;
+    const attempt = Math.max(record.lifecycleAttempt ?? 1, record.executionAttempt ?? 0, 1);
+    return {
+      ...record,
+      lifecycleState,
+      lifecycleAttempt: attempt,
+      lifecycleVersion: version,
+      lifecycleTransition: {
+        state: lifecycleState,
+        ...(previousState !== undefined ? { previousState } : {}),
+        attempt,
+        version,
+        transition,
+        occurredAt: this.now(),
+      },
+      updatedAt: this.now(),
+    };
+  }
+
   private replaceRecord(state: PersistenceState, record: OrchestrationRecord): void {
+    record = normalizeLifecycleRecord(record, this.now);
     // Scheduler lifecycle notifications frequently carry only a fresh
     // timestamp. Do not enqueue a full-record write when the durable
     // projection is unchanged; callers still retain the last durable time for
@@ -2147,6 +2206,10 @@ export class OrchestrationController {
     const snapshot = buildOrchestrationSnapshot({
       orchestrationId: state.record.orchestrationId,
       orchestrationStatus: state.record.status,
+      ...(state.record.lifecycleState !== undefined ? { lifecycleState: state.record.lifecycleState } : {}),
+      ...(state.record.lifecycleAttempt !== undefined ? { lifecycleAttempt: state.record.lifecycleAttempt } : {}),
+      ...(state.record.lifecycleVersion !== undefined ? { lifecycleVersion: state.record.lifecycleVersion } : {}),
+      ...(state.record.lifecycleTransition !== undefined ? { lifecycleTransition: state.record.lifecycleTransition } : {}),
       repository: state.record.repository,
       items: state.record.nodes.map(itemFromNodeRecord),
       serializationEdges: (state.record.serializationEdges ?? []).map(cloneSerializationEdge),
@@ -2188,6 +2251,10 @@ export class OrchestrationController {
     const snapshot = buildOrchestrationSnapshot({
       orchestrationId: record.orchestrationId,
       orchestrationStatus: record.status,
+      ...(record.lifecycleState !== undefined ? { lifecycleState: record.lifecycleState } : {}),
+      ...(record.lifecycleAttempt !== undefined ? { lifecycleAttempt: record.lifecycleAttempt } : {}),
+      ...(record.lifecycleVersion !== undefined ? { lifecycleVersion: record.lifecycleVersion } : {}),
+      ...(record.lifecycleTransition !== undefined ? { lifecycleTransition: record.lifecycleTransition } : {}),
       repository: record.repository,
       items: record.nodes.map(itemFromNodeRecord),
       serializationEdges: (record.serializationEdges ?? []).map(cloneSerializationEdge),
@@ -2260,6 +2327,62 @@ export class OrchestrationController {
   }
 }
 
+function normalizeLifecycleRecord(record: OrchestrationRecord, now: () => string): OrchestrationRecord {
+  const recordState = record.lifecycleState
+    ?? (record.status === "cancelled" ? "cancelled" : record.phase === "investigating" ? "investigating" : "ready-to-build");
+  const nodes = record.nodes.map((node) => {
+    if (record.status === "cancelled") {
+      if (node.lifecycleState === "cancelled") return node;
+      const version = (node.lifecycleVersion ?? 0) + 1;
+      const attempt = node.lifecycleAttempt ?? 1;
+      return { ...node, lifecycleState: "cancelled" as const, lifecycleAttempt: attempt, lifecycleVersion: version, lifecycleTransition: { state: "cancelled" as const, ...(node.lifecycleState !== undefined ? { previousState: node.lifecycleState } : {}), attempt, version, transition: "orchestration-cancelled", occurredAt: now() } };
+    }
+    // Legacy non-investigation DAGs are already represented by the durable
+    // scheduler status. Avoid rewriting every node with additive lifecycle
+    // metadata on every scheduler checkpoint; investigation-first records
+    // (the canonical lifecycle path) retain per-node evidence below.
+    if (record.phase !== "investigating" && node.lifecycleState === undefined) return node;
+    const waitReason = node.waitReason;
+    const derived = lifecycleStateForItem({}, node.status as ScheduledStatus, waitReason, record.phase);
+    // Investigation outcomes are authoritative and must not be relabeled by
+    // the scheduler's generic terminal statuses.
+    const investigation = record.investigations?.find((entry) => entry.nodeId === node.id);
+    const lifecycleState = investigation?.status === "failed"
+      ? "investigation-failed"
+      : investigation?.status === "queued" && investigation.attemptCount > 0
+        ? "investigation-retry"
+        : node.lifecycleState === "decomposed" || node.lifecycleState === "investigation-failed"
+          || (record.phase === "investigating" && (node.lifecycleState === "investigating" || node.lifecycleState === "investigation-retry"))
+          ? node.lifecycleState
+          : derived;
+    if (node.lifecycleState === lifecycleState && node.lifecycleTransition) return node;
+    const version = (node.lifecycleVersion ?? 0) + 1;
+    const attempt = node.lifecycleAttempt ?? Math.max(1, investigation?.attemptCount ?? 1);
+    const retainTransitionEvidence = record.phase === "investigating"
+      || lifecycleState === "cancelled"
+      || lifecycleState === "decomposed"
+      || lifecycleState === "investigation-failed";
+    const { lifecycleTransition: _priorTransition, ...withoutTransition } = node;
+    return {
+      ...withoutTransition,
+      lifecycleState,
+      lifecycleAttempt: attempt,
+      lifecycleVersion: version,
+      ...(retainTransitionEvidence ? {
+        lifecycleTransition: {
+          state: lifecycleState,
+          ...(node.lifecycleState !== undefined ? { previousState: node.lifecycleState } : {}),
+          attempt,
+          version,
+          transition: "scheduler-projection",
+          occurredAt: now(),
+        },
+      } : {}),
+    };
+  });
+  return { ...record, lifecycleState: recordState, nodes };
+}
+
 function investigationWorkflowLabel(record: OrchestrationRecord, node: OrchestrationNodeRecord): "workflow:investigating" | "workflow:waiting" | "workflow:invalid" | "workflow:decomposed" {
   const investigation = (record.investigations ?? []).find((entry) => entry.nodeId === node.id);
   if (investigation?.outcome === "invalid" && investigation.settledAt !== undefined) return "workflow:invalid";
@@ -2278,6 +2401,10 @@ function nodeRecordFromItem(item: ScheduledWorkItem): OrchestrationNodeRecord {
   return {
     id: item.id,
     issue: item.issue,
+    ...(item.lifecycleState !== undefined ? { lifecycleState: item.lifecycleState } : {}),
+    ...(item.lifecycleAttempt !== undefined ? { lifecycleAttempt: item.lifecycleAttempt } : {}),
+    ...(item.lifecycleVersion !== undefined ? { lifecycleVersion: item.lifecycleVersion } : {}),
+    ...(item.lifecycleTransition !== undefined ? { lifecycleTransition: structuredClone(item.lifecycleTransition) } : {}),
     priority: item.priority,
     dependencies: [...item.dependencies],
     claims: [...item.claims],
@@ -2308,6 +2435,10 @@ function itemFromNodeRecord(node: OrchestrationNodeRecord): ScheduledWorkItem {
   return {
     id: node.id,
     issue: node.issue,
+    ...(node.lifecycleState !== undefined ? { lifecycleState: node.lifecycleState } : {}),
+    ...(node.lifecycleAttempt !== undefined ? { lifecycleAttempt: node.lifecycleAttempt } : {}),
+    ...(node.lifecycleVersion !== undefined ? { lifecycleVersion: node.lifecycleVersion } : {}),
+    ...(node.lifecycleTransition !== undefined ? { lifecycleTransition: structuredClone(node.lifecycleTransition) } : {}),
     priority: node.priority,
     dependencies: [...node.dependencies],
     claims: [...node.claims],
@@ -2337,6 +2468,26 @@ function itemFromNodeRecord(node: OrchestrationNodeRecord): ScheduledWorkItem {
       ...(retryAttempt.rateLimit !== undefined ? { retryRateLimitWindow: rateLimitWindowKey(retryAttempt.rateLimit) } : {}),
     } : {}),
   };
+}
+
+function withNodeLifecycle(
+  node: OrchestrationNodeRecord,
+  state: CanonicalLifecycleState,
+  attempt: number,
+  version: number,
+  transition: string,
+  occurredAt: string,
+  previousState?: CanonicalLifecycleState,
+): OrchestrationNodeRecord {
+  const evidence: LifecycleTransitionEvidence = {
+    state,
+    ...(previousState !== undefined ? { previousState } : {}),
+    attempt,
+    version,
+    transition,
+    occurredAt,
+  };
+  return { ...node, lifecycleState: state, lifecycleAttempt: attempt, lifecycleVersion: version, lifecycleTransition: evidence };
 }
 
 function cloneScheduledItem(item: ScheduledWorkItem): ScheduledWorkItem {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { observationEntityId, type ObservationEnvelopeV1, type ObservationIdentity } from "./contracts.js";
+import { isObservationLifecyclePayload, observationEntityId, type ObservationEnvelopeV1, type ObservationIdentity, type ObservationLifecyclePayload } from "./contracts.js";
+import type { CanonicalLifecycleState, LifecycleTransitionEvidence } from "../core/state/machine.js";
 
 export type ObservedEntityType = "run" | "work-unit" | "controller" | "agent" | "reviewer" | "task";
 export type ObservedProcessState = "unknown" | "starting" | "alive" | "unresponsive" | "exited";
@@ -24,6 +25,10 @@ export interface ObservedEntity {
   workflow: {
     phase: string;
     state: string;
+    canonicalState?: CanonicalLifecycleState;
+    attempt?: number;
+    version?: number;
+    transition?: LifecycleTransitionEvidence;
   };
   process: {
     state: ObservedProcessState;
@@ -80,12 +85,20 @@ export class ObservationProjector {
   readonly #timeline: ObservedTimelineEntry[] = [];
   readonly #output: ObservationEnvelopeV1[] = [];
   #updatedAt: string | undefined;
+  #lifecycleEvidence = new Map<string, { attempt: number; version: number; sequence: number }>();
 
   apply(event: ObservationEnvelopeV1): void {
     const entityId = observationEntityId(event.identity, event.producer);
-    const entity = this.#entities.get(entityId) ?? createEntity(entityId, event);
     const payload = asRecord(event.payload);
-    const state = stringValue(payload?.state) ?? stringValue(payload?.status);
+    const lifecycle = lifecyclePayload(event, payload);
+    if (lifecycle) {
+      const previous = this.#lifecycleEvidence.get(entityId);
+      const current = { attempt: lifecycle.attempt, version: lifecycle.version, sequence: event.runSequence };
+      if (previous && compareLifecycleEvidence(current, previous) <= 0) return;
+      this.#lifecycleEvidence.set(entityId, current);
+    }
+    const entity = this.#entities.get(entityId) ?? createEntity(entityId, event);
+    const state = lifecycle?.state ?? stringValue(payload?.state) ?? stringValue(payload?.status);
     const phase = stringValue(payload?.phase);
     const activity = activityFromEvent(event, payload);
     const processState = processStateFromEvent(event, state);
@@ -100,6 +113,17 @@ export class ObservationProjector {
     entity.workflow = {
       phase: phase ?? entity.workflow.phase,
       state: state ?? entity.workflow.state,
+      ...(lifecycle ? {
+        canonicalState: lifecycle.state,
+        attempt: lifecycle.attempt,
+        version: lifecycle.version,
+        ...(lifecycle.transition !== undefined ? { transition: lifecycle.transition } : {}),
+      } : entity.workflow.canonicalState !== undefined ? {
+        canonicalState: entity.workflow.canonicalState,
+        ...(entity.workflow.attempt !== undefined ? { attempt: entity.workflow.attempt } : {}),
+        ...(entity.workflow.version !== undefined ? { version: entity.workflow.version } : {}),
+        ...(entity.workflow.transition !== undefined ? { transition: entity.workflow.transition } : {}),
+      } : {}),
     };
     entity.process = {
       state: processState ?? entity.process.state,
@@ -151,6 +175,7 @@ export class ObservationProjector {
     this.#attention.clear();
     this.#timeline.length = 0;
     this.#output.length = 0;
+    this.#lifecycleEvidence.clear();
     this.#updatedAt = undefined;
   }
 
@@ -193,6 +218,30 @@ export class ObservationProjector {
       ? { level: current.level, reason: current.reason, ...(current.decisionId ? { decisionId: current.decisionId } : {}) }
       : { level: "none" };
   }
+}
+
+function lifecyclePayload(
+  event: ObservationEnvelopeV1,
+  payload: Record<string, unknown> | undefined,
+): ObservationLifecyclePayload | undefined {
+  if (event.lifecycleState !== undefined) {
+    return {
+      ...(payload ?? {}),
+      state: event.lifecycleState,
+      attempt: event.lifecycleAttempt ?? 0,
+      version: event.lifecycleVersion ?? event.runSequence,
+      ...(event.lifecycleTransition !== undefined ? { transition: event.lifecycleTransition } : {}),
+    };
+  }
+  if (!payload || (!Object.hasOwn(payload, "attempt") && !Object.hasOwn(payload, "version"))) return undefined;
+  return isObservationLifecyclePayload(payload) ? payload : undefined;
+}
+
+function compareLifecycleEvidence(
+  left: { attempt: number; version: number; sequence: number },
+  right: { attempt: number; version: number; sequence: number },
+): number {
+  return left.attempt - right.attempt || left.version - right.version || left.sequence - right.sequence;
 }
 
 function attentionRank(level: Exclude<AttentionLevel, "none">): number {
