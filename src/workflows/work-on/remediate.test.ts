@@ -60,9 +60,9 @@ describe("mustFix remediation", () => {
   it("contracts compatible criterion shards into two packets without dropping roots", () => {
     const roots = Array.from({ length: 6 }, (_, index) => ({
       id: `f-${index}`, rootId: `root-${index}`,
-      normalizedRoot: `criterion-1\nsrc/${index < 3 ? "controller" : "view"}.ts\ncomponent\ninvariant\nfailure-${index}\ntrigger-${index}`,
+      normalizedRoot: `${index < 4 ? "criterion-1" : "criterion-2"}\nsrc/${index < 3 ? "controller" : "view"}.ts\ncomponent\ninvariant\nfailure-${index}\ntrigger-${index}`,
       severity: "high" as const, confidence: "high" as const, blocking: true, mustFix: true,
-      title: `Root ${index}`, evidence: "evidence", location: `src/${index < 3 ? "controller" : "view"}.ts:1`,
+      title: `Root ${index}`, evidence: "evidence", location: `src/${index < 4 ? "controller" : "view"}.ts:1`,
       intentRelevance: "criterion", remediation: "fix", scopeDisposition: "in_scope" as const,
     }));
     const clusters = clusterMustFixFindings(roots);

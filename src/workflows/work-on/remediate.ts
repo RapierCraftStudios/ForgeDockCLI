@@ -153,7 +153,7 @@ export function clusterMustFixFindings(
   for (const finding of findings) {
     const structural = finding.normalizedRoot?.split("\n") ?? [];
     const family = [
-      (finding.matchedAcceptanceCriteria ?? []).map((criterion) => /criterion-[1-9][0-9]*/i.exec(criterion)?.[0] ?? criterion).sort().join("|"),
+      criterionFamilyForFinding(finding),
       structural.length >= 5 ? [structural[0], structural[1], structural[3], structural[4]].join("|") : finding.causalRoot ?? finding.title,
     ].join("::").toLowerCase();
     const existing = byFamily.get(family) ?? [];
@@ -213,11 +213,18 @@ function compatibleCluster(left: MustFixCluster, right: MustFixCluster): boolean
   if (criterionFamily(left.family) !== criterionFamily(right.family)) return false;
   const union = new Set([...left.productionPaths, ...right.productionPaths]);
   if (union.size > 4) return false;
-  // Preserve the root-ledger component boundary: compatible shards must share
-  // at least one admitted production path. This permits a connected
-  // controller/view-model packet while keeping unrelated same-criterion
-  // components separate.
+  // Packet packing does not alias root identities. Preserve the root-ledger
+  // component boundary: compatible shards must share at least one admitted
+  // production path. This permits a connected controller/view-model packet
+  // while keeping unrelated same-criterion components separate.
   return left.productionPaths.some((path) => right.productionPaths.includes(path));
+}
+
+function criterionFamilyForFinding(finding: MustFixCluster["findings"][number]): string {
+  const criterionText = (finding.matchedAcceptanceCriteria ?? []).join(" ");
+  const source = `${criterionText}\n${finding.normalizedRoot ?? ""}`;
+  const match = /criterion[- ]([1-9][0-9]*)/i.exec(source);
+  return match ? `criterion-${match[1]}` : `unclassified:${finding.causalRoot ?? finding.title}`;
 }
 
 function criterionFamily(family: string): string { return family.split("::", 1)[0] ?? family; }
