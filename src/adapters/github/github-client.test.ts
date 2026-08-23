@@ -499,6 +499,29 @@ describe("GitHub pull request admission", () => {
     assert.equal(state, "MERGED");
   });
 
+  it("treats neutral and skipped required check outcomes as passing", async () => {
+    const client = new GitHubClient();
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      if (args[0] === "pr" && args[1] === "view" && args.includes("number,title,body,url,state,headRefOid,headRefName,baseRefName")) {
+        return JSON.stringify(pullRequestProjection(186));
+      }
+      if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ mergeable: "MERGEABLE" });
+      if (args[0] === "pr" && args[1] === "checks") return JSON.stringify([
+        { name: "Neutral CI", state: "NEUTRAL" },
+        { name: "Skipped CI", state: "SKIPPED" },
+      ]);
+      if (args[0] === "api" && args[1]?.includes("/check-runs")) return JSON.stringify([{ check_runs: [
+        { name: "Neutral CI", head_sha: headSha, status: "completed", conclusion: "neutral" },
+        { name: "Skipped CI", head_sha: headSha, status: "completed", conclusion: "skipped" },
+      ] }]);
+      if (args[0] === "api" && args[1]?.includes("/status?")) return JSON.stringify({ sha: headSha, statuses: [] });
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+
+    const gate = await client.getPullRequestMergeGate("a/b", 186, headSha, "staging");
+    assert.deepEqual(gate.requiredChecks.map((check) => check.state), ["passed", "passed"]);
+  });
+
   it("requires the initial pull request to be open before reading its merge gate", async () => {
     const client = new GitHubClient();
     Object.defineProperty(client, "gh", { value: async (args: string[]) => {
@@ -550,6 +573,54 @@ describe("GitHub workflow label projection", () => {
     assert.deepEqual(labels, ["workflow:merged"]);
     await client.projectOrchestrationNodeState({ ...base, phase: "waiting", attempt: { attemptId: "old", attempt: 1, recovery: "initial", status: "retry_wait", startedAt: "now", updatedAt: "now" } });
     assert.deepEqual(labels, ["workflow:merged"]);
+  });
+
+  it("gives terminal node status precedence over stale activity labels", async () => {
+    const terminalCases = [
+      { status: "failed", expected: "workflow:engine-error", workflowLabel: "workflow:investigating" },
+      { status: "blocked", expected: "workflow:engine-error", workflowLabel: "workflow:waiting" },
+      { status: "invalid", expected: "workflow:invalid", workflowLabel: "workflow:investigating" },
+      { status: "skipped", expected: "workflow:merged", workflowLabel: "workflow:investigating" },
+      { status: "skipped", expected: "workflow:decomposed", workflowLabel: "workflow:decomposed" },
+      { status: "completed", expected: "workflow:merged", workflowLabel: "workflow:investigating" },
+    ] as const;
+
+    for (const [index, scenario] of terminalCases.entries()) {
+      let labels = ["workflow:investigating"];
+      const client = new GitHubClient();
+      Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+        if (args[0] === "label" && args[1] === "create") return "";
+        if (args[0] === "issue" && args[1] === "view") return JSON.stringify({ labels: labels.map((name) => ({ name })) });
+        if (args[0] === "issue" && args[1] === "edit") {
+          const add = args.includes("--add-label") ? args[args.indexOf("--add-label") + 1]?.split(",") ?? [] : [];
+          const remove = args.includes("--remove-label") ? args[args.indexOf("--remove-label") + 1]?.split(",") ?? [] : [];
+          labels = [...new Set([...labels.filter((label) => !remove.includes(label)), ...add])];
+          return "";
+        }
+        throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+      } });
+      const node = { id: `terminal-${index}`, issue: 30 + index, priority: 1, memberIssues: [], status: "queued" as const, dependencies: [], claims: [], childRunIds: [] };
+      const base = { orchestrationId: `dag-terminal-${index}`, repository: "a/b", node };
+      await client.projectOrchestrationNodeState({
+        ...base,
+        phase: "terminal",
+        node: { ...node, status: scenario.status },
+        workflowLabel: scenario.workflowLabel,
+        attempt: { attemptId: "terminal-attempt", attempt: 1, recovery: "resume", status: scenario.status, startedAt: "now", updatedAt: "now" },
+      });
+      assert.deepEqual(labels, [scenario.expected], scenario.status);
+
+      // A late active projection from the same attempt cannot reclaim the
+      // terminal label, even when it carries an investigation label.
+      await client.projectOrchestrationNodeState({
+        ...base,
+        phase: "active",
+        node: { ...node, status: "running" },
+        workflowLabel: "workflow:investigating",
+        attempt: { attemptId: "terminal-attempt", attempt: 1, recovery: "resume", status: "running", startedAt: "now", updatedAt: "now" },
+      });
+      assert.deepEqual(labels, [scenario.expected], `${scenario.status} terminal projection was reclaimed`);
+    }
   });
 });
 

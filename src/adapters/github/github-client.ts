@@ -122,13 +122,22 @@ const REVIEW_FINDING_LABELS = [
 ] as const;
 
 function orchestrationLabelForProjection(input: OrchestrationNodeProjectionInput): string | undefined {
+  // Terminal node status is authoritative over any stale investigation/activity
+  // projection. A skipped decomposition remains truthfully decomposed; other
+  // completed or skipped work uses the completed delivery label.
+  if (input.node.status === "completed" || input.node.status === "skipped") {
+    return input.node.status === "skipped" && input.workflowLabel === "workflow:decomposed"
+      ? "workflow:decomposed"
+      : "workflow:merged";
+  }
+  if (input.node.status === "invalid") return "workflow:invalid";
+  if (input.node.status === "blocked" || input.node.status === "failed") return "workflow:engine-error";
+
+  // Investigation and scheduler phase labels are meaningful only while the
+  // node is nonterminal; they must not reclaim a terminal projection.
   if (input.workflowLabel !== undefined) return input.workflowLabel;
   if (input.phase === "waiting") return "workflow:waiting";
   if (input.phase === "active") return undefined;
-  if (input.node.status === "completed" || input.node.status === "skipped") return "workflow:merged";
-  if (input.node.status === "invalid") return "workflow:invalid";
-  if (input.node.status === "blocked") return "workflow:engine-error";
-  if (input.node.status === "failed") return "workflow:engine-error";
   return undefined;
 }
 
@@ -2594,7 +2603,7 @@ function pullRequestMatchesMergedIdentity(
 
 function mergeCheckState(value: string | undefined): PullRequestMergeGate["requiredChecks"][number]["state"] {
   const normalized = String(value ?? "").toUpperCase();
-  if (["SUCCESS", "PASSED", "PASS"].includes(normalized)) return "passed";
+  if (["SUCCESS", "PASSED", "PASS", "NEUTRAL", "SKIPPED"].includes(normalized)) return "passed";
   if (["FAILURE", "FAILED", "ERROR", "STARTUP_FAILURE", "ACTION_REQUIRED", "STALE"].includes(normalized)) return "failed";
   if (["CANCELLED", "CANCELED"].includes(normalized)) return "cancelled";
   if (["PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING"].includes(normalized)) return "pending";
