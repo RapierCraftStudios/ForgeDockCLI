@@ -4724,6 +4724,18 @@ export class VisibleDagDelegator {
         this.runs.set(stored.id, stored);
       }
     }
+    if (stored?.running) throw new Error("Orchestration DAG " + stored.id + " is still running");
+    if (stored && this.rebuildInput) {
+      const latest = await this.repository().loadOrchestration(orchestrationId);
+      if (latest) {
+        // A same-session controller may have durably admitted replacement
+        // nodes after the cached adapter input was built. Rebuild on every
+        // resume so dynamic waves use the durable plan, not a stale projection.
+        stored.input = await this.rebuildInput(latest);
+        stored.durableRecord = latest;
+        stored.result = scheduleResultFromDurableRecord(latest);
+      }
+    }
     if (!stored) throw new Error("No resumable orchestration DAG " + orchestrationId + " exists in this supervisor session or durable state");
     if (stored.running) throw new Error("Orchestration DAG " + stored.id + " is still running");
     // Investigation outcomes are semantic proposals which the controller must
@@ -4867,6 +4879,23 @@ export class VisibleDagDelegator {
     } = {},
   ): OrchestrationController {
     const projectNodeState = this.projectNodeStateFactory?.();
+    const materializeExecution: OrchestrationExecutionMaterializer | undefined = input.materializeExecution
+      ? async (materialization) => {
+          const result = await input.materializeExecution!(materialization);
+          const visibleItems = input.items as VisibleOrchestrationItem[];
+          for (const item of [...result.items, ...(result.nextInvestigationItems ?? [])]) {
+            if (!visibleItems.some((candidate) => candidate.id === item.id)) visibleItems.push({
+              ...item,
+              labels: [],
+              affectedFiles: [...(item.affectedFiles ?? [])],
+              memberIssues: [...(item.memberIssues ?? [item.issue])],
+              title: item.title ?? `Issue #${item.issue}`,
+              summary: item.summary ?? "Dynamically admitted orchestration work",
+            });
+          }
+          return result;
+        }
+      : undefined;
     return new OrchestrationController({
       repository: this.repository(),
       executionAdmission: this.admission(),
@@ -4896,7 +4925,7 @@ export class VisibleDagDelegator {
         },
       } : {}),
       ...(input.investigationWorker ? { investigationWorker: input.investigationWorker } : {}),
-      ...(input.materializeExecution ? { materializeExecution: input.materializeExecution } : {}),
+      ...(materializeExecution ? { materializeExecution } : {}),
       ...(input.settleInvestigation ? { settleInvestigation: input.settleInvestigation } : {}),
       worker: async (scheduled, context) => {
         const stored = requiredStoredRun(getStored());
