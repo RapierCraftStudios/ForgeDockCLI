@@ -221,7 +221,7 @@ function criterionFamily(family: string): string { return family.split("::", 1)[
 /** Component and invariant are durable root-ledger boundaries. */
 function rootSafety(findings: readonly MustFixCluster["findings"][number][]): string {
   const signatures = findings.map((finding) => {
-    const structural = finding.normalizedRoot?.split("\\n") ?? [];
+    const structural = finding.normalizedRoot?.split("\n") ?? [];
     const component = structural[1] ?? finding.location?.split(":", 1)[0] ?? "unanchored";
     const invariant = structural[3] ?? finding.impact?.affectedInvariant ?? "unspecified";
     return `${component.toLowerCase()}::${invariant.toLowerCase()}`;
