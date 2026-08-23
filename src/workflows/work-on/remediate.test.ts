@@ -70,6 +70,33 @@ describe("mustFix remediation", () => {
     assert.deepEqual(clusters.flatMap((cluster) => cluster.rootIds), roots.map((root) => root.rootId));
   });
 
+  it("contracts the sanitized live ReviewVerdict shape into criterion packets", () => {
+    const findings = ([
+      ["review-9fae5fca0a19c86c", "root-07b45ac50eda920aa6fd", "criterion-1", "src/workflows/orchestrate/view-model.ts", "src/workflows/orchestrate/view-model.ts (lifecycleStateForItem); src/workflows/orchestrate/controller.ts (execution-dispatch-admitted node mapping)"],
+      ["review-d668609680245d59", "root-12976fc5e44911577ccd", "criterion-1", "src/workflows/orchestrate/controller.ts", "src/workflows/orchestrate/controller.ts:2012-2026"],
+      ["review-2efddcba4025cbc8", "root-1c77e569343bffe53148", "criterion-2", "src/core/state/machine.ts", "src/core/state/machine.ts:68-72; src/adapters/github/github-client.ts:36-56"],
+      ["review-d16d370bf2d109ff", "root-9252c04d79d2b2e4c167", "criterion-2", "src/core/state/machine.ts", "src/core/state/machine.ts:49-68"],
+      ["review-0c316dfa5fc35c6e", "root-9572922a6f92914237ee", "criterion-1", "src/workflows/orchestrate/controller.ts", "src/workflows/orchestrate/controller.ts:737-743"],
+      ["review-193efb470db7ab28", "root-95851c5113f4997225d9", "criterion-1", "src/workflows/orchestrate/controller.ts", "src/workflows/orchestrate/controller.ts:450-493"],
+    ] as const).map(([id, rootId, criterion, component, location]) => ({
+      id, rootId, normalizedRoot: `${criterion}\n${component}\ncomponent\ninvariant\nfailure\ntrigger`,
+      severity: "high" as const, confidence: "high" as const, blocking: true, mustFix: true,
+      title: id, evidence: "sanitized live evidence", location,
+      intentRelevance: criterion, remediation: "fix", scopeDisposition: "in_scope" as const,
+      matchedAcceptanceCriteria: [`${criterion}: frozen acceptance criterion`],
+    }));
+    const clusters = clusterMustFixFindings(findings);
+    assert.equal(clusters.length, 2);
+    assert.deepEqual(clusters.flatMap((cluster) => cluster.rootIds), [
+      "root-07b45ac50eda920aa6fd", "root-12976fc5e44911577ccd", "root-9572922a6f92914237ee", "root-95851c5113f4997225d9",
+      "root-1c77e569343bffe53148", "root-9252c04d79d2b2e4c167",
+    ]);
+    assert.deepEqual(clusters.map((cluster) => cluster.productionPaths), [
+      ["src/workflows/orchestrate/controller.ts", "src/workflows/orchestrate/view-model.ts"],
+      ["src/adapters/github/github-client.ts", "src/core/state/machine.ts"],
+    ]);
+  });
+
   it("does not contract unrelated criteria or components", () => {
     const roots = Array.from({ length: 3 }, (_, index) => ({
       id: `f-${index}`, rootId: `root-${index}`,

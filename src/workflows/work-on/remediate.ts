@@ -211,22 +211,15 @@ function findingPaths(location: string): string[] {
 
 function compatibleCluster(left: MustFixCluster, right: MustFixCluster): boolean {
   if (criterionFamily(left.family) !== criterionFamily(right.family)) return false;
-  if (rootSafety(left.findings) !== rootSafety(right.findings)) return false;
   const union = new Set([...left.productionPaths, ...right.productionPaths]);
-  return union.size <= 4;
+  if (union.size > 4) return false;
+  // Preserve the root-ledger component boundary: compatible shards must share
+  // at least one admitted production path. This permits a connected
+  // controller/view-model packet while keeping unrelated same-criterion
+  // components separate.
+  return left.productionPaths.some((path) => right.productionPaths.includes(path));
 }
 
 function criterionFamily(family: string): string { return family.split("::", 1)[0] ?? family; }
-
-/** Component and invariant are durable root-ledger boundaries. */
-function rootSafety(findings: readonly MustFixCluster["findings"][number][]): string {
-  const signatures = findings.map((finding) => {
-    const structural = finding.normalizedRoot?.split("\n") ?? [];
-    const component = structural[1] ?? finding.location?.split(":", 1)[0] ?? "unanchored";
-    const invariant = structural[3] ?? finding.impact?.affectedInvariant ?? "unspecified";
-    return `${component.toLowerCase()}::${invariant.toLowerCase()}`;
-  });
-  return [...new Set(signatures)].sort().join("|");
-}
 
 function isTestPath(path: string): boolean { return /(?:^|\/)(?:test|tests|__tests__)(?:\/|$)|\.(?:test|spec)\.[^.]+$/i.test(path); }
