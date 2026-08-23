@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createArtifact, type ArtifactKind, type DurableArtifact } from "../core/artifacts/schema.js";
 import { renderArtifactMarkdown } from "../core/artifacts/codec.js";
 import { CachedArtifactRepository, ProjectedRunRepository, type ArtifactRepository, type RunProgressRecord, type RunRepository } from "../core/ports/repositories.js";
-import { orchestrationRepositoriesEqual, type OrchestrationNodeRecord, type OrchestrationRecord } from "../core/ports/orchestration.js";
+import { orchestrationRepositoriesEqual, MAX_ORCHESTRATION_PARALLEL, type OrchestrationNodeRecord, type OrchestrationRecord } from "../core/ports/orchestration.js";
 import { LeaseContinuityError } from "../core/ports/lease.js";
 import { createObservationProducer, type ObservationIdentity, type ObservationSink } from "../observability/contracts.js";
 import { retryableExternalDisposition } from "../core/retry.js";
@@ -1969,7 +1969,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
     ...(remediationDepthValue !== undefined ? { maxRemediationDepth: Number(remediationDepthValue) } : {}),
     ...(remediationChildrenValue !== undefined ? { maxRemediationChildren: Number(remediationChildrenValue) } : {}),
   });
-  if (maxParallelValue !== undefined && (!/^\d+$/.test(maxParallelValue) || Number(maxParallelValue) < 1)) throw new Error("--max-parallel must be a positive integer");
+  if (maxParallelValue !== undefined && (!/^\d+$/.test(maxParallelValue) || Number(maxParallelValue) < 1 || Number(maxParallelValue) > MAX_ORCHESTRATION_PARALLEL)) throw new Error(`--max-parallel must be an integer from 1 to ${MAX_ORCHESTRATION_PARALLEL}`);
   if (remediationDepthValue !== undefined && !/^\d+$/.test(remediationDepthValue)) throw new Error("--max-remediation-depth must be a non-negative integer");
   if (remediationChildrenValue !== undefined && (!/^\d+$/.test(remediationChildrenValue) || Number(remediationChildrenValue) < 1)) throw new Error("--max-remediation-children must be a positive integer");
   const autoMerge = commandAutoMerge(argv);

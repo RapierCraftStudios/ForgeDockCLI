@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { LeaseContinuityError } from "../../core/ports/lease.js";
+import { MAX_ORCHESTRATION_PARALLEL } from "../../core/ports/orchestration.js";
 import type { OrchestrationPlanMetadata, OrchestrationWaitReason } from "../../core/ports/orchestration.js";
 
 export { InMemoryLeaseRepository } from "../../core/ports/lease.js";
@@ -291,7 +292,7 @@ export async function runSchedule(
   worker: (item: ScheduledWorkItem, context: ScheduleWorkerContext) => Promise<ScheduleWorkerResult>,
   options: RunScheduleOptions = {},
 ): Promise<ScheduleResult> {
-  if (!Number.isInteger(maxParallel) || maxParallel < 1) throw new Error("maxParallel must be a positive integer");
+  if (!Number.isInteger(maxParallel) || maxParallel < 1 || maxParallel > MAX_ORCHESTRATION_PARALLEL) throw new Error(`maxParallel must be an integer from 1 to ${MAX_ORCHESTRATION_PARALLEL}`);
   const capacitySource = options.capacity;
   const dynamicCapacity = typeof capacitySource === "function";
   const capacityPollMs = options.capacityPollMs ?? 25;

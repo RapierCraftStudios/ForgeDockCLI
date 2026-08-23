@@ -69,6 +69,18 @@ describe("ForgeDock Next project configuration", () => {
     }
   });
 
+  it("accepts the bounded thirty-slot orchestration ceiling and rejects larger requests", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "forgedock-config-"));
+    try {
+      updateForgeDockConfig(cwd, { maxParallel: 30 });
+      assert.equal(readForgeDockConfig(cwd).maxParallel, 30);
+      assert.throws(() => updateForgeDockConfig(cwd, { maxParallel: 31 }), /1 to 30/);
+      assert.throws(() => updateForgeDockConfig(cwd, { orchestration: { maxParallel: 31 } }), /1 to 30/);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("rejects an unbounded specialist fleet", () => {
     const cwd = mkdtempSync(join(tmpdir(), "forgedock-config-"));
     try {

@@ -1342,7 +1342,7 @@ describe("OrchestrationController", () => {
       maximumActive = Math.max(maximumActive, active);
       await new Promise<void>((resolve) => setImmediate(resolve));
       active -= 1;
-    }, { transportCapacity: 20 });
+    }, { transportCapacity: 30 });
     const items = Array.from({ length: 500 }, (_, index) => ({
       ...item(
         `fleet-${index + 1}`,
@@ -1356,7 +1356,7 @@ describe("OrchestrationController", () => {
 
     const result = await service.createAndRun({
       repository: "owner/repo",
-      maxParallel: 20,
+      maxParallel: 30,
       items,
     });
     const durable = await repository.loadOrchestration(result.orchestrationId);
@@ -1370,7 +1370,7 @@ describe("OrchestrationController", () => {
     assert.ok(durable?.nodes.every((node) => node.activeAttemptId === undefined));
     assert.ok(durable?.nodes.every((node) => node.attempts?.length === 1 && node.attempts[0]?.status === "completed"));
     assert.ok(maximumActive > 1);
-    assert.ok(maximumActive <= 20);
+    assert.ok(maximumActive <= 30);
     assert.equal(active, 0);
 
     const serializedBytes = repository.saves.reduce((total, record) => total + JSON.stringify(record).length, 0);

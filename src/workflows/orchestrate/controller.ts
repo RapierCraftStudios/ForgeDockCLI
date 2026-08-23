@@ -11,6 +11,7 @@ import {
   orchestrationIssueIdentityKey,
   orchestrationNodeRepository,
   orchestrationRecordIssueIdentities,
+  MAX_ORCHESTRATION_PARALLEL,
 } from "../../core/ports/orchestration.js";
 import type {
   DurableOrchestrationNodeStatus,
@@ -319,6 +320,7 @@ export class OrchestrationController {
   async create(input: CreateOrchestrationInput): Promise<OrchestrationRecord> {
     if (!input.repository.trim()) throw new Error("Orchestration repository is required");
     assertPositiveInteger(input.maxParallel, "maxParallel");
+    if (input.maxParallel > MAX_ORCHESTRATION_PARALLEL) throw new Error(`maxParallel must be an integer from 1 to ${MAX_ORCHESTRATION_PARALLEL}`);
     if (!input.items.length) throw new Error("Orchestration requires at least one work item");
 
     const suppliedItems = input.items.map((item) => cloneScheduledItem({
@@ -528,6 +530,9 @@ export class OrchestrationController {
 
       const loaded = await this.dependencies.repository.loadOrchestration(orchestrationId);
       if (!loaded) throw new Error(`Unknown orchestration: ${orchestrationId}`);
+      if (!Number.isSafeInteger(loaded.maxParallel) || loaded.maxParallel < 1 || loaded.maxParallel > MAX_ORCHESTRATION_PARALLEL) {
+        throw new Error(`maxParallel must be an integer from 1 to ${MAX_ORCHESTRATION_PARALLEL}`);
+      }
       if (loaded.status === "cancelled") throw new Error(`Orchestration ${orchestrationId} is cancelled`);
       if (resume && loaded.status === "completed") throw new Error(`Orchestration ${orchestrationId} is already complete`);
       if (!resume && loaded.nodes.some((node) => node.status !== "queued" || (node.attempts?.length ?? 0) > 0)) {

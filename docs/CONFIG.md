@@ -84,7 +84,7 @@ next:
     max_remediation_cycles: 2
     max_remediation_depth: 2
     max_remediation_children: 8
-    # 1-20. TypeScript/status name: maxParallel.
+    # 1-30. TypeScript/status name: maxParallel.
     max_parallel: 4
     auto_merge: true
     # Optional route examples; omit fast_lane_target to use repository default.
@@ -116,7 +116,7 @@ next:
 | `max_remediation_cycles` | positive integer | `2` | Bounded parent remediation cycles. |
 | `max_remediation_depth` | positive integer | `2` | Maximum recursive remediation depth. |
 | `max_remediation_children` | positive integer | `8` | Maximum controller-authorized children. |
-| `max_parallel` | integer, `1`–`20` | `4` | Issue-slot budget (`maxParallel` in typed status), not a node count. A contracted node consumes one slot per unique member; transport capacity may lower the effective cap. |
+| `max_parallel` | integer, `1`–`30` | `4` | Issue-slot budget (`maxParallel` in typed status), not a node count. A contracted node consumes one slot per unique member; transport capacity may lower the effective cap. |
 | `auto_merge` | boolean | `true` | Allows merge only after all typed verification, exact-SHA review/CI, route, and merge-admission checks pass. |
 | `fast_lane_target` | branch | unset → repository default | Explicit ordinary delivery target. |
 | `feature_promotion_target` | branch | unset | Required integration target for feature/production promotion; promotion fails closed when absent. |

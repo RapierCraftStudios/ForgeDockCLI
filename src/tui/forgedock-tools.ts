@@ -30,6 +30,7 @@ import {
   normalizeOrchestrationRepository,
   orchestrationNodeRepository,
   OrchestrationIssueOwnershipConflictError,
+  MAX_ORCHESTRATION_PARALLEL,
 } from "../core/ports/orchestration.js";
 import type { LeaseWitness } from "../core/ports/lease.js";
 import { modelWithThinking, readForgeDockConfig, resolveAutoMerge, resolveOrchestrationConfig, splitConfiguredModel, THINKING_LEVELS, updateForgeDockConfig, type EffectiveOrchestrationConfig, type ThinkingLevel } from "../core/config/forgedock-config.js";
@@ -1025,7 +1026,7 @@ function orchestrationMaxParallelFromRequest(rawArgs: string): number | undefine
   for (const pattern of patterns) {
     const value = Number(pattern.exec(rawArgs)?.[1]);
     if (!Number.isSafeInteger(value)) continue;
-    if (value < 1 || value > 20) throw new Error(`Requested orchestration concurrency ${value} must be between 1 and 20`);
+    if (value < 1 || value > MAX_ORCHESTRATION_PARALLEL) throw new Error(`Requested orchestration concurrency ${value} must be between 1 and ${MAX_ORCHESTRATION_PARALLEL}`);
     return value;
   }
   return undefined;
@@ -2371,7 +2372,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         title: Type.String(),
         summary: Type.String(),
       }), { description: "Backward-compatible briefs; without executionPlan ForgeDock schedules conservatively" })),
-      maxParallel: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+      maxParallel: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_ORCHESTRATION_PARALLEL })),
       batching: Type.Optional(Type.String({ enum: ["aggressive", "conservative", "none"] })),
       priority: Type.Optional(Type.Array(Type.String({ pattern: "^P[0-3]$" }), { description: "Include only these priority labels" })),
       milestone: Type.Optional(Type.String()),
@@ -3418,7 +3419,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       reviewerModel: Type.Optional(Type.String({ description: "Nested-reviewer model; exact provider/model ID or unambiguous friendly name" })),
       reviewerThinking: Type.Optional(Type.String({ enum: [...THINKING_LEVELS] })),
       maxReviewSpecialists: Type.Optional(Type.Integer({ minimum: 1, maximum: 6, description: "Soft default specialist budget; independently concrete high-risk surfaces may exceed it" })),
-      maxParallel: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+      maxParallel: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_ORCHESTRATION_PARALLEL })),
       batchingPolicy: Type.Optional(Type.String({ enum: ["aggressive", "conservative", "none"] })),
       maxBatchSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
       maxSensitiveBatchSize: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),

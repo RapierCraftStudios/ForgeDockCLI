@@ -23,7 +23,7 @@ The default mapping is deliberately legible:
 
 - one selected issue becomes one visible DAG node and one `work-on` pipeline;
 - a running node occupies one top-level issue slot;
-- `maxParallel` is the issue-slot budget (1–20), not a scheduler-node count or a
+- `maxParallel` is the issue-slot budget (1–30), not a scheduler-node count or a
   promise that every slot can be filled;
 - an explicit batch is one node/pipeline but consumes one slot per unique member;
   an indivisible batch larger than the cap may run alone to avoid deadlock;

@@ -96,7 +96,7 @@ implementation boundary, not live dogfood readiness; the certification ledger is
   semantic dependencies, decomposition replacements, and predicted claims before
   mutation.
 - [x] Default one selected issue per visible DAG node and top-level `work-on` slot.
-  `maxParallel` (validated 1–20) is an issue-slot budget; a contracted node consumes
+  `maxParallel` (validated 1–30) is an issue-slot budget; a contracted node consumes
   one slot per unique member, while lower transport availability reduces dispatch.
   An indivisible oversized batch may run alone to avoid deadlock.
 - [x] Streaming ready-set scheduling without static topological execution waves.

@@ -2,6 +2,7 @@
 
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { MAX_ORCHESTRATION_PARALLEL } from "../ports/orchestration.js";
 
 const START = "# FORGEDOCK:NEXT-CONFIG:START";
 const END = "# FORGEDOCK:NEXT-CONFIG:END";
@@ -316,8 +317,8 @@ function validatePatch(patch: ForgeDockNextConfig, requireValue = true): void {
   if (patch.maxReviewSpecialists !== undefined && (!Number.isInteger(patch.maxReviewSpecialists) || patch.maxReviewSpecialists < 1 || patch.maxReviewSpecialists > 6)) {
     throw new Error("maxReviewSpecialists must be an integer from 1 to 6");
   }
-  if (patch.maxParallel !== undefined && (!Number.isInteger(patch.maxParallel) || patch.maxParallel < 1 || patch.maxParallel > 20)) {
-    throw new Error("maxParallel must be an integer from 1 to 20");
+  if (patch.maxParallel !== undefined && (!Number.isInteger(patch.maxParallel) || patch.maxParallel < 1 || patch.maxParallel > MAX_ORCHESTRATION_PARALLEL)) {
+    throw new Error(`maxParallel must be an integer from 1 to ${MAX_ORCHESTRATION_PARALLEL}`);
   }
   if (patch.fastLaneTarget !== undefined && !isSafeBranchName(patch.fastLaneTarget)) {
     throw new Error(`fastLaneTarget must be a safe Git branch name: ${patch.fastLaneTarget}`);
@@ -348,7 +349,7 @@ function validatePatch(patch: ForgeDockNextConfig, requireValue = true): void {
   if (nested?.maxRemediationCycles !== undefined && (!Number.isSafeInteger(nested.maxRemediationCycles) || nested.maxRemediationCycles < 1 || nested.maxRemediationCycles > 100)) throw new Error("maxRemediationCycles must be a positive integer");
   if (nested?.maxRemediationDepth !== undefined && (!Number.isSafeInteger(nested.maxRemediationDepth) || nested.maxRemediationDepth < 0 || nested.maxRemediationDepth > 100)) throw new Error("maxRemediationDepth must be an integer from 0 to 100");
   if (nested?.maxRemediationChildren !== undefined && (!Number.isSafeInteger(nested.maxRemediationChildren) || nested.maxRemediationChildren < 1 || nested.maxRemediationChildren > 100)) throw new Error("maxRemediationChildren must be a positive integer");
-  if (nested?.maxParallel !== undefined && (!Number.isSafeInteger(nested.maxParallel) || nested.maxParallel < 1 || nested.maxParallel > 20)) throw new Error("maxParallel must be an integer from 1 to 20");
+  if (nested?.maxParallel !== undefined && (!Number.isSafeInteger(nested.maxParallel) || nested.maxParallel < 1 || nested.maxParallel > MAX_ORCHESTRATION_PARALLEL)) throw new Error(`maxParallel must be an integer from 1 to ${MAX_ORCHESTRATION_PARALLEL}`);
   if (nested?.fastLaneTarget !== undefined && !isSafeBranchName(nested.fastLaneTarget)) throw new Error(`orchestration.fastLaneTarget must be a safe Git branch name: ${nested.fastLaneTarget}`);
   if (nested?.featurePromotionTarget !== undefined && !isSafeBranchName(nested.featurePromotionTarget)) throw new Error(`orchestration.featurePromotionTarget must be a safe Git branch name: ${nested.featurePromotionTarget}`);
   if (nested?.productionTarget !== undefined && !isSafeBranchName(nested.productionTarget)) throw new Error(`orchestration.productionTarget must be a safe Git branch name: ${nested.productionTarget}`);
@@ -387,7 +388,7 @@ function validateEffectiveOrchestration(config: EffectiveOrchestrationConfig): v
   if (!Number.isSafeInteger(config.maxRemediationCycles) || config.maxRemediationCycles < 1) throw new Error("Invalid effective remediation cycle limit");
   if (!Number.isSafeInteger(config.maxRemediationDepth) || config.maxRemediationDepth < 0) throw new Error("Invalid effective remediation depth");
   if (!Number.isSafeInteger(config.maxRemediationChildren) || config.maxRemediationChildren < 1) throw new Error("Invalid effective remediation child limit");
-  if (!Number.isSafeInteger(config.maxParallel) || config.maxParallel < 1) throw new Error("Invalid effective maxParallel");
+  if (!Number.isSafeInteger(config.maxParallel) || config.maxParallel < 1 || config.maxParallel > MAX_ORCHESTRATION_PARALLEL) throw new Error(`Invalid effective maxParallel (1 to ${MAX_ORCHESTRATION_PARALLEL})`);
   if (config.fastLaneTarget !== undefined && !isSafeBranchName(config.fastLaneTarget)) throw new Error(`Invalid effective fastLaneTarget: ${config.fastLaneTarget}`);
   if (config.featurePromotionTarget !== undefined && !isSafeBranchName(config.featurePromotionTarget)) throw new Error(`Invalid effective featurePromotionTarget: ${config.featurePromotionTarget}`);
   if (config.productionTarget !== undefined && !isSafeBranchName(config.productionTarget)) throw new Error(`Invalid effective productionTarget: ${config.productionTarget}`);

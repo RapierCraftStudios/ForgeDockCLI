@@ -1356,13 +1356,13 @@ test("orchestration preview projects all five selected nodes and the clamped iss
   assert.ok(tool);
   const issueNumbers = [701, 702, 703, 704, 705];
   bindOrchestrationInvocation(state.pi, {
-    rawArgs: "701,702,703,704,705 --max-parallel 20 --dry-run",
+    rawArgs: "701,702,703,704,705 --max-parallel 30 --dry-run",
     issueNumbers,
     noMilestone: true,
   });
   const result = await tool.execute("five-preview", {
     issueNumbers,
-    maxParallel: 20,
+    maxParallel: 30,
     dryRun: true,
     executionPlan: issueNumbers.map((issue, index) => ({
       issue,
@@ -1405,9 +1405,9 @@ test("orchestration rejects a supervisor-invented concurrency override", async (
   bindOrchestrationInvocation(state.pi, { rawArgs: "7", issueNumbers: [7], noMilestone: true });
   await assert.rejects(() => tool.execute("invented-concurrency", {
     issueNumbers: [7],
-    maxParallel: 20,
+    maxParallel: 30,
     executionPlan: [{ issue: 7, title: "Seven", summary: "Deliver Seven", dependsOn: [], claims: ["src/a"], labels: [] }],
-  }, undefined, undefined, { ...commandContext(), hasUI: false } as any), /maxParallel=20 is not authorized by the user request/);
+  }, undefined, undefined, { ...commandContext(), hasUI: false } as any), /maxParallel=30 is not authorized by the user request/);
 });
 
 test("native promotion exposes an explicit mutation-aware entrypoint", async () => {

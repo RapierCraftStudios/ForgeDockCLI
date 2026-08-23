@@ -23,7 +23,7 @@
 
 ### Changed
 
-- Orchestration now defaults to one selected issue per visible DAG node and top-level `work-on` slot. `maxParallel` is a 1–20 issue-slot budget; an explicit batch consumes one slot per member, and transport capacity may lower actual dispatch.
+- Orchestration now defaults to one selected issue per visible DAG node and top-level `work-on` slot. `maxParallel` is a 1–30 issue-slot budget; an explicit batch consumes one slot per member, and transport capacity may lower actual dispatch.
 - Semantic dependencies and conflict claims have separate meanings: a dependency requires an authoritative successful predecessor Outcome, while a same-repository, same-target claim only serializes overlapping work until the predecessor is terminal. Dynamically refined Build Packet claims participate in scheduling, and a claim-deferred worker refreshes its exact target before dispatch.
 - Batching is an explicit opt-in. Eligible ordinary issues and review findings use typed compatibility; sensitive security/auth groups require exactly two members with shared causal-family and secondary proof and are hard-capped at two despite the current managed-config default of three. Priority labels alone neither define nor authorize compatibility.
 - Natural-language scope selection is projected into typed discovery evidence before controller validation. Fleet and orchestration views report selected/runnable issue demand, requested/transport/effective caps, node status, and typed waits without presenting queued demand as active.

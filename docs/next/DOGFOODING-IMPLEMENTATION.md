@@ -12,7 +12,7 @@ barrier.
 ## Implemented contract
 
 - [x] Default to one selected issue per visible DAG node and top-level `work-on`
-  slot; treat `maxParallel` as a 1–20 issue-slot budget. Explicit batches consume
+  slot; treat `maxParallel` as a 1–30 issue-slot budget. Explicit batches consume
   one slot per member, and available transport may lower dispatch.
 - [x] Keep semantic dependencies separate from release-only conflict claims.
   Dependencies require an authoritative successful predecessor Outcome. Claims

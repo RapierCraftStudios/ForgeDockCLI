@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+/** Hard upper bound for one orchestration's issue-slot budget. */
+export const MAX_ORCHESTRATION_PARALLEL = 30;
+
 export type DurableOrchestrationNodeStatus =
   | "queued"
   | "running"
