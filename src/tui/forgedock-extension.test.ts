@@ -2715,6 +2715,9 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
   const artifactReads: Array<{ repo: string; issue: number }> = [];
   const issueReads: Array<{ repo: string; issue: number }> = [];
   const rebuildIdentities: Array<{ nodeRepository: string | undefined; itemRepository: string | undefined }> = [];
+  const legacyRebuildIdentities: Array<{ nodeRepository: string | undefined; itemRepository: string | undefined }> = [];
+  const selectedRepositories: string[] = [];
+  const legacySelectedRepositories: string[] = [];
   const taskPreparations: number[] = [];
   const workerDispatches: number[] = [];
   const launchSnapshots: Array<{ issue: number; record: OrchestrationRecord | undefined }> = [];
@@ -2855,6 +2858,8 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
     items: any[],
     resolveFromDurable: ConstructorParameters<typeof VisibleDagDelegator>[2],
     failReads: boolean,
+    identityObservations = rebuildIdentities,
+    repositoryObservations = selectedRepositories,
   ) => {
     failureMode = failReads;
     const input: any = {
@@ -2870,11 +2875,13 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
         return { repository: itemRepository, targetBranch: authoritative.defaultBranch, lane: "fast" as const };
       },
       resolveDecomposition: async ({ orchestration, node, item, childIssues: reported }: any) => {
-        rebuildIdentities.push({ nodeRepository: node.repository, itemRepository: item.repository });
+        identityObservations.push({ nodeRepository: node.repository, itemRepository: item.repository });
+        const selectedRepository = item.repository ?? orchestration.repository;
+        repositoryObservations.push(selectedRepository);
         return materializeVisibleDecomposition({
           github,
           artifacts,
-          repository: item.repository ?? orchestration.repository,
+          repository: selectedRepository,
           effective,
           orchestration,
           node,
@@ -2942,6 +2949,7 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
   assert.equal(initialReads.started, childIssues.length + 1, "the parent route read and every child read must settle");
   assert.equal(initialReads.completed, childIssues.length + 1);
   assert.deepEqual(taskPreparations, [42], "the failed expansion only prepared the parent task");
+  // invariant:matrix-identity-isolation-21f1955150ff
   assert.deepEqual(workerDispatches, [42], "a resolver rejection must dispatch no replacement child worker");
   const failedRecord = await repository.loadOrchestration(initial.id);
   assert.equal(failedRecord?.status, "failed");
@@ -2949,7 +2957,7 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
   assert.equal(failedRecord?.nodes[0]?.decompositionChildren, undefined);
   assert.deepEqual(failedRecord?.nodes[0]?.attempts?.at(-1)?.decompositionChildren, childIssues);
   assert.ok(failedRecord);
-  await repository.saveOrchestration({
+  const resumableRecord = {
     ...failedRecord,
     nodes: failedRecord.nodes.map((node) => ({
       ...node,
@@ -2960,7 +2968,16 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
         }),
       } : {}),
     })),
+  };
+  await repository.saveOrchestration(resumableRecord);
+  const legacyRecord = structuredClone(resumableRecord);
+  legacyRecord.orchestrationId = `${initial.id}-legacy-repository`;
+  legacyRecord.nodes = legacyRecord.nodes.map((node) => {
+    const legacyNode = { ...node };
+    delete legacyNode.repository;
+    return legacyNode;
   });
+  await repository.createOrchestration(legacyRecord);
 
   failureMode = false;
   readPhase = "resumed";
@@ -3028,6 +3045,7 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
   assert.equal(completed?.nodes.filter((node) => node.repository === "owner/work").length, childIssues.length + 1);
   assert.ok(completed?.nodes.filter((node) => childIssues.includes(node.issue)).every((node) =>
     node.repository === "owner/work" && node.targetBranch === "work-main"));
+  // invariant:matrix-identity-isolation-ba3715ddfbc2
   assert.deepEqual(rebuildIdentities, [
     { nodeRepository: "owner/work", itemRepository: "owner/work" },
     { nodeRepository: "owner/work", itemRepository: "owner/work" },
@@ -3051,12 +3069,63 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
   "each actual child spawn must observe the durable expansion");
   const firstChildDispatch = observations.findIndex((event) => event.kind === "dispatch" && event.issue !== 42);
   assert.ok(firstChildDispatch >= 0);
+  // invariant:matrix-terminal-metadata-3643f0feb469
   assert.ok(observations.slice(0, firstChildDispatch).some((event) => event.kind === "save"
     && event.record.nodes.find((node) => node.id === "parent")?.decompositionChildren?.join(",") === childIssues.join(",")
     && childIssues.every((issue) => event.record.nodes.some((node) => node.issue === issue))),
   "actual child spawn must follow the completed durable expansion save");
+
+  const legacyPersisted = await repository.loadOrchestration(legacyRecord.orchestrationId);
+  assert.ok(legacyPersisted);
+  assert.equal(legacyPersisted.nodes.find((node) => node.id === "parent")?.repository, undefined,
+    "the compatibility record must omit the persisted parent repository");
+  const legacyRepositoryReadStart = repositoryReads.length;
+  const legacyBranchReadStart = branchReads.length;
+  const legacyIssueReadStart = issueReads.length;
+  const legacyArtifactReadStart = artifactReads.length;
+  const legacyRebuild = witnessedDagDelegator(secondState.pi, repository, async (record) => {
+    const items = record.nodes.map((node) => ({
+      ...node,
+      repository: "owner/work",
+      labels: [],
+      affectedFiles: [...(node.affectedFiles ?? [])],
+      memberIssues: [...(node.memberIssues ?? [node.issue])],
+      title: node.title ?? `Issue #${node.issue}`,
+      summary: node.summary ?? "Legacy resumed decomposition",
+    }));
+    return makeInput(items, async () => {
+      throw new Error("nested legacy rebuild callback is not used");
+    }, false, legacyRebuildIdentities, legacySelectedRepositories);
+  });
+  const legacyResumed = await legacyRebuild.resume(legacyRecord.orchestrationId);
+  await legacyResumed.completion;
+  const legacyCompleted = await repository.loadOrchestration(legacyRecord.orchestrationId);
+  assert.equal(legacyCompleted?.status, "completed");
+  assert.deepEqual(legacyCompleted?.nodes.find((node) => node.id === "parent")?.decompositionChildren, childIssues);
+  assert.ok(legacyCompleted?.nodes.filter((node) => childIssues.includes(node.issue)).every((node) =>
+    node.repository === "owner/work" && node.targetBranch === "work-main"));
+  assert.deepEqual(legacyRebuildIdentities, [
+    { nodeRepository: undefined, itemRepository: "owner/work" },
+  ], "legacy resume must rebuild the missing node identity from the visible item");
+  assert.deepEqual(legacySelectedRepositories, ["owner/work"],
+    "legacy resume must select the visible item repository before materialization");
+  const legacyRepositoryReads = repositoryReads.slice(legacyRepositoryReadStart);
+  const legacyBranchReads = branchReads.slice(legacyBranchReadStart);
+  const legacyIssueReads = issueReads.slice(legacyIssueReadStart);
+  const legacyArtifactReads = artifactReads.slice(legacyArtifactReadStart);
+  assert.ok(legacyRepositoryReads.length > 0);
+  assert.ok(legacyRepositoryReads.every((repo) => repo === "owner/work"));
+  assert.ok(legacyBranchReads.every(({ repo }) => repo === "owner/work"));
+  assert.ok(legacyIssueReads.length > 0);
+  assert.ok(legacyIssueReads.every(({ repo }) => repo === "owner/work"));
+  assert.ok(legacyArtifactReads.every(({ repo }) => repo === "owner/work"));
+  assert.equal(legacyRepositoryReads.includes("owner/control"), false);
+  assert.equal(legacyBranchReads.some(({ repo }) => repo === "owner/control"), false);
+  assert.equal(legacyIssueReads.some(({ repo }) => repo === "owner/control"), false);
+  assert.equal(legacyArtifactReads.some(({ repo }) => repo === "owner/control"), false);
   await first.shutdown();
   await second.shutdown();
+  await legacyRebuild.shutdown();
 });
 
 test("visible DAG refuses to retry terminally decomposed work", async () => {
