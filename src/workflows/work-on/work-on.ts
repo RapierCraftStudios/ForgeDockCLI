@@ -407,6 +407,12 @@ async function resumeTargetAdvanceWorkOnInternal(
           : {}), findingIssuePolicy: "all", reviewCycle: { current: 1, total: 1 },
     }, { runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
       ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}) });
+    const continuation = admitPostReviewContinuation({
+      run: reviewed.run, verdict: reviewed.verdict, packet: input.packet,
+      buildResult: recoveredFresh, pullRequest: published.pullRequest,
+      currentRemediationCycles: 0, maxRemediationCycles: 0,
+    });
+    if (continuation.action === "blocked") return { run: continuation.run, pullRequest: published.pullRequest, buildResult: recoveredFresh };
     await persistTargetAdvanceCheckpoint({
       run: reviewed.run, packet: input.packet, buildResult: recoveredFresh, sourceBuildResult: input.buildResult,
       workspace: input.workspace, targetBranch: checkpoint.targetBranch, observedTargetSha: targetSha, phase: "reviewed",
@@ -618,6 +624,12 @@ async function resumeTargetAdvanceWorkOnInternal(
       : {}), findingIssuePolicy: "all", reviewCycle: { current: 1, total: 1 },
   }, { runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
     ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}) });
+  const continuation = admitPostReviewContinuation({
+    run: reviewed.run, verdict: reviewed.verdict, packet: input.packet,
+    buildResult: freshBuildResult, pullRequest: published.pullRequest,
+    currentRemediationCycles: 0, maxRemediationCycles: 0,
+  });
+  if (continuation.action === "blocked") return { run: continuation.run, pullRequest: published.pullRequest, buildResult: freshBuildResult };
   // Review is the final semantic phase of ordinary target recovery. Persist it
   // against the fresh receipts so a crash after review resumes remediation (or
   // merge) rather than replaying target movement from the stale source head.
@@ -2363,7 +2375,11 @@ async function continueBuildDelivery(
     run = reviewed.run;
     verdict = reviewed.verdict;
     priorVerdict = verdict;
-    if (isTerminalReviewCheckpoint(run, verdict)) return { run, pullRequest };
+    const continuation = admitPostReviewContinuation({
+      run, verdict, packet: input.packet, buildResult, pullRequest,
+      currentRemediationCycles: cycle, maxRemediationCycles: input.maxRemediationCycles,
+    });
+    if (continuation.action === "blocked") return { run: continuation.run, pullRequest };
     const scopeViolation = blockingFindingOutsidePacket(
       verdict, input.packet, undefined, input.scopeExpansion === "recursive",
     );
@@ -2371,6 +2387,10 @@ async function continueBuildDelivery(
       run = await blockForScopeViolation(
         run, pullRequest, input.packet, verdict, scopeViolation, input, dependencies,
       );
+      return { run, pullRequest };
+    }
+    if (continuation.action === "budget-exhausted") {
+      run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, continuation.reason);
       return { run, pullRequest };
     }
     if (run.state === "merging") {
@@ -2609,6 +2629,11 @@ export async function resumeWorkOn(
       run = reviewed.run;
       verdict = reviewed.verdict;
       priorVerdict = verdict;
+      const continuation = admitPostReviewContinuation({
+        run, verdict, packet: input.packet, buildResult, pullRequest,
+        currentRemediationCycles: cycle, maxRemediationCycles: input.maxRemediationCycles,
+      });
+      if (continuation.action === "blocked") return { run: continuation.run, pullRequest };
       const scopeViolation = blockingFindingOutsidePacket(
         verdict, input.packet, undefined, input.scopeExpansion === "recursive",
       );
@@ -2788,7 +2813,11 @@ export async function resumeReviewWorkOn(
       });
       run = reassessed.run;
       verdict = reassessed.verdict;
-      if (isTerminalReviewCheckpoint(run, verdict)) return { run, pullRequest };
+      const continuation = admitPostReviewContinuation({
+        run, verdict, packet: input.packet, buildResult, pullRequest,
+        currentRemediationCycles: cycle, maxRemediationCycles: remediationLimit,
+      });
+      if (continuation.action === "blocked") return { run: continuation.run, pullRequest };
       const scopeViolation = blockingFindingOutsidePacket(
         verdict, input.packet, undefined, input.scopeExpansion === "recursive",
       );
@@ -2796,6 +2825,10 @@ export async function resumeReviewWorkOn(
         run = await blockForScopeViolation(
           run, pullRequest, input.packet, verdict, scopeViolation, input, dependencies,
         );
+        return { run, pullRequest };
+      }
+      if (continuation.action === "budget-exhausted") {
+        run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, continuation.reason);
         return { run, pullRequest };
       }
       if (run.state === "merging") {
@@ -2872,6 +2905,11 @@ export async function resumeReviewWorkOn(
       });
       run = reviewed.run;
       verdict = reviewed.verdict;
+      const continuation = admitPostReviewContinuation({
+        run, verdict, packet: input.packet, buildResult, pullRequest,
+        currentRemediationCycles: cycle, maxRemediationCycles: remediationLimit,
+      });
+      if (continuation.action === "blocked") return { run: continuation.run, pullRequest };
       const scopeViolation = blockingFindingOutsidePacket(
         verdict, input.packet, undefined, input.scopeExpansion === "recursive",
       );
@@ -2879,6 +2917,10 @@ export async function resumeReviewWorkOn(
         run = await blockForScopeViolation(
           run, pullRequest, input.packet, verdict, scopeViolation, input, dependencies,
         );
+        return { run, pullRequest };
+      }
+      if (continuation.action === "budget-exhausted") {
+        run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, continuation.reason);
         return { run, pullRequest };
       }
       if (run.state === "merging") break;
@@ -3041,9 +3083,16 @@ export async function resumeExpandedReviewWorkOn(
     runs: dependencies.runs,
     ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
   });
-  if (isTerminalReviewCheckpoint(reviewed.run, reviewed.verdict)) {
-    return { run: reviewed.run, pullRequest: input.pullRequest };
-  }
+  const continuation = admitPostReviewContinuation({
+    run: reviewed.run,
+    verdict: reviewed.verdict,
+    packet: input.packet,
+    buildResult: proof.buildResult,
+    pullRequest: { ...input.pullRequest, headSha: proof.buildResult.payload.headSha },
+    currentRemediationCycles: 0,
+    maxRemediationCycles: 0,
+  });
+  if (continuation.action === "blocked") return { run: continuation.run, pullRequest: input.pullRequest };
   const expandedViolation = blockingFindingOutsidePacket(
     reviewed.verdict, input.packet, input.checkpoint, input.scopeExpansion === "recursive",
   );
@@ -3172,7 +3221,11 @@ export async function resumePublicationWorkOn(
       run = resumedProjectionReview.run;
       verdict = resumedProjectionReview.verdict;
       priorVerdict = verdict;
-      if (isTerminalReviewCheckpoint(run, verdict)) return { run, pullRequest };
+      const continuation = admitPostReviewContinuation({
+        run, verdict, packet: input.packet, buildResult, pullRequest,
+        currentRemediationCycles: cycle, maxRemediationCycles: input.maxRemediationCycles,
+      });
+      if (continuation.action === "blocked") return { run: continuation.run, pullRequest };
     }
     while (true) {
       if (resumedProjectionReview) {
@@ -3293,6 +3346,7 @@ export async function resumeCompletionWorkOn(
     run: RunState;
     verdict: DurableArtifact<"ReviewVerdict">;
     pullRequest: PullRequestSnapshot;
+    packet?: DurableArtifact<"BuildPacket">;
     autoMerge?: boolean;
     batchMembers?: readonly number[];
     batchMemberContracts?: readonly BatchMemberContract[];
@@ -3303,10 +3357,14 @@ export async function resumeCompletionWorkOn(
 ): Promise<WorkOnResult> {
   dependencies = guardMutationBoundaries(dependencies);
   if (input.run.state !== "merging" && input.run.state !== "closing") throw new Error(`Completion resume requires merging or closing state, found ${input.run.state}`);
-  if (input.verdict.payload.disposition !== "approve"
-    || input.verdict.payload.headSha !== input.pullRequest.headSha) {
-    throw new Error("Completion resume requires an approving verdict for the current pull request head");
-  }
+  const continuation = admitPostReviewContinuation({
+    run: input.run,
+    verdict: input.verdict,
+    ...(input.packet !== undefined ? { packet: input.packet } : {}),
+    pullRequest: input.pullRequest,
+  });
+  if (continuation.action === "blocked") return { run: continuation.run, pullRequest: input.pullRequest };
+  if (continuation.action !== "complete") throw new Error("Completion resume requires an approving verdict admitted for merging");
   let run = input.run;
   let retainWorkspaceForRecovery = false;
   try {
@@ -3484,6 +3542,11 @@ export async function resumeConflictRecoveryWorkOn(
       run = reviewed.run;
       verdict = reviewed.verdict;
       priorVerdict = verdict;
+      const continuation = admitPostReviewContinuation({
+        run, verdict, packet: input.packet, buildResult, pullRequest,
+        currentRemediationCycles: cycle, maxRemediationCycles: remediationLimit,
+      });
+      if (continuation.action === "blocked") return { run: continuation.run, pullRequest };
       const scopeViolation = blockingFindingOutsidePacket(
         verdict,
         input.packet,
@@ -3492,6 +3555,10 @@ export async function resumeConflictRecoveryWorkOn(
       );
       if (scopeViolation) {
         run = await blockForScopeViolation(run, pullRequest, input.packet, verdict, scopeViolation, input, dependencies);
+        return { run, pullRequest };
+      }
+      if (continuation.action === "budget-exhausted") {
+        run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, continuation.reason);
         return { run, pullRequest };
       }
       if (run.state === "merging") break;
@@ -3589,11 +3656,115 @@ export async function resumeConflictRecoveryWorkOn(
   }
 }
 
-function isTerminalReviewCheckpoint(
-  run: RunState,
-  verdict: DurableArtifact<"ReviewVerdict">,
-): boolean {
-  return run.state === "blocked" || verdict.payload.disposition === "blocked";
+export type PostReviewContinuation =
+  | { action: "blocked"; run: RunState; verdict: DurableArtifact<"ReviewVerdict">; reason: string }
+  | { action: "remediate"; run: RunState; verdict: DurableArtifact<"ReviewVerdict">; cycle: number }
+  | { action: "complete"; run: RunState; verdict: DurableArtifact<"ReviewVerdict"> }
+  | { action: "budget-exhausted"; run: RunState; verdict: DurableArtifact<"ReviewVerdict">; reason: string };
+
+/**
+ * The only admission point after a review or durable finding-projection resume.
+ * This function is deliberately pure: it validates the durable identity chain
+ * before callers can inspect findings or perform workspace/agent/publication
+ * work. In particular, findings never imply remediation; the verdict and the
+ * state-machine transition remain the authority.
+ */
+export function admitPostReviewContinuation(input: {
+  run: RunState;
+  verdict: DurableArtifact<"ReviewVerdict">;
+  packet?: DurableArtifact<"BuildPacket">;
+  buildResult?: DurableArtifact<"BuildResult">;
+  pullRequest?: PullRequestSnapshot;
+  currentRemediationCycles?: number;
+  maxRemediationCycles?: number;
+}): PostReviewContinuation {
+  const { run, verdict, packet, buildResult, pullRequest } = input;
+  const disposition = verdict.payload.disposition;
+  if (disposition !== "blocked" && disposition !== "request_changes" && disposition !== "approve") {
+    throw new Error("Post-review continuation received unknown ReviewVerdict disposition; refusing mutation");
+  }
+  if (!verdict.payload.headSha || !/^[0-9a-f]{7,64}$/i.test(verdict.payload.headSha)) {
+    throw new Error("Post-review continuation requires a valid ReviewVerdict head SHA");
+  }
+  if (verdict.runId !== run.runId || verdict.subject.repo.toLowerCase() !== run.subject.repo.toLowerCase()
+    || (verdict.subject.issue !== undefined && verdict.subject.issue !== run.subject.issue)
+    || (run.subject.pr !== undefined && verdict.subject.pr !== run.subject.pr)) {
+    throw new Error("Post-review continuation ReviewVerdict identity does not match the admitted run");
+  }
+  if (packet !== undefined && (packet.runId !== run.runId || packet.subject.repo.toLowerCase() !== run.subject.repo.toLowerCase()
+    || packet.subject.issue !== run.subject.issue)) {
+    throw new Error("Post-review continuation Build Packet identity does not match the admitted run");
+  }
+  if (buildResult !== undefined) {
+    if (buildResult.runId !== run.runId || buildResult.subject.repo.toLowerCase() !== run.subject.repo.toLowerCase()
+      || buildResult.subject.issue !== run.subject.issue || buildResult.payload.headSha.toLowerCase() !== verdict.payload.headSha.toLowerCase()) {
+      throw new Error("Post-review continuation Build Result identity does not match the ReviewVerdict");
+    }
+    if (pullRequest !== undefined
+      && (buildResult.payload.branch !== pullRequest.headBranch
+        || (buildResult.payload.targetBranch !== undefined && buildResult.payload.targetBranch !== pullRequest.baseBranch))) {
+      throw new Error("Post-review continuation Build Result branch/base identity does not match the pull request");
+    }
+  }
+  if (pullRequest !== undefined) {
+    if (verdict.subject.pr !== pullRequest.number
+      || pullRequest.repo.toLowerCase() !== run.subject.repo.toLowerCase()
+      || pullRequest.headSha.toLowerCase() !== verdict.payload.headSha.toLowerCase()
+      || (verdict.payload.headBranch !== undefined && verdict.payload.headBranch !== pullRequest.headBranch)
+      || (verdict.payload.baseBranch !== undefined && verdict.payload.baseBranch !== pullRequest.baseBranch)) {
+      throw new Error("Post-review continuation PR/head identity does not match the ReviewVerdict");
+    }
+  }
+  if (run.headSha !== undefined && run.headSha.toLowerCase() !== verdict.payload.headSha.toLowerCase()) {
+    throw new Error("Post-review continuation run head does not match the ReviewVerdict");
+  }
+  if (disposition === "blocked") {
+    if (run.state !== "blocked") {
+      throw new Error(`Blocked ReviewVerdict requires blocked run state, found ${run.state}`);
+    }
+    return {
+      action: "blocked",
+      run,
+      verdict,
+      reason: run.blockedReason ?? verdict.payload.warnings?.join("; ") ?? "ReviewVerdict disposition=blocked",
+    };
+  }
+  if (run.state === "blocked") {
+    if (disposition === "approve") {
+      throw new Error("Contradictory post-review state: approve ReviewVerdict with blocked run");
+    }
+    return {
+      action: "blocked",
+      run,
+      verdict,
+      reason: run.blockedReason ?? `Durable run ${run.runId} is blocked; preserving its review checkpoint`,
+    };
+  }
+  if (disposition === "approve") {
+    if (run.state !== "merging") throw new Error(`Approve ReviewVerdict requires merging state, found ${run.state}`);
+    return { action: "complete", run, verdict };
+  }
+  if (run.state !== "remediating") {
+    throw new Error(`request_changes ReviewVerdict requires remediating state, found ${run.state}`);
+  }
+  const acceptedRoots = verdict.payload.findings.filter((finding) =>
+    finding.scopeDisposition !== "rejected"
+      && finding.scopeDisposition !== "follow_up"
+      && (finding.mustFix ?? finding.blocking));
+  if (!acceptedRoots.length) {
+    throw new Error("request_changes ReviewVerdict has no controller-accepted remediation roots");
+  }
+  const cycle = (input.currentRemediationCycles ?? 0) + 1;
+  const limit = input.maxRemediationCycles ?? 2;
+  if (!Number.isSafeInteger(cycle) || cycle > limit) {
+    return {
+      action: "budget-exhausted",
+      run,
+      verdict,
+      reason: `Remediation budget exhausted after ${Math.max(0, cycle - 1)} cycle(s)`,
+    };
+  }
+  return { action: "remediate", run, verdict, cycle };
 }
 
 function blockingFindingOutsidePacket(

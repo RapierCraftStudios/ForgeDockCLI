@@ -539,6 +539,10 @@ async function workOn(
       process.stdout.write(`${statusGlyph("passed", mode)} Existing run ${admission.runId} is already ${admission.state}; no duplicate run was created.\n`);
       return;
     }
+    if (admission.action === "blocked") {
+      process.stdout.write(`${statusGlyph("failed", mode)} Existing run ${admission.runId} is blocked: ${admission.reason}\n`);
+      return;
+    }
     if (admission.action === "block") {
       throw new Error(admission.reason);
     }
@@ -682,6 +686,10 @@ async function workOn(
 
     if (resumeRunId) {
       const admission = decideSubjectAdmission(resumeArtifacts, { currentTargetBranch: deliveryTargetBranch });
+      if (admission.action === "blocked") {
+        process.stdout.write(`${statusGlyph("failed", mode)} Existing run ${admission.runId} is blocked: ${admission.reason}\n`);
+        return;
+      }
       if (admission.action === "block") throw new Error(admission.reason);
       if (admission.action !== "resume" || admission.runId !== resumeRunId) {
         throw new Error(`Run ${resumeRunId} no longer has a recoverable durable checkpoint`);
@@ -1152,6 +1160,7 @@ async function workOn(
           run,
           verdict: priorVerdict!,
           pullRequest: checkpointPullRequest!,
+          ...(packet !== undefined ? { packet } : {}),
           ...(workspace ? { workspace } : {}),
           ...(durableBatchMembers.length ? { batchMembers: durableBatchMembers } : {}),
           ...(durableBatchMemberContracts.length ? { batchMemberContracts: durableBatchMemberContracts } : {}),
@@ -2485,6 +2494,11 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
           }
           return;
         }
+        if (admission.action === "blocked") {
+          outcomes.set(item.id, "blocked");
+          process.stdout.write(`${statusGlyph("failed", mode)} ${item.id} blocked · ${admission.reason}\n`);
+          return { status: "blocked", error: admission.reason, retryable: false };
+        }
         if (admission.action === "block") {
           throw new Error(admission.reason);
         }
@@ -3081,6 +3095,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
           if (terminal) return terminal;
           throw new Error(`#${item.issue} has terminal state ${current.state} without a supported orchestration result`);
         }
+        if (current.action === "blocked") return { status: "blocked", error: current.reason, retryable: false };
         if (current.action === "block") throw new Error(current.reason);
         const workerArgs = [String(item.issue), "--repo", itemRepository];
         const dependencies = item.dependencies.map(issueNumberFromScheduledId);

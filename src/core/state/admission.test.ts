@@ -126,6 +126,28 @@ describe("subject run admission", () => {
     assert.deepEqual(decideSubjectAdmission([]), { action: "start" });
   });
 
+  it("returns the original blocker for a durable blocked ReviewVerdict instead of a passed skip", () => {
+    const runId = "run_review_verdict_blocked";
+    const delivery = publicationArtifacts(runId).map((artifact, index) => ({
+      ...artifact, createdAt: `2026-01-01T00:0${index + 1}:00.000Z`,
+    }));
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+      payload: {
+        headSha: "d".repeat(40), disposition: "blocked", reviewerRoles: ["correctness"], findings: [], checks: [],
+        warnings: ["source proof is unavailable at the reviewed head"],
+      },
+    }, { createdAt: "2026-01-01T00:04:00.000Z" });
+    const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict]);
+    assert.equal(decision.action, "blocked");
+    if (decision.action === "blocked") {
+      assert.equal(decision.runId, runId);
+      assert.equal(decision.state, "blocked");
+      assert.equal(decision.reason, "source proof is unavailable at the reviewed head");
+      assert.ok(decision.artifacts.some((artifact) => artifact.kind === "ReviewVerdict"));
+    }
+  });
+
   it("skips the newest terminal run instead of publishing duplicate artifacts", () => {
     const artifacts = [
       intent("run_old", "2026-01-01T00:00:00.000Z"),

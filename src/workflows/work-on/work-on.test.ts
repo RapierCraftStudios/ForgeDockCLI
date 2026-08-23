@@ -21,13 +21,79 @@ import { terminalOrchestrationResult } from "../orchestrate/terminal-result.js";
 import type { BuilderSubmission, VerificationDiagnosis } from "./build.js";
 import { planReviewPanel } from "../review-pr/planner.js";
 import { WorkflowExecutionError } from "./investigate.js";
-import { certifyPacketRelationAuthority, repositoryPathFromLocation, resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, shouldAppendFailureOutcome, workspacePathsEquivalent, workOn } from "./work-on.js";
+import { admitPostReviewContinuation, certifyPacketRelationAuthority, repositoryPathFromLocation, resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, shouldAppendFailureOutcome, workspacePathsEquivalent, workOn } from "./work-on.js";
 import { digestRelation } from "../../core/packet/relation-graph.js";
 
 const sha = "e".repeat(40);
 const fastLane = { kind: "fast", targetBranch: "main", resolution: "repository-default" } as const;
 const runTarget = { lane: "fast", targetBranch: "main" } as const;
 const workspace: GitWorkspace = { path: "/tmp/work", branch: "forgedock/issue-8", baseRef: "main", baseSha: sha };
+
+describe("post-review continuation guard", () => {
+  const runId = "run_post_review_guard";
+  const subject = { repo: "a/b", issue: 8 } as const;
+  const headSha = "a".repeat(40);
+  const packetArtifact = createArtifact({
+    kind: "BuildPacket", runId, subject, producer: { role: "packet-author" }, payload: {
+      scope: ["Guard"], acceptanceCriteria: ["Guard runs"], context: [], implementationPlan: ["Edit src/a.js"],
+      expectedPaths: ["src/a.js"], verificationPlan: ["npm test"], risks: [], outOfScope: [],
+    },
+  });
+  const pullRequest: PullRequestSnapshot = {
+    repo: "a/b", number: 7, title: "Fix", body: "", url: "https://github.test/a/b/pull/7", state: "OPEN",
+    headSha, headBranch: "forgedock/issue-8", baseBranch: "main",
+  };
+
+  it("invariant:matrix-chunk-boundary-7701f1c33be3 · returns the authoritative blocked checkpoint without remediation", () => {
+    const queued = createRun({ workflow: "work-on", subject, runId, target: runTarget });
+    const blocked = transition(queued, "BLOCK", { reason: "source proof is unavailable" }).state;
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 7 }, producer: { role: "controller" },
+      payload: { headSha, disposition: "blocked", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    });
+    const decision = admitPostReviewContinuation({ run: blocked, verdict, packet: packetArtifact, pullRequest });
+    assert.equal(decision.action, "blocked");
+    if (decision.action === "blocked") assert.equal(decision.reason, "source proof is unavailable");
+  });
+
+  it("invariant:matrix-adapter-lifecycle-727d7c2084b4 · fails closed for contradictory blocked identity", () => {
+    const run = createRun({ workflow: "work-on", subject, runId });
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 7 }, producer: { role: "controller" },
+      payload: { headSha, disposition: "blocked", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    });
+    assert.throws(() => admitPostReviewContinuation({ run, verdict, packet: packetArtifact, pullRequest }), /requires blocked run state/);
+  });
+
+  it("invariant:matrix-terminal-metadata-348772f31d76 · never treats findings as approval or remediation", () => {
+    const run = createRun({ workflow: "work-on", subject, runId });
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 7 }, producer: { role: "controller" },
+      payload: { headSha, disposition: "approve", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    });
+    assert.throws(() => admitPostReviewContinuation({ run, verdict, packet: packetArtifact, pullRequest }), /requires merging state/);
+  });
+
+  it("invariant:matrix-adapter-lifecycle-3f4408636d75 · preserves terminal metadata on blocked publication", () => {
+    const queued = createRun({ workflow: "work-on", subject, runId, target: runTarget });
+    const blocked = transition(queued, "BLOCK", { reason: "original blocker" }).state;
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 7 }, producer: { role: "controller" },
+      payload: { headSha, disposition: "blocked", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    });
+    const decision = admitPostReviewContinuation({ run: blocked, verdict, packet: packetArtifact, pullRequest });
+    assert.equal(decision.action, "blocked");
+  });
+
+  it("invariant:matrix-terminal-metadata-c8a73b26ef48 · rejects approve without merging before mutation", () => {
+    const run = createRun({ workflow: "work-on", subject, runId });
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 7 }, producer: { role: "controller" },
+      payload: { headSha, disposition: "approve", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    });
+    assert.throws(() => admitPostReviewContinuation({ run, verdict, packet: packetArtifact, pullRequest }), /requires merging state/);
+  });
+});
 
 describe("durable workspace identity", () => {
   it("treats Windows and WSL spellings as the same retained workspace", () => {

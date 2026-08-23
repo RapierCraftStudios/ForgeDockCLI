@@ -9,6 +9,7 @@ export type SubjectAdmissionDecision =
   | { action: "start" }
   | { action: "resume"; runId: string; state: "investigating" | "preparing" | "building" | "blocked" | "publishing" | "target_recovery" | "retry_wait" | "failed" | "remediating" | "merging" | "invalid"; checkpoint: "investigation" | "preparation" | "build" | "verification" | "remediation" | "publication" | "target-advance" | "retry" | "completion" | "conflict-recovery" | "invalid-closure"; artifacts: DurableArtifact[] }
   | { action: "skip"; runId: string; state: RunStateName }
+  | { action: "blocked"; runId: string; state: "blocked"; reason: string; artifacts: DurableArtifact[] }
   | { action: "block"; runId: string; state: RunStateName; reason: string };
 
 export interface DurableLaneMismatch {
@@ -192,6 +193,25 @@ export function decideSubjectAdmission(
   const hasPacket = packet !== undefined;
   const build = latestArtifactOfKind(latest.artifacts, "BuildResult");
   const verdict = latestArtifactOfKind(latest.artifacts, "ReviewVerdict");
+  if (verdict?.payload.disposition === "blocked" && reconciled.state !== "blocked") {
+    return {
+      action: "block",
+      runId: latest.runId,
+      state: reconciled.state,
+      reason: `Contradictory durable ReviewVerdict disposition=blocked with run state ${reconciled.state}; refusing recovery mutation`,
+    };
+  }
+  if (verdict?.payload.disposition === "blocked" && reconciled.state === "blocked") {
+    return {
+      action: "blocked",
+      runId: latest.runId,
+      state: "blocked",
+      reason: verdict.payload.warnings?.join("; ")
+        ?? latestOutcome?.payload.reason
+        ?? `ReviewVerdict ${verdict.id} is durably blocked`,
+      artifacts: latest.artifacts,
+    };
+  }
   const outcome = latestArtifactOfKind(latest.artifacts, "Outcome");
   const terminalTargetRecoveryOutcome = outcome?.payload.targetRecovery?.checkpointId !== undefined
     && (outcome.payload.status === "failed" || outcome.payload.status === "blocked");
