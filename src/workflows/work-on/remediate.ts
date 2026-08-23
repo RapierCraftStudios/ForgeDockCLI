@@ -12,7 +12,7 @@ import {
   type AgentEventSink,
   type AgentRuntime,
 } from "../../runtime/agent-runtime.js";
-import { BuilderSubmissionSchema, criterionCoverageInstructions, deriveBuilderVerificationGate, normalizeBuilderSubmission, type BuilderSubmission } from "./build.js";
+import { auditBuilderCriterionCoverage, BuilderSubmissionSchema, criterionCoverageInstructions, deriveBuilderVerificationGate, normalizeBuilderSubmission, type BuilderSubmission } from "./build.js";
 import { WorkflowExecutionError, retryableExternalWorkflowError } from "./investigate.js";
 
 export class RemediationAdmissionError extends Error {
@@ -51,6 +51,7 @@ export async function remediateReview(
   const verificationGate = input.verification?.length && (input.verificationRunner ?? dependencies.verifier)
     ? deriveBuilderVerificationGate(input.packet, input.verification)
     : undefined;
+  const frozenCommands = input.verification ?? [];
   let run = input.run;
   try {
     // Admission is controller-owned and deliberately inside the guarded path:
@@ -58,6 +59,7 @@ export async function remediateReview(
     // retry loop or leave a failed run that ordinary resume will replay.
     const clusters = clusterMustFixFindings(findings);
     const reviewCycle = input.reviewCycle ?? { current: 1, total: 1 };
+    const rootChecklist = remediationRootChecklist(input.packet, findings);
     const result = await dependencies.runtime.run<BuilderSubmission>({
       id: `${run.runId}:remediate:${input.verdict.payload.headSha}:${run.attempt}`,
       role: "remediator",
@@ -70,7 +72,7 @@ export async function remediateReview(
         latestArtifacts: { buildResult: input.buildResult.createdAt, reviewVerdict: input.verdict.createdAt },
         remainingRemediationCycles: Math.max(0, reviewCycle.total - reviewCycle.current),
       },
-      objective: `Fix every open controller-accepted mustFix root from review of ${input.verdict.payload.headSha}. Roots are bounded into at most two coherent clusters; no listed criterion violation may be ignored:\n${JSON.stringify(clusters, null, 2)}`,
+      objective: `Fix every open controller-accepted mustFix root from review of ${input.verdict.payload.headSha}. Roots are bounded into at most two coherent clusters; no listed criterion violation may be ignored. Resolve each root using this checklist (carry forward unchanged paths when their invariant remains proven):\n${rootChecklist.map((item) => `- ${item}`).join("\n")}\nClusters:\n${JSON.stringify(clusters, null, 2)}`,
       instructions: [
         "Address every root in every supplied cluster, including accepted medium/non-blocking roots. Do not drop a known frozen-criterion violation merely because it is not independently blocking.",
         "Do not address rejected, follow-up, speculative, or unrelated cleanup.",
@@ -81,6 +83,7 @@ export async function remediateReview(
         "Do not invoke GitHub, commit, push, merge, or alter workflow state.",
         "Use the typed verify tool for implementation feedback when a frozen command is relevant. The controller independently reruns every verification command and owns publication; your check result is feedback, not controller evidence.",
         criterionCoverageInstructions(input.packet),
+        `Root resolution evidence is mandatory for every checklist item: ${rootChecklist.join("; ")}. A previously correct path need not be edited; carry it forward with its current symbol and focused test/invariant or explicit frozen controller-check receipt.`,
         "Report the complete current delivery revision: carry forward prior Build Result paths and criterion evidence, then add or revise the paths and criteria changed by this remediation. The controller normalizes omitted in-scope paths to its scoped Git observation, but rejects fabricated reported paths.",
         "The controller re-runs every required verification command and starts a fresh review at the new SHA.",
       ].join("\n"),
@@ -105,6 +108,7 @@ export async function remediateReview(
         verification: { commands: input.verification, runner: input.verificationRunner ?? dependencies.verifier! },
       } : {}),
       ...(verificationGate !== undefined ? { verificationGate } : {}),
+      submissionAudit: (submission: unknown) => auditRemediationSubmission(input.packet, frozenCommands, findings, submission),
       outputSchema: BuilderSubmissionSchema,
       modelPolicy: {
         ...(input.provider !== undefined ? { provider: input.provider } : {}),
@@ -230,3 +234,93 @@ function criterionFamilyForFinding(finding: MustFixCluster["findings"][number]):
 function criterionFamily(family: string): string { return family.split("::", 1)[0] ?? family; }
 
 function isTestPath(path: string): boolean { return /(?:^|\/)(?:test|tests|__tests__)(?:\/|$)|\.(?:test|spec)\.[^.]+$/i.test(path); }
+
+/**
+ * The review root ledger is stricter than ordinary criterion coverage.  A
+ * remediator may retain a correct implementation, but it must prove each
+ * accepted root against the frozen criterion and a current implementation
+ * anchor; prose or a changed-path claim cannot discharge a root.
+ */
+export function auditRemediationSubmission(
+  packet: DurableArtifact<"BuildPacket">,
+  commands: readonly VerificationCommand[],
+  findings: readonly MustFixCluster["findings"][number][],
+  submission: unknown,
+): { code: string; criterionId?: string; message: string }[] {
+  const diagnostics = [...auditBuilderCriterionCoverage(packet, commands, submission)];
+  if (!submission || typeof submission !== "object") {
+    return [...diagnostics, ...findings.map((finding) => ({
+      code: "missing-remediation-root",
+      message: `root ${rootIdentity(finding)} is unaddressed: submit criterion, production path, symbol, and focused test/invariant or frozen controller-check evidence.`,
+    }))];
+  }
+  const coverage = Array.isArray((submission as Partial<BuilderSubmission>).criterionCoverage)
+    ? (submission as Partial<BuilderSubmission>).criterionCoverage!
+    : [];
+  for (const finding of findings) {
+    const root = rootIdentity(finding);
+    const criterionId = criterionIdForFinding(packet, finding);
+    const criterion = criterionId === undefined ? undefined : packet.payload.acceptanceCriteria[Number(criterionId.slice("criterion-".length)) - 1];
+    if (criterionId === undefined || criterion === undefined) {
+      diagnostics.push({ code: "root-missing-frozen-criterion", message: `root ${root} is unaddressed: it does not map to a frozen acceptance criterion (matched criteria: ${(finding.matchedAcceptanceCriteria ?? []).join(" | ") || "none"}).` });
+      continue;
+    }
+    const item = coverage.find((entry) => entry && typeof entry === "object" && (entry as { criterionId?: unknown }).criterionId === criterionId) as BuilderSubmission["criterionCoverage"][number] | undefined;
+    if (!item) {
+      diagnostics.push({ code: "root-missing-criterion-coverage", criterionId, message: `root ${root} is unaddressed: missing ${criterionId} coverage for frozen criterion ${JSON.stringify(criterion)}.` });
+      continue;
+    }
+    if (item.criterion !== criterion) {
+      diagnostics.push({ code: "root-criterion-mismatch", criterionId, message: `root ${root} is unaddressed: ${criterionId} must match frozen criterion ${JSON.stringify(criterion)} exactly.` });
+    }
+    const anchors = item.anchors;
+    const rootPaths = finding.location ? findingPaths(finding.location).filter((path) => !isTestPath(path)) : [];
+    if (!anchors) {
+      diagnostics.push({ code: "root-missing-anchors", criterionId, message: `root ${root} is unaddressed for ${criterionId}: missing current production path, symbol, and focused test/invariant or explicit frozen controller-check receipt.` });
+      continue;
+    }
+    const missingPaths = rootPaths.filter((path) => !anchors.paths.includes(path));
+    if (!rootPaths.length) {
+      diagnostics.push({ code: "root-missing-production-path", criterionId, message: `root ${root} is unaddressed for ${criterionId}: review finding has no parseable production path to carry forward or fix.` });
+    } else if (missingPaths.length) {
+      diagnostics.push({ code: "root-missing-production-path", criterionId, message: `root ${root} is unaddressed for ${criterionId}: anchor current production path(s) ${missingPaths.join(", ")} (unchanged paths are valid; editing is not required).` });
+    }
+    if (!anchors.symbols.length) {
+      diagnostics.push({ code: "root-missing-symbol-invariant", criterionId, message: `root ${root} is unaddressed for ${criterionId}: anchor the current production symbol or invariant.` });
+    }
+    const knownCommands = new Set(commands.map(({ id }) => id));
+    const controllerReceipt = (anchors.verificationCommandIds ?? []).filter((id) => knownCommands.has(id));
+    if (!anchors.testIds?.length && !controllerReceipt.length) {
+      diagnostics.push({ code: "root-missing-focused-evidence", criterionId, message: `root ${root} is unaddressed for ${criterionId}: provide a focused test/invariant ID or an explicit frozen controller-check receipt.` });
+    }
+  }
+  return diagnostics;
+}
+
+function rootIdentity(finding: MustFixCluster["findings"][number]): string {
+  return finding.rootId ?? finding.normalizedRoot ?? finding.id;
+}
+
+function criterionIdForFinding(
+  packet: DurableArtifact<"BuildPacket">,
+  finding: MustFixCluster["findings"][number],
+): string | undefined {
+  const matched = finding.matchedAcceptanceCriteria ?? [];
+  const exact = packet.payload.acceptanceCriteria.findIndex((criterion) => matched.includes(criterion));
+  if (exact >= 0) return `criterion-${exact + 1}`;
+  const normalized = finding.normalizedRoot?.match(/^criterion-([1-9][0-9]*)\\b/i)?.[1];
+  if (normalized !== undefined && Number(normalized) <= packet.payload.acceptanceCriteria.length) return `criterion-${Number(normalized)}`;
+  return undefined;
+}
+
+function remediationRootChecklist(
+  packet: DurableArtifact<"BuildPacket">,
+  findings: readonly MustFixCluster["findings"][number][],
+): string[] {
+  return findings.map((finding) => {
+    const root = rootIdentity(finding);
+    const criterionId = criterionIdForFinding(packet, finding) ?? "missing-frozen-criterion";
+    const paths = finding.location ? findingPaths(finding.location).filter((path) => !isTestPath(path)) : [];
+    return `${root} => ${criterionId}; production path(s)=${paths.join(", ") || "missing"}; prove with current symbol/invariant + focused test or frozen controller-check`;
+  });
+}

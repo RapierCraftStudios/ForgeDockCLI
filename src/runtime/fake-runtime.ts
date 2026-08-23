@@ -47,6 +47,19 @@ export class FakeAgentRuntime implements AgentRuntime {
       const details = [...Errors(task.outputSchema, value)].slice(0, 5).map((error) => error.message);
       throw new Error(`Fake response does not match task schema: ${details.join("; ")}`);
     }
+    const requestsVerify = task.tools.includes("verify");
+    if (requestsVerify !== (task.verification !== undefined)) {
+      throw new Error(`Fake task verify capability mismatch: tools=${requestsVerify} verification=${task.verification !== undefined}`);
+    }
+    if (task.verificationGate) {
+      const available = new Set(task.verification?.commands.map(({ id }) => id) ?? []);
+      const missing = task.verificationGate.requiredCommandIds.filter((id) => !available.has(id));
+      if (missing.length) throw new Error(`Fake task verification gate references unavailable command IDs: ${missing.join(", ")}`);
+    }
+    const diagnostics = task.submissionAudit?.(value) ?? [];
+    if (diagnostics.length) {
+      throw new Error(`Fake submission audit rejected artifact: ${diagnostics.map(({ criterionId, code, message }) => `${criterionId ?? "packet"}:${code} ${message}`).join("; ")}`);
+    }
     emit({ type: "artifact.submitted", logicalStreamId, taskId: task.id });
     emit({ type: "session.completed", logicalStreamId, taskId: task.id, sessionRef });
     return { output: value as T, sessionRef, provider: "fake", model: "scripted" };

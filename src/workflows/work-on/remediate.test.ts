@@ -5,11 +5,11 @@ import { InMemoryRunRepository } from "../../core/ports/repositories.js";
 import type { VerificationRunner } from "../../core/ports/verification.js";
 import { createRun, transition } from "../../core/state/machine.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
-import { clusterMustFixFindings, remediateReview } from "./remediate.js";
+import { auditRemediationSubmission, clusterMustFixFindings, remediateReview } from "./remediate.js";
 
 const submission = {
   summary: "Fixed medium root", changedPaths: ["src/a.ts"],
-  criterionCoverage: [{ criterionId: "criterion-1", criterion: "Paraphrased remediation prose", implementation: "guard fixed", anchors: { paths: ["src/a.ts"], symbols: ["guard"], testIds: ["guard-regression"], verificationCommandIds: ["test"] } }],
+  criterionCoverage: [{ criterionId: "criterion-1", criterion: "Guard remains correct", implementation: "guard fixed", anchors: { paths: ["src/a.ts"], symbols: ["guard"], testIds: ["guard-regression"], verificationCommandIds: ["test"] } }],
   decisions: [], residualRisks: [],
 };
 
@@ -116,6 +116,24 @@ describe("mustFix remediation", () => {
       intentRelevance: "criterion", remediation: "fix", scopeDisposition: "in_scope" as const,
     }));
     assert.throws(() => clusterMustFixFindings(roots), /spans .* production paths; maximum is 4/i);
+  });
+  it("rejects an omitted root with exact diagnostics, then accepts corrected carry-forward proof", () => {
+    const common = { runId: "run-audit", subject: { repo: "a/b", issue: 14 } };
+    const packet = createArtifact({ ...common, kind: "BuildPacket", producer: { role: "packet-author" }, payload: {
+      scope: ["Guard"], acceptanceCriteria: ["Guard remains correct", "Cancellation remains safe"], context: [{ source: "src/a.ts", relevance: "root evidence" }],
+      implementationPlan: ["Preserve guards"], expectedPaths: ["src/a.ts", "src/b.ts"], verificationPlan: ["none"], risks: [{ risk: "none", mitigation: "retain proof" }], outOfScope: ["none"],
+    } });
+    const findings = [
+      { id: "f-1", rootId: "root-admission", normalizedRoot: "criterion-1\\nsrc/a.ts\\nguard\\ninvariant\\nfailure\\ntrigger", severity: "high" as const, confidence: "high" as const, blocking: true, mustFix: true, title: "Admission", evidence: "evidence", location: "src/a.ts:guard()", intentRelevance: "criterion", remediation: "fix", matchedAcceptanceCriteria: ["Guard remains correct"] },
+      { id: "f-2", rootId: "root-cancel", normalizedRoot: "criterion-2\\nsrc/b.ts\\ncancel\\ninvariant\\nfailure\\ntrigger", severity: "high" as const, confidence: "high" as const, blocking: true, mustFix: true, title: "Cancellation", evidence: "evidence", location: "src/b.ts:cancel()", intentRelevance: "criterion", remediation: "fix", matchedAcceptanceCriteria: ["Cancellation remains safe"] },
+    ];
+    const proof = (root: string) => ({ criterionId: root === "root-admission" ? "criterion-1" : "criterion-2", criterion: root === "root-admission" ? "Guard remains correct" : "Cancellation remains safe", implementation: "existing invariant remains proven", anchors: { paths: [root === "root-admission" ? "src/a.ts" : "src/b.ts"], symbols: [root === "root-admission" ? "guard" : "cancel"], testIds: [root] } });
+    const complete = { summary: "carry forward", changedPaths: ["src/a.ts"], criterionCoverage: [proof("root-admission"), proof("root-cancel")], decisions: [], residualRisks: [] };
+    assert.deepEqual(auditRemediationSubmission(packet, [], findings, complete), []);
+    const omitted = { ...complete, criterionCoverage: [proof("root-admission")] };
+    const diagnostics = auditRemediationSubmission(packet, [], findings, omitted);
+    assert.ok(diagnostics.some(({ message }) => message.includes("root-cancel") && message.includes("criterion-2")));
+    assert.deepEqual(auditRemediationSubmission(packet, [], findings, complete), []);
   });
 
 });
