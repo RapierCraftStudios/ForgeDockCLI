@@ -14,7 +14,7 @@ import { WorkflowExecutionError, retryableExternalWorkflowError } from "../work-
 import { consolidateReviewerFindings, type ConsolidatedFinding } from "./consolidate.js";
 import { openLedgerFindings, reconcileFindingRootLedger, type FindingRoot, type RootAssessment } from "./finding-root-ledger.js";
 import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, planReviewPanel, ROLE_ORDER, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
-import { applyFindingScopePolicy, findingAuthorityEligible, findingMaterializationReason, shouldMaterializeFinding, verifyFindingSourceAnchors, type FindingProjectionMode } from "./scope.js";
+import { applyFindingScopePolicy, findingAuthorityEligible, findingMaterializationReason, isUnverifiedSourceFinding, shouldMaterializeFinding, verifyFindingSourceAnchors, type FindingProjectionMode } from "./scope.js";
 
 const ReviewerFindingSchema = Type.Object({
   ...FindingSchema.properties,
@@ -795,6 +795,17 @@ export async function reviewPullRequest(
       ...(input.readExactBlob ? { readBlob: input.readExactBlob } : {}),
       verifiedAuthorityReferences,
     });
+    const rawSourceVerified = await verifyFindingSourceAnchors(
+      reviewerResults.flatMap((result) => result.output.findings),
+      {
+        reviewedHeadSha: frozen.headSha,
+        changedPaths,
+        expectedPaths: input.packet.payload.expectedPaths,
+        ...(input.readExactBlob ? { readBlob: input.readExactBlob } : {}),
+        verifiedAuthorityReferences,
+      },
+    );
+    const unverifiedRawSourceClaim = rawSourceVerified.some(isUnverifiedSourceFinding);
     const adjudicationCandidates = sourceVerified.filter((finding) => finding.confidence !== "low"
       && finding.scopeDisposition === "in_scope"
       && (finding.mustFix ?? finding.blocking));
@@ -862,7 +873,12 @@ export async function reviewPullRequest(
         ...(priorRootLedger ? { supersedes: priorRootLedger.id } : {}),
       },
     });
-    const disposition = openFindings.some((finding) => finding.mustFix ?? finding.blocking) ? "request_changes" as const : "approve" as const;
+    const unverifiedSourceFindings = scopedFindings.some(isUnverifiedSourceFinding);
+    // Missing/stale source proof is a review admission failure, not a
+    // remediation obligation: retain the finding as advisory but block closure.
+    const disposition = unverifiedSourceFindings || unverifiedRawSourceClaim
+      ? "blocked" as const
+      : openFindings.some((finding) => finding.mustFix ?? finding.blocking) ? "request_changes" as const : "approve" as const;
     const finalSnapshot = await dependencies.host.getPullRequest(frozen.repo, frozen.number);
     assertPullRequestRouteStable(frozen, finalSnapshot, "before verdict publication");
     // First gate prevents a known-stale approval from projecting/closing finding
@@ -1023,7 +1039,7 @@ export async function reviewPullRequest(
     });
     await dependencies.artifacts.append(verdict);
     run = attachArtifact(run, "ReviewVerdict", verdict.id);
-    const advanced = transition(run, disposition === "approve" ? "REVIEW_APPROVED" : "REVIEW_CHANGES_REQUESTED", { headSha: frozen.headSha });
+    const advanced = transition(run, disposition === "approve" ? "REVIEW_APPROVED" : disposition === "blocked" ? "REVIEW_BLOCKED" : "REVIEW_CHANGES_REQUESTED", { headSha: frozen.headSha });
     await dependencies.runs.commit(run.version, advanced.state, advanced.record);
     return { run: advanced.state, verdict, sessionRefs, reviewPlan };
   } catch (error) {
@@ -1983,7 +1999,7 @@ export async function resumeReviewFindingProjection(
     run = attachArtifact(run, "ReviewFindingProjection", projectionReceiptId ?? completedProjectionId);
   }
   run = attachArtifact(run, "ReviewVerdict", verdict.id);
-  const advanced = transition(run, payload.disposition === "approve" ? "REVIEW_APPROVED" : "REVIEW_CHANGES_REQUESTED", { headSha: payload.headSha });
+  const advanced = transition(run, payload.disposition === "approve" ? "REVIEW_APPROVED" : payload.disposition === "blocked" ? "REVIEW_BLOCKED" : "REVIEW_CHANGES_REQUESTED", { headSha: payload.headSha });
   await dependencies.runs.commit(run.version, advanced.state, advanced.record);
   return { run: advanced.state, verdict, reviewPlan };
 }

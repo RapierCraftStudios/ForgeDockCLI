@@ -136,6 +136,24 @@ const followUpAdjudication = (task: AgentTask<unknown>) => ({
 });
 
 describe("fresh-context PR review", () => {
+  it("blocks closure when a blocking finding has stale source proof", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const stale = { ...inScope, id: "stale-source", severity: "high" as const, confidence: "high" as const,
+      blocking: true, title: "Guard is stale", evidence: "The guarded write is absent", location: "src/lock.ts:1",
+      remediation: "Restore the guarded write", intentRelevance: "The accepted guard must remain present", sourceSnapshot: { reviewedHeadSha: sha, path: "src/lock.ts", excerpt: "missing-now" } };
+    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd(),
+      readExactBlob: async () => ({ content: "current source", mode: "100644" }) }, {
+      runtime: new FakeAgentRuntime([() => ({ summary: "Blocking stale claim", findings: [stale] }), () => ({ summary: "Blocking stale claim", findings: [stale] }), () => ({ summary: "Blocking stale claim", findings: [stale] }), () => ({ summary: "Blocking stale claim", findings: [stale] }), clean]),
+      host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
+    });
+    assert.equal(result.verdict.payload.disposition, "blocked");
+    assert.equal(result.run.state, "blocked");
+    assert.equal(result.verdict.payload.findings[0]?.blocking, false);
+    assert.equal(result.verdict.payload.findings[0]?.mustFix, false);
+  });
+
   it("routes risk specialists and approves only the frozen SHA", async () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);

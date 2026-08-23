@@ -74,6 +74,11 @@ export function findingAuthorityEligible(
   return finding.sourceSnapshot !== undefined;
 }
 
+export function isUnverifiedSourceFinding(finding: ReviewFinding): boolean {
+  return finding.scopeDisposition === "follow_up"
+    && finding.scopeRationale?.includes("Controller could not verify an exact reviewed-head source anchor") === true;
+}
+
 /** Projection mode used by the native review controller. */
 export type FindingProjectionMode = "all" | "impact-gated";
 
