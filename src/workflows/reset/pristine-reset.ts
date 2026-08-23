@@ -548,9 +548,18 @@ async function rereadManifestIdentities(manifest: PristineResetManifest, deps: R
     }
   }
   if (phase === "before") {
-    const runIds = new Set(manifest.runs.map((run) => run.runId));
-    const artifactIds = new Set(manifest.artifacts.map((artifact) => artifact.artifactId));
-    const investigationIds = new Set(manifest.dags.flatMap((dag) => [...(dag.investigationArtifactIds ?? []), ...(dag.investigationIds ?? [])]));
+    const runIds = new Set([
+      ...manifest.runs.map((run) => run.runId),
+      ...(manifest.selection.runIds ?? []),
+    ]);
+    const artifactIds = new Set([
+      ...manifest.artifacts.map((artifact) => artifact.artifactId),
+      ...(manifest.selection.artifactIds ?? []),
+    ]);
+    const investigationIds = new Set([
+      ...(manifest.selection.investigationIds ?? []),
+      ...manifest.dags.flatMap((dag) => [...(dag.investigationArtifactIds ?? []), ...(dag.investigationIds ?? [])]),
+    ]);
     const investigationRunIds = new Set(manifest.dags.flatMap((dag) => dag.investigationRunIds ?? []));
     const selectedIds = new Set(manifest.comments.map((comment) => comment.id));
     const issueComments = (await Promise.all(manifest.selection.issueNumbers
@@ -720,8 +729,13 @@ function isSelectedResetComment(
       return false;
     }
     if (canonical.subject.repo.trim().toLowerCase() !== repo.trim().toLowerCase()) return false;
+    // An exact artifact identity frozen in the signed/current authority manifest
+    // is stronger than the producer/provider metadata in the remote projection.
+    // The body hash, schema decode, and subject checks above still bind it to the
+    // exact comment being removed.
+    if (artifactIds.has(canonical.id)) return true;
     if (!isControllerCompatibleArtifact(canonical)) return false;
-    return artifactIds.has(canonical.id) || runIds.has(canonical.runId)
+    return runIds.has(canonical.runId)
       || investigationIds.has(canonical.id) || investigationRunIds.has(canonical.runId);
   }
   // Compatibility path for adapter-provided identities whose local artifact

@@ -119,7 +119,48 @@ describe("typed pristine repository reset", () => {
     assert.equal(deleted, true);
   });
 
-  it("dry-run is read-only and replays labels deterministically", async () => {
+  it("selects a packet-author canonical projection only by its frozen artifact ID", async () => {
+    const packet = createArtifact({
+      kind: "BuildPacket", runId: "run-packet", subject: { repo: "o/r", issue: 1 },
+      producer: { role: "packet-author", runtime: "pi-compatible" },
+      payload: { scope: ["fix"], acceptanceCriteria: ["pass"], context: [], implementationPlan: ["edit"], expectedPaths: ["src/a.ts"], verificationPlan: ["test"], risks: [], outOfScope: [] },
+    }, { id: "packet-artifact" });
+    const body = renderArtifactComment(packet);
+    const comment = { id: 51, issue: 1, marker: `artifact:${packet.id}`, runId: packet.runId, artifactId: packet.id, bodySha256: sha256(body), body, managed: true as const };
+    const deps = fakeDeps();
+    let deleted = false;
+    deps.state.capture = async () => ({ runs: [], artifacts: [], tasks: [], observations: [], fences: [], promotions: [], dags: [], leases: [], archive: [] });
+    deps.host.listComments = async () => deleted ? [] : [comment];
+    deps.host.deleteComment = async () => { deleted = true; };
+    const manifest = await dryRunPristineReset({ repo: "o/r", issueNumbers: [1], dagIds: [], artifactIds: [packet.id] }, deps);
+    assert.deepEqual(manifest.comments.map((selected) => selected.id), [51]);
+    await applyPristineReset(manifest, manifest.digest, deps);
+    assert.equal(deleted, true);
+
+    const unselected = fakeDeps();
+    unselected.state.capture = async () => ({ runs: [], artifacts: [], tasks: [], observations: [], fences: [], promotions: [], dags: [], leases: [], archive: [] });
+    unselected.host.listComments = async () => [comment];
+    const runOnly = await dryRunPristineReset({ repo: "o/r", issueNumbers: [1], dagIds: [], runIds: [packet.runId] }, unselected);
+    assert.deepEqual(runOnly.comments, []);
+  });
+
+  it("rechecks selected packet projections after fencing", async () => {
+    const packet = createArtifact({
+      kind: "BuildPacket", runId: "run-packet", subject: { repo: "o/r", issue: 1 },
+      producer: { role: "packet-author", runtime: "pi-compatible" },
+      payload: { scope: ["fix"], acceptanceCriteria: ["pass"], context: [], implementationPlan: ["edit"], expectedPaths: ["src/a.ts"], verificationPlan: ["test"], risks: [], outOfScope: [] },
+    }, { id: "packet-after-fence" });
+    const body = renderArtifactComment(packet);
+    const original = { id: 52, issue: 1, marker: `artifact:${packet.id}`, runId: packet.runId, artifactId: packet.id, bodySha256: sha256(body), body, managed: true as const };
+    const late = { ...original, id: 53 };
+    const deps = fakeDeps();
+    let fenced = false;
+    deps.state.capture = async () => ({ runs: [], artifacts: [], tasks: [], observations: [], fences: [], promotions: [], dags: [], leases: [], archive: [] });
+    deps.cancellation.fence = async () => { fenced = true; };
+    deps.host.listComments = async () => fenced ? [original, late] : [original];
+    const manifest = await dryRunPristineReset({ repo: "o/r", issueNumbers: [1], dagIds: [], artifactIds: [packet.id] }, deps);
+    await assert.rejects(() => applyPristineReset(manifest, manifest.digest, deps), /newly appeared selected comment/i);
+  });  it("dry-run is read-only and replays labels deterministically", async () => {
     assert.deepEqual(replayLabels([
       { name: "workflow:building", action: "labeled", occurredAt: "2026-01-02", eventId: 2 },
       { name: "workflow:building", action: "unlabeled", occurredAt: "2026-01-03", eventId: 3 },
