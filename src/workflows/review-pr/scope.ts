@@ -1,8 +1,78 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { createHash } from "node:crypto";
 import type { DurableArtifact } from "../../core/artifacts/schema.js";
 
 export type ReviewFinding = DurableArtifact<"ReviewVerdict">["payload"]["findings"][number];
+
+export interface ExactSourceBlob {
+  content: string;
+  mode: string;
+}
+
+/** Validate reviewer source identity against the immutable reviewed revision. */
+export async function verifyFindingSourceAnchors<T extends ReviewFinding>(
+  findings: readonly T[],
+  input: {
+    reviewedHeadSha: string;
+    changedPaths: readonly string[];
+    expectedPaths: readonly string[];
+    readBlob?: (revision: string, path: string) => Promise<ExactSourceBlob | undefined>;
+    verifiedAuthorityReferences: readonly string[];
+  },
+): Promise<T[]> {
+  const changed = input.changedPaths.map(normalizeRepoPath);
+  const expected = input.expectedPaths.map(normalizeRepoPath);
+  const authority = new Set(input.verifiedAuthorityReferences);
+  return Promise.all(findings.map(async (finding) => {
+    if (!(finding.mustFix ?? finding.blocking)) return finding;
+    const anchor = finding.evidenceAnchor;
+    if ((anchor?.kind === "delivery-authority" || anchor?.kind === "deterministic-check")
+      && authority.has(anchor.reference)) return finding;
+    const snapshot = finding.sourceSnapshot;
+    const path = snapshot?.path ? normalizeRepoPath(snapshot.path) : undefined;
+    const pathAllowed = Boolean(path)
+      && (changed.some((candidate) => pathMatchesExpectation(path!, candidate))
+        || expected.some((candidate) => pathMatchesExpectation(path!, candidate)));
+    let verified = Boolean(snapshot
+      && input.readBlob
+      && snapshot.reviewedHeadSha.toLowerCase() === input.reviewedHeadSha.toLowerCase()
+      && pathAllowed
+      && (snapshot.excerpt !== undefined || snapshot.digest !== undefined));
+    if (verified) {
+      try {
+        const blob = await input.readBlob!(input.reviewedHeadSha, path!);
+        if (!blob || blob.mode === "120000") verified = false;
+        else {
+          if (snapshot!.excerpt !== undefined && !blob.content.includes(snapshot!.excerpt)) verified = false;
+          if (snapshot!.digest !== undefined
+            && createHash("sha256").update(blob.content).digest("hex") !== snapshot!.digest.toLowerCase()) verified = false;
+          if (snapshot!.symbol !== undefined && !blob.content.includes(snapshot!.symbol)) verified = false;
+        }
+      } catch { verified = false; }
+    }
+    if (verified) return finding;
+    return {
+      ...finding,
+      blocking: false,
+      mustFix: false,
+      scopeDisposition: "follow_up",
+      scopeRationale: [finding.scopeRationale, "Controller could not verify an exact reviewed-head source anchor; retained as advisory."].filter(Boolean).join(" "),
+    };
+  }));
+}
+
+export function findingAuthorityEligible(
+  finding: ReviewFinding,
+  verifiedAuthorityReferences: readonly string[],
+): boolean {
+  if (finding.scopeDisposition !== undefined && finding.scopeDisposition !== "in_scope") return false;
+  if (!(finding.mustFix ?? finding.blocking)) return false;
+  const anchor = finding.evidenceAnchor;
+  if ((anchor?.kind === "delivery-authority" || anchor?.kind === "deterministic-check")
+    && verifiedAuthorityReferences.includes(anchor.reference)) return true;
+  return finding.sourceSnapshot !== undefined;
+}
 
 /** Projection mode used by the native review controller. */
 export type FindingProjectionMode = "all" | "impact-gated";

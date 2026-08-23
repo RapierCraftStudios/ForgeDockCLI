@@ -14,7 +14,7 @@ import { WorkflowExecutionError, retryableExternalWorkflowError } from "../work-
 import { consolidateReviewerFindings, type ConsolidatedFinding } from "./consolidate.js";
 import { openLedgerFindings, reconcileFindingRootLedger, type FindingRoot, type RootAssessment } from "./finding-root-ledger.js";
 import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, planReviewPanel, ROLE_ORDER, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
-import { applyFindingScopePolicy, findingMaterializationReason, shouldMaterializeFinding, type FindingProjectionMode } from "./scope.js";
+import { applyFindingScopePolicy, findingAuthorityEligible, findingMaterializationReason, shouldMaterializeFinding, verifyFindingSourceAnchors, type FindingProjectionMode } from "./scope.js";
 
 const ReviewerFindingSchema = Type.Object({
   ...FindingSchema.properties,
@@ -309,6 +309,8 @@ export async function reviewPullRequest(
     priorVerdict?: DurableArtifact<"ReviewVerdict">;
     reviewCycle?: { current: number; total: number };
     workspace: string;
+    /** Exact immutable blob reader for controller-owned source proof. */
+    readExactBlob?: (revision: string, path: string) => Promise<{ content: string; mode: string } | undefined>;
     provider?: string;
     model?: string;
     blockingSeverities?: readonly ("critical" | "high" | "medium" | "low")[];
@@ -568,6 +570,7 @@ export async function reviewPullRequest(
               "Every finding needs concrete evidence, intent relevance, remediation, and a concise causalRoot failure-mode label.",
               "Every finding must include a structured impact declaration: choose one category (correctness, security, data-integrity, availability, performance, compatibility, operability, test-gap, advisory) and state the concrete trigger, the affected invariant or acceptance criterion, and the observable consequence. Do not promote style, preference, speculative cleanup, or a test gap with no concrete consequence; report no finding or classify it advisory.",
               "Anchor a potentially blocking finding with a repository location or a typed evidenceAnchor. Delivery-authority/check anchors must quote an exact controller-observed reference; vague prose cannot block.",
+              "For every blocking or mustFix repository-location claim, provide sourceSnapshot with reviewedHeadSha exactly equal to the frozen head, a repo-relative path, and either a bounded exact source excerpt or SHA-256 digest; include symbol when claiming symbol identity. Line-only prose is not source proof. Deterministic-check and delivery-authority anchors are valid only when they quote an exact controller-known reference.",
               "Classify scopeDisposition=in_scope only when the minimal fix is wholly required by the frozen Build Packet and does not add a new guarantee, entity, protocol, or behavior excluded from it; otherwise use follow_up or rejected.",
               "For every in_scope finding, copy at least one Build Packet acceptance criterion verbatim into matchedAcceptanceCriteria. A broad consistency criterion does not authorize transitive redesign beyond the packet's explicit scope and exclusions.",
               input.priorVerdict
@@ -785,7 +788,14 @@ export async function reviewPullRequest(
       remediationDeltaHunks,
       changedRemediationAuthorityReferences,
     });
-    const adjudicationCandidates = prefiltered.filter((finding) => finding.confidence !== "low"
+    const sourceVerified = await verifyFindingSourceAnchors(prefiltered, {
+      reviewedHeadSha: frozen.headSha,
+      changedPaths,
+      expectedPaths: input.packet.payload.expectedPaths,
+      ...(input.readExactBlob ? { readBlob: input.readExactBlob } : {}),
+      verifiedAuthorityReferences,
+    });
+    const adjudicationCandidates = sourceVerified.filter((finding) => finding.confidence !== "low"
       && finding.scopeDisposition === "in_scope"
       && (finding.mustFix ?? finding.blocking));
     const adjudication = adjudicationCandidates.length
@@ -808,21 +818,28 @@ export async function reviewPullRequest(
         ...(dependencies.onAgentEvent ? { onAgentEvent: dependencies.onAgentEvent } : {}),
       })
       : undefined;
-    const adjudicated = adjudication ? applyScopeAdjudication(prefiltered, adjudication.output.decisions) : prefiltered;
+    const adjudicated = adjudication ? applyScopeAdjudication(sourceVerified, adjudication.output.decisions) : sourceVerified;
     const scopedFindings = applyFindingScopePolicy(adjudicated, input.packet, input.priorVerdict, {
       remediationDeltaPaths,
       remediationDeltaHunks,
       changedRemediationAuthorityReferences,
     });
+    const authoritativeFindings = scopedFindings.filter((finding) => findingAuthorityEligible(finding, verifiedAuthorityReferences));
     const rootAssessments = collectRootAssessments(reviewerResults, openPriorRoots);
     const roots = reconcileFindingRootLedger({
       ...(priorRootLedger ? { previous: priorRootLedger } : {}),
       packet: input.packet,
-      findings: scopedFindings,
+      findings: authoritativeFindings,
       assessments: rootAssessments,
       headSha: frozen.headSha,
     });
-    const openFindings = openLedgerFindings(roots);
+    // A prior ledger entry is not fresh evidence. Only roots linked to an
+    // authoritative finding from this exact review can reopen or project.
+    const authoritativeFindingIds = new Set(authoritativeFindings.map((finding) => finding.id));
+    const freshRoots = priorRootLedger
+      ? roots.filter((root) => root.findingIds.some((id) => authoritativeFindingIds.has(id)))
+      : roots;
+    const openFindings = openLedgerFindings(freshRoots);
     const activeRootIds = new Set(openFindings.flatMap((finding) => finding.rootId ? [finding.rootId] : []));
     const activeFindingIds = new Set(roots.filter((root) => activeRootIds.has(root.rootId)).flatMap((root) => root.findingIds));
     const findings = [

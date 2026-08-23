@@ -108,6 +108,7 @@ function artifacts(run: RunState) {
 }
 
 const clean: ReviewerSubmission = { summary: "No blocking defects", findings: [] };
+const sourceBlob = async () => ({ content: "// lock guarded source\nfunction lock() {}", mode: "100644" });
 const inScope = {
   scopeDisposition: "in_scope" as const,
   scopeRationale: "Directly matches the frozen acceptance criterion.",
@@ -115,6 +116,7 @@ const inScope = {
   matchedPriorFindingIds: [] as string[],
   introducedByRemediation: false,
   causalRoot: "lock releases before guarded write",
+  sourceSnapshot: { reviewedHeadSha: sha, path: "src/lock.ts", excerpt: "lock" },
   impact: {
     category: "correctness" as const,
     trigger: "A concurrent update enters after the lock is released.",
@@ -150,7 +152,7 @@ describe("fresh-context PR review", () => {
     };
     const runtime = new FakeAgentRuntime([clean, clean]);
     const host = new FakeHost();
-    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, packet, workspace: process.cwd() }, {
+    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, packet, workspace: process.cwd(), readExactBlob: sourceBlob }, {
       runtime, host, artifacts: new InMemoryArtifactRepository(), runs,
     });
     assert.equal(result.run.state, "merging");
@@ -192,7 +194,7 @@ describe("fresh-context PR review", () => {
       },
       async close() {},
     };
-    const result = await reviewPullRequest({ run, pullRequest: pr, ...base, packet, buildResult, workspace: process.cwd() }, {
+    const result = await reviewPullRequest({ run, pullRequest: pr, ...base, packet, buildResult, workspace: process.cwd(), readExactBlob: sourceBlob }, {
       runtime, host, artifacts: new InMemoryArtifactRepository(), runs,
     });
     assert.equal(result.reviewPlan.executionGroups.length, 6);
@@ -228,7 +230,7 @@ describe("fresh-context PR review", () => {
     };
     const events: string[] = [];
     const host = new FakeHost(events);
-    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob }, {
       runtime: new FakeAgentRuntime([{ summary: "correctness", findings: [duplicateA] }, { summary: "concurrency", findings: [duplicateB] }, acceptAdjudication]),
       host, artifacts: new InMemoryArtifactRepository(), runs,
     });
@@ -272,7 +274,7 @@ describe("fresh-context PR review", () => {
     };
     const host = new FakeHost();
     const result = await reviewPullRequest({
-      run, pullRequest: pr, ...context, workspace: process.cwd(), findingIssuePolicy: "impact-gated",
+      run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob, findingIssuePolicy: "impact-gated",
     }, {
       runtime: new FakeAgentRuntime([
         { summary: "Runtime defect", findings: [runtimeDefect] },
@@ -308,7 +310,7 @@ describe("fresh-context PR review", () => {
     };
     const host = new FakeHost();
     const result = await reviewPullRequest({
-      run, pullRequest: pr, ...context, workspace: process.cwd(), findingIssuePolicy: "shadow-impact-gated",
+      run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob, findingIssuePolicy: "shadow-impact-gated",
     }, {
       runtime: new FakeAgentRuntime([{ summary: "Advisory", findings: [lowTestGap] }, clean]),
       host, artifacts: new InMemoryArtifactRepository(), runs,
@@ -327,7 +329,7 @@ describe("fresh-context PR review", () => {
     const host = new FakeHost();
     host.snapshots = [pr, { ...pr, baseBranch: "release" }];
     await assert.rejects(
-      reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+      reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob }, {
         runtime, host, artifacts: new InMemoryArtifactRepository(), runs,
       }),
       /PR delivery route changed during reviewer execution/,
@@ -343,7 +345,7 @@ describe("fresh-context PR review", () => {
     const runtime = new FakeAgentRuntime([clean, clean]);
 
     await assert.rejects(
-      reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+      reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob }, {
         runtime, host, artifacts: new InMemoryArtifactRepository(), runs,
       }),
       /must be OPEN at freeze, found CLOSED/,
@@ -378,12 +380,12 @@ describe("fresh-context PR review", () => {
         ...inScope,
         id: "lease-1", severity: "high", confidence: "high", blocking: true,
         title: "Stale lease holder can commit", evidence: "A reassigned worker is not fenced", location: "src/worker.ts:20",
-        intentRelevance: "Permits stale writes", remediation: "Fence commits with the active lease epoch",
+        sourceSnapshot: { reviewedHeadSha: sha, path: "src/worker.ts", excerpt: "lock" }, intentRelevance: "Permits stale writes", remediation: "Fence commits with the active lease epoch",
       }],
     }, acceptAdjudication]);
     const result = await reviewPullRequest({
       run, pullRequest: pr, intent: context.intent, investigation: context.investigation,
-      packet: packetWithoutConcurrency, buildResult, workspace: process.cwd(), maxReviewSpecialists: 1,
+      packet: packetWithoutConcurrency, buildResult, workspace: process.cwd(), readExactBlob: sourceBlob, maxReviewSpecialists: 1,
     }, { runtime, host: new PlainHost(), artifacts: new InMemoryArtifactRepository(), runs });
     assert.deepEqual(result.reviewPlan.selected.map(({ role }) => role), ["correctness"]);
     assert.equal(result.reviewPlan.frozen, true);
@@ -410,7 +412,7 @@ describe("fresh-context PR review", () => {
       payload: { headSha: "b".repeat(40), headBranch: "fix", baseBranch: "main", disposition: "request_changes", reviewerRoles: ["correctness"], findings: [], checks: [], reviewPlan: priorPlan },
     });
     const runtime = new FakeAgentRuntime([clean, clean]);
-    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, packet: neutralPacket, priorVerdict, workspace: process.cwd() }, {
+    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, packet: neutralPacket, priorVerdict, workspace: process.cwd(), readExactBlob: sourceBlob }, {
       runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
     });
     assert.notEqual(result.reviewPlan.planId, priorPlan.planId);
@@ -440,7 +442,7 @@ describe("fresh-context PR review", () => {
     const runtime = new FakeAgentRuntime([clean]);
     const host = new FakeHost();
     await assert.rejects(reviewPullRequest({
-      run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd(),
+      run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd(), readExactBlob: sourceBlob,
     }, { runtime, host, artifacts: new InMemoryArtifactRepository(), runs }), /newly pushed pull-request revision/);
     assert.equal(runtime.tasks.length, 0);
     assert.equal(host.findingIssues.length, 0);
@@ -485,7 +487,7 @@ describe("fresh-context PR review", () => {
     const host = new FakeHost();
     host.remediationDeltaPaths = ["src/lock.ts"];
     host.remediationDeltaHunks = ["src/lock.ts:L20-L20:lock.run"];
-    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd() }, {
+    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd(), readExactBlob: sourceBlob }, {
       runtime: new FakeAgentRuntime([{ summary: "introduced regression", findings: [introduced] }, clean, acceptAdjudication]),
       host, artifacts: new InMemoryArtifactRepository(), runs,
     });
@@ -541,7 +543,7 @@ describe("fresh-context PR review", () => {
       }
       const artifactStore = new InMemoryArtifactRepository();
       await assert.rejects(
-        reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd() }, {
+        reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd(), readExactBlob: sourceBlob }, {
           runtime, host, artifacts: artifactStore, runs,
         }),
         /Cannot use prior Review Verdict/,
@@ -572,7 +574,7 @@ describe("fresh-context PR review", () => {
       },
     });
     const runtime = new FakeAgentRuntime([clean, clean]);
-    await assert.rejects(reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd() }, {
+    await assert.rejects(reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd(), readExactBlob: sourceBlob }, {
       runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
     }), /Cannot use prior Review Verdict/);
     assert.equal(runtime.tasks.length, 0);
@@ -587,7 +589,7 @@ describe("fresh-context PR review", () => {
       clean,
       clean,
     ]);
-    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob }, {
       runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
     });
     assert.equal(result.run.state, "merging");
@@ -607,7 +609,7 @@ describe("fresh-context PR review", () => {
       clean,
     ]);
     await assert.rejects(
-      reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+      reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob }, {
         runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
       }),
       /context window/,
@@ -627,7 +629,7 @@ describe("fresh-context PR review", () => {
     const host = new FakeHost();
     const artifactStore = new InMemoryArtifactRepository();
     await assert.rejects(
-      reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+      reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob }, {
         runtime, host, artifacts: artifactStore, runs,
       }),
       /tool_budget_exhausted/,
@@ -677,7 +679,7 @@ describe("fresh-context PR review", () => {
       clean,
       acceptAdjudication,
     ]);
-    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob }, {
       runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
     });
     assert.equal(result.run.state, "merging");
@@ -701,7 +703,7 @@ describe("fresh-context PR review", () => {
     const host = new FakeHost();
     const artifactStore = new InMemoryArtifactRepository();
     await assert.rejects(
-      reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+      reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob }, {
         runtime, host, artifacts: artifactStore, runs,
       }),
       /Review incomplete.*successful reviewer reports were preserved and no partial approval was issued/,
@@ -740,7 +742,7 @@ describe("fresh-context PR review", () => {
     });
     const runtime = new FakeAgentRuntime([async () => { throw new Error("first attempt failed"); }, clean]);
     await assert.rejects(
-      reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd() }, {
+      reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd(), readExactBlob: sourceBlob }, {
         runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
       }),
       /reviewer-attempt budget exhausted/,
@@ -764,7 +766,7 @@ describe("fresh-context PR review", () => {
     });
     const runtime = new FakeAgentRuntime([async () => { throw new Error("first attempt failed"); }, clean]);
     await assert.rejects(
-      reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd() }, {
+      reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd(), readExactBlob: sourceBlob }, {
         runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
       }),
       /model-call budget exhausted/,
@@ -795,7 +797,7 @@ describe("fresh-context PR review", () => {
     };
     const runtime = new FakeAgentRuntime([{ summary: "finding", findings: [finding] }, clean, { decisions: [] }]);
     await assert.rejects(
-      reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd() }, {
+      reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd(), readExactBlob: sourceBlob }, {
         runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
       }),
       /Scope adjudication omitted finding/,
@@ -820,7 +822,7 @@ describe("fresh-context PR review", () => {
     const runtime = new HangingRuntime();
     await assert.rejects(
       reviewPullRequest({
-        run, pullRequest: pr, ...context, workspace: process.cwd(), maxReviewSpecialists: 1, reviewerAttemptTimeoutMs: 25,
+        run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob, maxReviewSpecialists: 1, reviewerAttemptTimeoutMs: 25,
       }, { runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs }),
       /timed out after 25ms/,
     );
@@ -852,7 +854,7 @@ describe("fresh-context PR review", () => {
     const runtime = new CancellationIgnoringRuntime();
     const controller = new AbortController();
     const pending = reviewPullRequest({
-      run, pullRequest: pr, ...context, workspace: process.cwd(), maxReviewSpecialists: 1, signal: controller.signal,
+      run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob, maxReviewSpecialists: 1, signal: controller.signal,
     }, { runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs });
     for (let attempt = 0; attempt < 20 && runtime.started === 0; attempt += 1) {
       await new Promise<void>((resolve) => setTimeout(resolve, 1));
@@ -887,7 +889,7 @@ describe("fresh-context PR review", () => {
     const context = artifacts(run);
     const runtime = new AbortIgnoringLateRuntime();
     const result = await reviewPullRequest({
-      run, pullRequest: pr, ...context, workspace: process.cwd(), maxReviewSpecialists: 1, reviewerAttemptTimeoutMs: 10,
+      run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob, maxReviewSpecialists: 1, reviewerAttemptTimeoutMs: 10,
     }, { runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs });
 
     assert.equal(result.run.state, "merging");
@@ -932,7 +934,7 @@ describe("fresh-context PR review", () => {
     const context = artifacts(run);
     const runtime = new NonResumableDrainFailureRuntime();
     const result = await reviewPullRequest({
-      run, pullRequest: pr, ...context, workspace: process.cwd(), maxReviewSpecialists: 1, reviewerAttemptTimeoutMs: 10,
+      run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob, maxReviewSpecialists: 1, reviewerAttemptTimeoutMs: 10,
     }, { runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs });
 
     assert.equal(result.run.state, "merging");
@@ -975,7 +977,7 @@ describe("fresh-context PR review", () => {
 
     await assert.rejects(
       reviewPullRequest({
-        run, pullRequest: pr, ...context, workspace: process.cwd(), maxReviewSpecialists: 1, reviewerAttemptTimeoutMs: 10,
+        run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob, maxReviewSpecialists: 1, reviewerAttemptTimeoutMs: 10,
       }, { runtime, host, artifacts: new InMemoryArtifactRepository(), runs }),
       /did not settle within the 100ms drain window/,
     );
@@ -1047,7 +1049,7 @@ describe("fresh-context PR review", () => {
 
     await assert.rejects(
       reviewPullRequest({
-        run, pullRequest: pr, ...context, workspace: process.cwd(), maxReviewSpecialists: 1, reviewerAttemptTimeoutMs: 10,
+        run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob, maxReviewSpecialists: 1, reviewerAttemptTimeoutMs: 10,
       }, { runtime, host, artifacts: new InMemoryArtifactRepository(), runs }),
       /scope-adjudication.*did not settle within the 100ms drain window/,
     );
@@ -1084,7 +1086,7 @@ describe("fresh-context PR review", () => {
       return clean;
     };
     const runtime = new FakeAgentRuntime([response, response]);
-    await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+    await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob }, {
       runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
     });
     assert.equal(maxActive, 2);
@@ -1113,7 +1115,7 @@ describe("fresh-context PR review", () => {
       active--;
       return clean;
     };
-    await reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd() }, {
+    await reviewPullRequest({ run, pullRequest: pr, ...context, priorVerdict, workspace: process.cwd(), readExactBlob: sourceBlob }, {
       runtime: new FakeAgentRuntime([response, response]), host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs,
     });
     assert.equal(maxActive, 1);
@@ -1140,7 +1142,7 @@ describe("fresh-context PR review", () => {
       },
       list: backing.list.bind(backing),
     };
-    await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+    await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob }, {
       runtime, host, artifacts: projectedArtifacts, runs,
     });
     const verdictIndex = events.indexOf("artifact:ReviewVerdict");
@@ -1163,11 +1165,12 @@ describe("fresh-context PR review", () => {
       title: "Projection can be resumed",
       evidence: "A durable checkpoint is required",
       location: "src/projection.ts:1",
+      sourceSnapshot: { reviewedHeadSha: sha, path: "src/projection.ts", excerpt: "lock" },
       intentRelevance: "Preserves review authority",
       remediation: "Resume the GitHub projection",
     };
     const backing = new InMemoryArtifactRepository();
-    await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+    await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob }, {
       runtime: new FakeAgentRuntime([{ summary: "Projection finding", findings: [finding] }, clean, acceptAdjudication]),
       host: new FakeHost(), artifacts: backing, runs,
     });
@@ -1225,7 +1228,7 @@ describe("fresh-context PR review", () => {
       remediation: `Fix ${index}`,
     }));
     const host = new FakeHost();
-    await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+    await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob }, {
       runtime: new FakeAgentRuntime([{ summary: "two roots", findings }, clean, acceptAdjudication]),
       host, artifacts: new InMemoryArtifactRepository(), runs,
     });
@@ -1247,7 +1250,7 @@ describe("fresh-context PR review", () => {
       };
       const runtime = new FakeAgentRuntime([{ summary: "Blocking", findings: [finding] }, clean, acceptAdjudication]);
       const host = new FakeHost();
-      const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+      const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob }, {
         runtime, host, artifacts: new InMemoryArtifactRepository(), runs,
       });
       const expectedBlocking = severity === "high";
@@ -1273,7 +1276,7 @@ describe("fresh-context PR review", () => {
       intentRelevance: "Adjacent to the guarded update", remediation: "Define a new takeover protocol",
     };
     const host = new FakeHost();
-    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd() }, {
+    const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob }, {
       runtime: new FakeAgentRuntime([{ summary: "Adjacent concern", findings: [finding] }, clean, followUpAdjudication]),
       host, artifacts: new InMemoryArtifactRepository(), runs,
     });

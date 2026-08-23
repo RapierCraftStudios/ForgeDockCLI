@@ -56,6 +56,9 @@ export async function reviewExistingPullRequest(
   try {
     const result = await reviewPullRequest({
       run, pullRequest, intent, investigation, packet, buildResult, workspace: workspace.path,
+      ...(dependencies.workspaces.readExactBlob ? {
+        readExactBlob: (revision: string, path: string) => dependencies.workspaces.readExactBlob!(workspace, revision, path),
+      } : {}),
       deliveryRunId: buildResult.runId,
       ...(input.provider !== undefined ? { provider: input.provider } : {}),
       ...(input.model !== undefined ? { model: input.model } : {}),
@@ -138,6 +141,9 @@ async function reviewDeploymentPullRequest(
           checks,
         },
         workspace: workspace.path,
+        ...(dependencies.workspaces.readExactBlob ? {
+          readExactBlob: (revision: string, path: string) => dependencies.workspaces.readExactBlob!(workspace, revision, path),
+        } : {}),
         ...(input.input.provider !== undefined ? { provider: input.input.provider } : {}),
         ...(input.input.model !== undefined ? { model: input.input.model } : {}),
         // Deployment diffs are often repository-wide. Pack specialist

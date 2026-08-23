@@ -146,6 +146,13 @@ export interface ReviewFindingInput {
   location?: string;
   intentRelevance: string;
   remediation: string;
+  sourceSnapshot?: {
+    reviewedHeadSha: string;
+    path: string;
+    excerpt?: string;
+    digest?: string;
+    symbol?: string;
+  };
   sourceFindingIds?: readonly string[];
   sourceSessionRefs?: readonly string[];
   reviewerRoles?: readonly string[];

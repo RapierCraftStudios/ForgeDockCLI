@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
-import { applyFindingScopePolicy, shouldMaterializeFinding, type ReviewFinding } from "./scope.js";
+import { applyFindingScopePolicy, shouldMaterializeFinding, verifyFindingSourceAnchors, type ReviewFinding } from "./scope.js";
 
 const runId = "run_scope";
 const subject = { repo: "a/b", issue: 1 };
@@ -34,6 +34,38 @@ function finding(overrides: Partial<ReviewFinding> = {}): ReviewFinding {
 }
 
 describe("review finding scope policy", () => {
+  it("requires an exact reviewed-head source snapshot for blocking code findings", async () => {
+    const reviewedHeadSha = "a".repeat(40);
+    const source = finding({ sourceSnapshot: {
+      reviewedHeadSha, path: "src/a.ts", excerpt: "guardedUpdate",
+    } });
+    const [verified] = await verifyFindingSourceAnchors([source], {
+      reviewedHeadSha,
+      changedPaths: ["src/a.ts"],
+      expectedPaths: packet.payload.expectedPaths,
+      readBlob: async () => ({ content: "function guardedUpdate() {}", mode: "100644" }),
+      verifiedAuthorityReferences: [],
+    });
+    assert.equal(verified?.blocking, true);
+    const [stale] = await verifyFindingSourceAnchors([source], {
+      reviewedHeadSha: "b".repeat(40),
+      changedPaths: ["src/a.ts"],
+      expectedPaths: packet.payload.expectedPaths,
+      readBlob: async () => ({ content: "function guardedUpdate() {}", mode: "100644" }),
+      verifiedAuthorityReferences: [],
+    });
+    assert.equal(stale?.blocking, false);
+    assert.match(stale?.scopeRationale ?? "", /exact reviewed-head source anchor/);
+  });
+
+  it("keeps legacy findings decodable but advisory without current-source proof", async () => {
+    const [legacy] = await verifyFindingSourceAnchors([finding({})], {
+      reviewedHeadSha: "a".repeat(40), changedPaths: ["src/a.ts"], expectedPaths: packet.payload.expectedPaths,
+      readBlob: async () => ({ content: "function guardedUpdate() {}", mode: "100644" }), verifiedAuthorityReferences: [],
+    });
+    assert.equal(legacy?.blocking, false);
+    assert.equal(legacy?.mustFix, false);
+  });
   it("downgrades path and criterion expansion before remediation", () => {
     const [outside, excludedTopic, excludedRuntime, localLease] = applyFindingScopePolicy([
       finding({ location: "deploy/production.yml:2", matchedAcceptanceCriteria: ["Invent a deployment contract"] }),

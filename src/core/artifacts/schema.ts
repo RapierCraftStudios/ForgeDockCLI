@@ -457,6 +457,14 @@ export const FindingSchema = Type.Object({
     ]),
     reference: NonEmptyString,
   })),
+  /** Structured current-source proof bound to the reviewed head; optional for legacy decoding. */
+  sourceSnapshot: Type.Optional(Type.Object({
+    reviewedHeadSha: NonEmptyString,
+    path: NonEmptyString,
+    excerpt: Type.Optional(Type.String({ minLength: 1, maxLength: 4000 })),
+    digest: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$", minLength: 64, maxLength: 64 })),
+    symbol: Type.Optional(NonEmptyString),
+  })),
   sourceFindingIds: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
   sourceSessionRefs: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
   reviewerRoles: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),

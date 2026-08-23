@@ -178,6 +178,27 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     }
   }
 
+  async readExactBlob(workspace: GitWorkspace, revision: string, path: string): Promise<{ content: string; mode: string } | undefined> {
+    assertSha(revision, "exact blob revision");
+    const normalized = path.replaceAll("\\", "/").trim();
+    if (!normalized || normalized.startsWith("/") || normalized.split("/").some((part) => part === ".." || part === ".") || normalized.includes(" ")) {
+      throw new Error(`Unsafe exact blob path: ${path}`);
+    }
+    const spec = `${revision}:${normalized}`;
+    try {
+      const type = (await this.git(["cat-file", "-t", spec], workspace.path)).trim();
+      if (type !== "blob") return undefined;
+      const content = await this.git(["show", spec], workspace.path);
+      const entry = (await this.git(["--literal-pathspecs", "ls-tree", "-z", revision, "--", normalized], workspace.path)).split("\0")[0] ?? "";
+      const mode = /^(\d+)\s+blob\s+[0-9a-f]+\t/.exec(entry)?.[1];
+      if (!mode || mode === "120000") return undefined;
+      return { content, mode };
+    } catch (error) {
+      if (error instanceof Error && /does not exist|invalid object|Not a valid object name|path .* exists on disk, but not in/i.test(error.message)) return undefined;
+      throw error;
+    }
+  }
+
   async assertPristineAtHead(workspace: GitWorkspace, expectedHeadSha: string): Promise<void> {
     assertSha(expectedHeadSha, "expected pristine workspace HEAD");
     const mergeHead = await this.readMergeHead(workspace);

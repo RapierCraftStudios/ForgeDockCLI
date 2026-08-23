@@ -14,6 +14,8 @@ export interface ManagedWorktreeResetLifecycle {
 }
 export interface ReviewWorkspaceManager {
   createReview(input: { runId: string; pr: number; headSha: string }): Promise<GitWorkspace>;
+  /** Read one immutable blob from the exact review revision; reject unsafe paths. */
+  readExactBlob?(workspace: GitWorkspace, revision: string, path: string): Promise<{ content: string; mode: string } | undefined>;
   remove(workspace: GitWorkspace): Promise<void>;
 }
 export interface PullRequestRepairWorkspaceManager extends ReviewWorkspaceManager { changedPaths(workspace: GitWorkspace): Promise<string[]>; commit(workspace: GitWorkspace, message: string): Promise<string>; head(workspace: GitWorkspace): Promise<string>; publishPullRequestRepair(workspace: GitWorkspace, input: { branch: string; expectedRemoteHeadSha: string }): Promise<void>; }
