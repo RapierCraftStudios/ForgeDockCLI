@@ -15,6 +15,15 @@ import {
 import { BuilderSubmissionSchema, criterionCoverageInstructions, deriveBuilderVerificationGate, normalizeBuilderSubmission, type BuilderSubmission } from "./build.js";
 import { WorkflowExecutionError, retryableExternalWorkflowError } from "./investigate.js";
 
+export class RemediationAdmissionError extends Error {
+  readonly code = "remediation-admission" as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "RemediationAdmissionError";
+  }
+}
+
 export async function remediateReview(
   input: {
     run: RunState;
@@ -42,9 +51,12 @@ export async function remediateReview(
   const verificationGate = input.verification?.length && (input.verificationRunner ?? dependencies.verifier)
     ? deriveBuilderVerificationGate(input.packet, input.verification)
     : undefined;
-  const clusters = clusterMustFixFindings(findings);
   let run = input.run;
   try {
+    // Admission is controller-owned and deliberately inside the guarded path:
+    // deterministic scope/packet rejection must block, never enter an agent
+    // retry loop or leave a failed run that ordinary resume will replay.
+    const clusters = clusterMustFixFindings(findings);
     const reviewCycle = input.reviewCycle ?? { current: 1, total: 1 };
     const result = await dependencies.runtime.run<BuilderSubmission>({
       id: `${run.runId}:remediate:${input.verdict.payload.headSha}:${run.attempt}`,
@@ -107,6 +119,11 @@ export async function remediateReview(
     return { run: advanced.state, submission: normalizeBuilderSubmission(input.packet, result.output), sessionRef: result.sessionRef };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
+    if (error instanceof RemediationAdmissionError) {
+      const blocked = transition(run, "BLOCK", { reason });
+      await dependencies.runs.commit(run.version, blocked.state, blocked.record);
+      throw new WorkflowExecutionError(reason, blocked.state, { cause: error, recoverable: false });
+    }
     const externalRetry = retryableExternalWorkflowError(error, run);
     if (externalRetry) throw externalRetry;
     if (isRecoverableAgentExecutionError(error)) {
@@ -146,10 +163,9 @@ export function clusterMustFixFindings(
   for (const [family, members] of byFamily) {
     for (let offset = 0; offset < members.length; offset += 3) {
       const chunk = members.slice(offset, offset + 3);
-      const productionPaths = [...new Set(chunk.flatMap((finding) => finding.location ? [findingPath(finding.location)] : [])
-        .filter((path): path is string => Boolean(path) && !isTestPath(path!)))].sort();
+      const productionPaths = productionPathsFor(chunk);
       if (productionPaths.length > 4) {
-        throw new Error(`MustFix cluster ${family} spans ${productionPaths.length} production paths; maximum is 4 and no root may be ignored`);
+        throw new RemediationAdmissionError(`MustFix cluster ${family} spans ${productionPaths.length} production paths; maximum is 4 and no root may be ignored`);
       }
       clusters.push({
         id: `mustfix-cluster-${clusters.length + 1}`,
@@ -160,13 +176,57 @@ export function clusterMustFixFindings(
       });
     }
   }
-  if (clusters.length > 2) {
-    throw new Error(`Review produced ${clusters.length} mustFix clusters; maximum is 2 and the controller refuses to hide known criterion violations`);
+
+  // A normalized family intentionally remains strict, but a family can be
+  // split by the legacy three-root packet bound. Contract those shards in
+  // stable order when they share the frozen criterion and the existing root
+  // component/invariant safety boundary. Never merge on path overlap alone.
+  const contracted: MustFixCluster[] = [];
+  for (const cluster of clusters) {
+    const target = contracted.find((candidate) => compatibleCluster(candidate, cluster));
+    if (!target) {
+      contracted.push({ ...cluster, id: `mustfix-cluster-${contracted.length + 1}` });
+      continue;
+    }
+    target.rootIds.push(...cluster.rootIds);
+    target.findings.push(...cluster.findings);
+    target.productionPaths = [...new Set([...target.productionPaths, ...cluster.productionPaths])].sort();
   }
-  return clusters;
+  if (contracted.length > 2) {
+    throw new RemediationAdmissionError(`Review produced ${contracted.length} mustFix clusters; maximum is 2 and the controller refuses to hide known criterion violations`);
+  }
+  return contracted;
 }
 
-function findingPath(location: string): string | undefined {
-  return /(?:^|[\s`(])([A-Za-z0-9_.@+-]+(?:\/[A-Za-z0-9_.@+-]+)+|[A-Za-z0-9_.@+-]+\.[A-Za-z0-9_.@+-]+)(?=[:#\s`),]|$)/.exec(location.replaceAll("\\", "/"))?.[1];
+function productionPathsFor(findings: readonly MustFixCluster["findings"][number][]): string[] {
+  return [...new Set(findings.flatMap((finding) => finding.location ? findingPaths(finding.location) : [])
+    .filter((path): path is string => Boolean(path) && !isTestPath(path!)))].sort();
 }
+
+function findingPaths(location: string): string[] {
+  return [...location.replaceAll("\\", "/").matchAll(/(?:^|[\s`(])([A-Za-z0-9_.@+-]+(?:\/[A-Za-z0-9_.@+-]+)+|[A-Za-z0-9_.@+-]+\.[A-Za-z0-9_.@+-]+)(?=[:#\s`),]|$)/g)]
+    .map((match) => match[1])
+    .filter((path): path is string => Boolean(path));
+}
+
+function compatibleCluster(left: MustFixCluster, right: MustFixCluster): boolean {
+  if (criterionFamily(left.family) !== criterionFamily(right.family)) return false;
+  if (rootSafety(left.findings) !== rootSafety(right.findings)) return false;
+  const union = new Set([...left.productionPaths, ...right.productionPaths]);
+  return union.size <= 4;
+}
+
+function criterionFamily(family: string): string { return family.split("::", 1)[0] ?? family; }
+
+/** Component and invariant are durable root-ledger boundaries. */
+function rootSafety(findings: readonly MustFixCluster["findings"][number][]): string {
+  const signatures = findings.map((finding) => {
+    const structural = finding.normalizedRoot?.split("\\n") ?? [];
+    const component = structural[1] ?? finding.location?.split(":", 1)[0] ?? "unanchored";
+    const invariant = structural[3] ?? finding.impact?.affectedInvariant ?? "unspecified";
+    return `${component.toLowerCase()}::${invariant.toLowerCase()}`;
+  });
+  return [...new Set(signatures)].sort().join("|");
+}
+
 function isTestPath(path: string): boolean { return /(?:^|\/)(?:test|tests|__tests__)(?:\/|$)|\.(?:test|spec)\.[^.]+$/i.test(path); }

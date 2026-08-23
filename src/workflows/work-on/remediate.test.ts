@@ -57,11 +57,38 @@ describe("mustFix remediation", () => {
     assert.equal(result.submission.criterionCoverage[0]?.criterion, "Guard remains correct");
   });
 
-  it("bounds clusters without silently dropping roots", () => {
-    const roots = Array.from({ length: 7 }, (_, index) => ({
-      id: `f-${index}`, rootId: `root-${index}`, normalizedRoot: `criterion-${index + 1}\nsrc/${index}.ts\nsymbol-${index}\ninvariant-${index}\nfailure-${index}\ntrigger-${index}`,
-      severity: "high" as const, confidence: "high" as const, blocking: true, mustFix: true, title: `Root ${index}`, evidence: "evidence", location: `src/${index}.ts:1`, intentRelevance: "criterion", remediation: "fix", scopeDisposition: "in_scope" as const,
+  it("contracts compatible criterion shards into two packets without dropping roots", () => {
+    const roots = Array.from({ length: 6 }, (_, index) => ({
+      id: `f-${index}`, rootId: `root-${index}`,
+      normalizedRoot: `criterion-1\nsrc/controller.ts\ncomponent\ninvariant\nfailure-${index}\ntrigger-${index}`,
+      severity: "high" as const, confidence: "high" as const, blocking: true, mustFix: true,
+      title: `Root ${index}`, evidence: "evidence", location: `src/${index < 3 ? "controller" : "view"}.ts:1`,
+      intentRelevance: "criterion", remediation: "fix", scopeDisposition: "in_scope" as const,
+    }));
+    const clusters = clusterMustFixFindings(roots);
+    assert.equal(clusters.length, 2);
+    assert.deepEqual(clusters.flatMap((cluster) => cluster.rootIds), roots.map((root) => root.rootId));
+  });
+
+  it("does not contract unrelated criteria or components", () => {
+    const roots = Array.from({ length: 3 }, (_, index) => ({
+      id: `f-${index}`, rootId: `root-${index}`,
+      normalizedRoot: `criterion-${index + 1}\nsrc/${index}.ts\ncomponent\ninvariant\nfailure\ntrigger`,
+      severity: "high" as const, confidence: "high" as const, blocking: true, mustFix: true,
+      title: `Root ${index}`, evidence: "evidence", location: `src/${index}.ts:1`,
+      intentRelevance: "criterion", remediation: "fix", scopeDisposition: "in_scope" as const,
     }));
     assert.throws(() => clusterMustFixFindings(roots), /maximum is 2.*refuses to hide/i);
   });
+
+  it("blocks a cluster whose production path union exceeds four", () => {
+    const roots = Array.from({ length: 3 }, (_, index) => ({
+      id: `f-${index}`, rootId: `root-${index}`, normalizedRoot: `criterion-1\nsrc/component.ts\ncomponent\ninvariant\nfailure\ntrigger`,
+      severity: "high" as const, confidence: "high" as const, blocking: true, mustFix: true,
+      title: `Root ${index}`, evidence: "evidence", location: `src/a${index}.ts:1 src/b${index}.ts:1`,
+      intentRelevance: "criterion", remediation: "fix", scopeDisposition: "in_scope" as const,
+    }));
+    assert.throws(() => clusterMustFixFindings(roots), /spans .* production paths; maximum is 4/i);
+  });
+
 });

@@ -784,6 +784,29 @@ describe("subject run admission", () => {
     }
   });
 
+  it("salvages remediation after a failed Outcome with a prior request-changes verdict", () => {
+    const runId = "run_failed_remediation_salvage";
+    const delivery = publicationArtifacts(runId).map((artifact, index) => ({
+      ...artifact, createdAt: `2026-01-01T00:0${index + 1}:00.000Z`,
+    }));
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+      payload: { headSha: "d".repeat(40), disposition: "request_changes", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    }, { createdAt: "2026-01-01T00:04:00.000Z" });
+    const failed = outcome(runId, "2026-01-01T00:05:00.000Z", "failed");
+
+    const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict, failed]);
+
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") {
+      assert.equal(decision.runId, runId);
+      assert.equal(decision.state, "remediating");
+      assert.equal(decision.checkpoint, "remediation");
+      assert.equal(decision.artifacts.at(-1)?.id, failed.id);
+      assert.equal(decision.artifacts.at(-2)?.id, verdict.id);
+    }
+  });
+
   it("does not reuse stale verification evidence after a newer review block", () => {
     const runId = "run_review_blocked";
     const staleVerification = createArtifact({
