@@ -8,6 +8,31 @@ export interface GitWorkspace {
   baseSha?: string;
 }
 
+/** Exact identity of a controller-owned, detached investigation checkout. */
+export interface InvestigationSnapshotIdentity {
+  schema: "forgedock.investigation-snapshot/v1";
+  repository: string;
+  /** Canonical repository root, used to prevent symlink/cache aliasing. */
+  repositoryRoot: string;
+  targetBranch: string;
+  baseSha: string;
+  snapshotId: string;
+  snapshotPath: string;
+}
+
+export interface InvestigationSnapshot {
+  identity: InvestigationSnapshotIdentity;
+  path: string;
+}
+
+/** Read-only workspaces are separate from mutable delivery workspaces. */
+export interface InvestigationSnapshotManager {
+  acquire(input: { repository: string; repositoryRoot: string; targetBranch: string; baseSha: string; signal?: AbortSignal }): Promise<InvestigationSnapshot>;
+  validate(snapshot: InvestigationSnapshot): Promise<void>;
+  /** Remove only a snapshot previously admitted by this manager. */
+  release(snapshot: InvestigationSnapshot): Promise<void>;
+}
+
 export interface ManagedWorktreeResetLifecycle {
   /** Re-read exact path/branch/HEAD identity, then force-remove only that managed worktree. */
   removeExactManaged(input: { path: string; branch: string; headSha: string }): Promise<void>;

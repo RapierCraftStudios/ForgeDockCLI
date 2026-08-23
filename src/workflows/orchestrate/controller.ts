@@ -13,6 +13,7 @@ import {
   orchestrationRecordIssueIdentities,
   MAX_ORCHESTRATION_PARALLEL,
 } from "../../core/ports/orchestration.js";
+import type { InvestigationSnapshotIdentity } from "../../core/ports/git-workspace.js";
 import type {
   DurableOrchestrationNodeStatus,
   OrchestrationExecutionAdmission,
@@ -79,6 +80,8 @@ export interface OrchestrationInvestigationResult {
   evidence?: OrchestrationPlanMetadata;
   /** Exact base observed by the read-only worker. */
   baseSha?: string;
+  /** Detached workspace identity used for all read-only work. */
+  snapshot?: InvestigationSnapshotIdentity;
   /** Decomposition is interpreted only after the complete wave barrier. */
   childIssues?: readonly number[];
 }
@@ -100,6 +103,7 @@ export interface OrchestrationPacketResult {
   expectedPaths: readonly string[];
   semanticDependencies: readonly string[];
   baseSha: string;
+  snapshot?: InvestigationSnapshotIdentity;
 }
 
 export interface OrchestrationPacketWorkerContext extends OrchestrationWorkerContext {
@@ -794,6 +798,7 @@ export class OrchestrationController {
         this.updateInvestigation(state, item.id, (entry) => ({
           ...entry, status: "completed", outcome: result.outcome,
           ...(result.baseSha !== undefined ? { baseSha: result.baseSha } : {}),
+          ...(result.snapshot !== undefined ? { snapshot: structuredClone(result.snapshot) } : {}),
           ...(result.evidence?.runId !== undefined ? { runId: String(result.evidence.runId) } : {}),
           ...(result.evidence?.investigationId !== undefined ? { investigationArtifactId: String(result.evidence.investigationId) } : {}),
           ...(result.evidence !== undefined ? { evidence: structuredClone(result.evidence) } : {}),
@@ -901,11 +906,12 @@ export class OrchestrationController {
         return {
           id: item.id, issue: item.issue, expectedPaths: packet.expectedPaths, baseRef: packet.baseSha,
           semanticDependencies,
+          ...(packet.identity !== undefined ? { identity: packet.identity } : {}),
           ...(item.memberIssues !== undefined ? { childIssues: item.memberIssues } : {}),
         };
       });
       const baseRef = packetInputs[0]?.baseRef;
-      if (!baseRef || packetInputs.some((packet) => packet.baseRef !== baseRef)) throw new Error("Packet barrier exact-base mismatch");
+      if (!baseRef) throw new Error("Packet barrier has no exact base");
       const compiled = compileExecutionDag({ items: nextItems, packets: packetInputs, baseRef });
       nextItems = compiled.items;
       nextEdges = compiled.edges;
@@ -1094,6 +1100,13 @@ export class OrchestrationController {
           const paths = normalizePacketPaths(result.expectedPaths);
           if (!paths.length) throw new Error(`Packet ${item.id} has no bounded expected paths`);
           if (!result.baseSha.trim()) throw new Error(`Packet ${item.id} has no exact base SHA`);
+          if (investigation.baseSha !== undefined && result.baseSha.toLowerCase() !== investigation.baseSha.toLowerCase()) {
+            throw new Error(`Packet ${item.id} base drifted from investigation route ${investigation.targetBranch ?? "unknown"}: expected ${investigation.baseSha}, observed ${result.baseSha}`);
+          }
+          const resultSnapshot = result.snapshot ?? result.identity?.snapshot ?? investigation.snapshot;
+          if (investigation.snapshot !== undefined && !sameSnapshotIdentity(resultSnapshot, investigation.snapshot)) {
+            throw new Error(`Packet ${item.id} snapshot identity drifted from investigation route ${investigation.targetBranch ?? "unknown"} base ${investigation.baseSha ?? "unknown"}`);
+          }
           if (result.semanticDependencies === undefined || !Array.isArray(result.semanticDependencies)) {
             throw new Error(`Packet ${item.id} lacks authoritative semantic dependency evidence`);
           }
@@ -1103,7 +1116,7 @@ export class OrchestrationController {
           }
           const packetId = result.packetId ?? result.identity?.packetId;
           const expectedIdentity = packetId && investigation.runId && investigation.investigationArtifactId
-            ? packetIdentityFor(item, investigation, packetId, result.baseSha)
+            ? packetIdentityFor(item, investigation, packetId, result.baseSha, resultSnapshot)
             : undefined;
           const identity = result.identity === undefined
             ? expectedIdentity
@@ -1113,6 +1126,7 @@ export class OrchestrationController {
             ...(packetId !== undefined ? { packetId } : {}),
             ...(identity !== undefined ? { identity } : {}),
             expectedPaths: paths, semanticDependencies, baseSha: result.baseSha,
+            ...(resultSnapshot !== undefined ? { snapshot: structuredClone(resultSnapshot) } : {}),
             completedAt: this.now(),
           };
           byNode.set(item.id, completed);
@@ -2671,6 +2685,7 @@ function packetIdentityFor(
   investigation: OrchestrationInvestigationRecord,
   packetId: string,
   baseSha: string,
+  snapshot?: InvestigationSnapshotIdentity,
 ): OrchestrationPacketIdentity {
   if (!investigation.runId?.trim() || !investigation.investigationArtifactId?.trim()) {
     throw new Error(`Packet ${item.id} lacks exact investigation identity`);
@@ -2682,6 +2697,8 @@ function packetIdentityFor(
     investigationId: investigation.investigationArtifactId,
     subject: { repo: item.repository ?? "", issue: item.issue },
     baseSha,
+    targetBranch: investigation.targetBranch,
+    ...(snapshot !== undefined ? { snapshot } : investigation.snapshot !== undefined ? { snapshot: investigation.snapshot } : {}),
   };
 }
 
@@ -2701,10 +2718,26 @@ function assertPacketIdentity(
     || actual.investigationId !== expected.investigationId
     || actual.subject.issue !== expected.subject.issue
     || actual.subject.repo.trim().toLowerCase() !== expected.subject.repo.trim().toLowerCase()
-    || actual.baseSha !== expected.baseSha)) {
+    || actual.baseSha !== expected.baseSha
+    || actual.targetBranch !== expected.targetBranch
+    || !sameSnapshotIdentity(actual.snapshot, expected.snapshot))) {
     throw new Error(`Packet ${itemId} packet identity drifted from investigation checkpoint`);
   }
   return structuredClone(actual);
+}
+
+function sameSnapshotIdentity(
+  left: InvestigationSnapshotIdentity | undefined,
+  right: InvestigationSnapshotIdentity | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return left.schema === right.schema
+    && left.repository === right.repository
+    && left.repositoryRoot === right.repositoryRoot
+    && left.targetBranch === right.targetBranch
+    && left.baseSha === right.baseSha
+    && left.snapshotId === right.snapshotId
+    && left.snapshotPath === right.snapshotPath;
 }
 
 function assertReusablePacketRecord(
@@ -2718,7 +2751,7 @@ function assertReusablePacketRecord(
   }
   normalizePacketPaths(packet.expectedPaths);
   normalizeSemanticDependencies(packet.semanticDependencies ?? (() => { throw new Error(`Packet ${item.id} lacks authoritative semantic dependency evidence`); })());
-  const expected = packetIdentityFor(item, investigation, packet.packetId, packet.baseSha);
+  const expected = packetIdentityFor(item, investigation, packet.packetId, packet.baseSha, packet.snapshot ?? investigation.snapshot);
   assertPacketIdentity(packet.identity!, expected, item.id);
   if (packet.identity?.baseSha !== packet.baseSha) throw new Error(`Packet ${item.id} packet base identity drifted`);
 }

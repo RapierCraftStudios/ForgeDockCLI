@@ -20,7 +20,7 @@ import {
   workOnDeliveryArtifacts,
 } from "../core/state/admission.js";
 import { reconcileLatestRunArtifacts } from "../core/state/reconcile.js";
-import { GitWorktreeManager } from "../adapters/git/git-worktree.js";
+import { GitInvestigationSnapshotManager, GitWorktreeManager } from "../adapters/git/git-worktree.js";
 import { GitHubArtifactRepository, GitHubClient } from "../adapters/github/github-client.js";
 import { resolveCheckoutContext } from "../adapters/git/repository-context.js";
 import { ProcessVerificationRunner } from "../adapters/process/process-verifier.js";
@@ -2308,9 +2308,12 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
     const outcomes = new Map<string, string>();
     const skipped = new Map<string, string>();
     const owner = `pid-${process.pid}-${crypto.randomUUID()}`;
+    const investigationSnapshotManager = new GitInvestigationSnapshotManager(checkoutRoot);
     const sharedInvestigationWorkers = createInvestigationFirstWorkers({
       repository: repository.repo,
       checkoutRoot,
+      snapshotManager: investigationSnapshotManager,
+      resolveRepositoryRoot: (repositoryName) => resolveCheckoutContext(launchCwd, repositoryName, { allowAmbiguous: true, allowUnresolvedTarget: true }).checkoutRoot,
       runtime,
       artifacts,
       runs,
@@ -2321,7 +2324,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
       ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
       getBranchHead: async (repo, branch) => await github.getBranchHead(repo, branch),
       resolveRoute: async (item) => {
-        const routed = requiredOrchestrationRoute(routedIssues, { repository: repository.repo, issue: item.issue });
+        const routed = requiredOrchestrationRoute(routedIssues, { repository: item.repository ?? repository.repo, issue: item.issue });
         return { issue: { title: routed.issue.title, body: routed.issue.body, url: routed.issue.url }, targetBranch: routed.lane.targetBranch, lane: routed.lane.kind, ...(routed.lane.kind === "feature" && routed.lane.promotionTarget !== undefined ? { promotionTarget: routed.lane.promotionTarget } : {}), ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}) };
       },
       sourceItems: (durable, initial) => durable.investigationWave === 1 ? initial : durable.nodes.map((node) => ({ id: node.id, issue: node.issue, priority: node.priority, dependencies: [...node.dependencies], claims: [...node.claims], ...(node.repository !== undefined ? { repository: node.repository } : {}), ...(node.targetBranch !== undefined ? { targetBranch: node.targetBranch } : {}), ...(node.targetRouteClaim !== undefined ? { targetRouteClaim: node.targetRouteClaim } : {}), ...(node.lane !== undefined ? { lane: node.lane } : {}), ...(node.promotionTarget !== undefined ? { promotionTarget: node.promotionTarget } : {}), ...(node.productionTarget !== undefined ? { productionTarget: node.productionTarget } : {}), ...(node.affectedFiles !== undefined ? { affectedFiles: [...node.affectedFiles] } : {}), ...(node.memberIssues !== undefined ? { memberIssues: [...node.memberIssues] } : {}), ...(node.title !== undefined ? { title: node.title } : {}), ...(node.summary !== undefined ? { summary: node.summary } : {}), ...(node.plan !== undefined ? { plan: structuredClone(node.plan) } : {}) })),
@@ -2430,7 +2433,8 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
         if (run.state !== "investigating") return;
         const lane = requiredOrchestrationRoute(routedIssues, { repository: repository.repo, issue: investigation.issue }).lane;
         const settled = await resumeInvestigationWorkItem({
-          run, intent, investigation: investigationArtifact, cwd: checkoutRoot,
+          run, intent, investigation: investigationArtifact,
+          cwd: investigation.snapshot?.snapshotPath ?? (() => { throw new Error(`Investigation ${investigation.issue} has no admitted snapshot for settlement`); })(),
           ...(settleSignal !== undefined ? { signal: settleSignal } : {}),
           target: runTargetForLane(lane, effective.productionTarget),
           scopeHints: { affectedFiles: [], claims: [], metadataRoots: STANDARD_SCOPE_METADATA_ROOTS },
