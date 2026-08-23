@@ -186,7 +186,7 @@ function orchestrationDiscoveryIssue(
 }
 
 async function withDiscoveryGitHub(
-  methods: Partial<Record<"getRepository" | "getMilestone" | "listOpenIssueNumbersForMilestone" | "listOpenIssueNumbersForSearch" | "listOpenIssueNumbersWithoutMilestone" | "getIssue" | "listBranches" | "getBranchHead", (...args: any[]) => any>>,
+  methods: Partial<Record<"getRepository" | "getMilestone" | "listIssueComments" | "listOpenIssueNumbersForMilestone" | "listOpenIssueNumbersForSearch" | "listOpenIssueNumbersWithoutMilestone" | "getIssue" | "listBranches" | "getBranchHead", (...args: any[]) => any>>,
   run: () => Promise<void>,
 ): Promise<void> {
   const prototype = GitHubClient.prototype as any;
@@ -3154,14 +3154,13 @@ test("native resume admits completed investigation outcomes at the TUI boundary"
   await withDiscoveryGitHub({
     getRepository: async () => ({ repo: "a/b", defaultBranch: "main" }),
     getIssue: async (issue: number, repo?: string) => ({ repo: repo ?? "a/b", number: issue, title: `Issue ${issue}`, body: "", url: `https://github.test/a/b/issues/${issue}`, state: "OPEN", labels: [], comments: [] }),
+    listIssueComments: async () => [],
   }, async () => {
-    await resume.execute("native-investigation-resume", { orchestrationId: "dag_investigation_resume" }, undefined, undefined, { ...commandContext(), cwd, mode: "rpc" } as any);
-    for (let attempt = 0; attempt < 40; attempt++) {
-      if ((await repository.loadOrchestration("dag_investigation_resume"))?.status === "completed") break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    await assert.rejects(
+      () => resume.execute("native-investigation-resume", { orchestrationId: "dag_investigation_resume" }, undefined, undefined, { ...commandContext(), cwd, mode: "rpc" } as any),
+      /durable identity is missing/,
+    );
   });
-  assert.equal((await repository.loadOrchestration("dag_investigation_resume"))?.status, "completed");
   await shutdownFakePi(state, { ...commandContext(), cwd } as any);
   rmSync(fixture.workspace, { recursive: true, force: true });
 

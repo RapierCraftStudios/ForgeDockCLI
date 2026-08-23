@@ -2241,7 +2241,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
         const expansion = await materializeCliDecomposition({ github, artifacts, repository: repository.repo, defaultBranch: repository.defaultBranch, effective, orchestration: durable, node: parent, item, childIssues, routedIssues, ...(materializeSignal !== undefined ? { signal: materializeSignal } : {}), ...(assertActive !== undefined ? { assertActive } : {}) });
         return expansion ? { items: expansion.items } : undefined;
       },
-      childIssuesFor: async (entry) => decompositionChildIssuesFromArtifacts(entry.issue, await artifacts.list({ repo: repository.repo, issue: entry.issue }), undefined),
+      childIssuesFor: async (entry) => decompositionChildIssuesFromArtifacts(entry.issue, await artifacts.list({ repo: scheduleItems.items.find((item) => item.id === entry.nodeId)?.repository ?? repository.repo, issue: entry.issue }), entry.runId),
     }, scheduleItems.items);
     let phase2BatchMaterialized = false;
     const phase2MaterializeExecution: NonNullable<OrchestrationControllerDependencies["materializeExecution"]> = async (input) => {
@@ -2314,12 +2314,9 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
         const durable = await artifacts.list(subject);
         const currentRunId = investigation.runId;
         const currentInvestigationId = investigation.investigationArtifactId;
+        if (!currentRunId || !currentInvestigationId) throw new Error(`Cannot settle invalid #${investigation.issue}: durable investigation identity is missing`);
         const scoped = durable.filter((artifact) => artifact.runId === currentRunId
-          && (artifact.kind !== "Investigation" || currentInvestigationId === undefined || artifact.id === currentInvestigationId));
-        const existingSettlement = scoped.find((artifact): artifact is DurableArtifact<"Outcome"> => artifact.kind === "Outcome"
-          && artifact.runId === currentRunId
-          && (artifact.payload.status === "invalid" || artifact.payload.status === "decomposed"));
-        if (existingSettlement) return;
+          && (artifact.kind !== "Investigation" || artifact.id === currentInvestigationId));
         assertActive?.();
         if (settleSignal?.aborted) throw settleSignal.reason ?? new Error("Investigation settlement cancelled");
         const intent = scoped.find((artifact): artifact is DurableArtifact<"Intent"> => artifact.kind === "Intent" && artifact.runId === currentRunId);
@@ -2327,6 +2324,16 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
         if (!intent || investigationArtifact?.kind !== "Investigation") throw new Error(`Cannot settle invalid #${investigation.issue}: durable investigation identity is missing`);
         const run = await runs.load(intent.runId);
         if (!run) throw new Error(`Cannot settle invalid #${investigation.issue}: durable run is missing`);
+        const existingSettlement = scoped.find((artifact): artifact is DurableArtifact<"Outcome"> => artifact.kind === "Outcome"
+          && artifact.runId === currentRunId
+          && (artifact.payload.status === "invalid" || artifact.payload.status === "decomposed"));
+        if (existingSettlement && (existingSettlement.subject.repo.toLowerCase() !== subject.repo.toLowerCase() || existingSettlement.subject.issue !== subject.issue)) {
+          throw new Error(`Cannot settle invalid #${investigation.issue}: durable Outcome identity mismatched`);
+        }
+        if (run.state === "invalid" && existingSettlement?.payload.status === "invalid") {
+          await completeInvalidWorkItem({ run, investigation: investigationArtifact, outcome: existingSettlement }, { host: github, artifacts, ...(settleSignal !== undefined ? { signal: settleSignal } : {}), ...(assertActive !== undefined ? { assertActive } : {}) });
+          return;
+        }
         if (run.state !== "investigating") return;
         const lane = requiredOrchestrationRoute(routedIssues, { repository: repository.repo, issue: investigation.issue }).lane;
         const settled = await resumeInvestigationWorkItem({

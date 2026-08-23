@@ -3102,24 +3102,32 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
           if (result.outcome !== "invalid" && result.outcome !== "decompose") return;
           assertActive?.();
           if (settleSignal?.aborted) throw settleSignal.reason ?? new Error("Investigation settlement cancelled");
-          const durableArtifacts = await artifacts.list({ repo: readyRepository.repo, issue: investigation.issue });
+          const investigationRepository = schedule.items.find((item) => item.id === investigation.nodeId)?.repository ?? readyRepository.repo;
+          const durableArtifacts = await artifacts.list({ repo: investigationRepository, issue: investigation.issue });
           const currentRunId = investigation.runId;
           const currentInvestigationId = investigation.investigationArtifactId;
+          if (!currentRunId || !currentInvestigationId) throw new Error(`Cannot settle investigation #${investigation.issue}: durable identity is missing`);
           const scopedArtifacts = durableArtifacts.filter((artifact) => artifact.runId === currentRunId
-            && (artifact.kind !== "Investigation" || currentInvestigationId === undefined || artifact.id === currentInvestigationId));
-          if (scopedArtifacts.some((artifact) => artifact.kind === "Outcome"
-            && artifact.runId === currentRunId
-            && (artifact.payload.status === "invalid" || artifact.payload.status === "decomposed"))) return;
+            && (artifact.kind !== "Investigation" || artifact.id === currentInvestigationId));
           assertActive?.();
           const intent = scopedArtifacts.find((artifact): artifact is DurableArtifact<"Intent"> => artifact.kind === "Intent" && artifact.runId === currentRunId);
           const investigationArtifact = scopedArtifacts.find((artifact): artifact is DurableArtifact<"Investigation"> => artifact.kind === "Investigation" && artifact.id === currentInvestigationId);
           if (!intent || !investigationArtifact) throw new Error(`Cannot settle investigation #${investigation.issue}: durable identity is missing`);
           const run = await investigationRuns.load(intent.runId);
           if (!run) throw new Error(`Cannot settle investigation #${investigation.issue}: durable run is missing`);
+          const existingOutcome = latestRunOutcome(scopedArtifacts, currentRunId);
+          if (existingOutcome && (existingOutcome.subject.repo.toLowerCase() !== investigationRepository.toLowerCase() || existingOutcome.subject.issue !== investigation.issue)) {
+            throw new Error(`Cannot settle investigation #${investigation.issue}: durable Outcome identity mismatched`);
+          }
+          if (run.state === "invalid" && existingOutcome?.payload.status === "invalid") {
+            await completeInvalidWorkItem({ run, investigation: investigationArtifact, outcome: existingOutcome }, { host: readyGithub, artifacts, ...(settleSignal !== undefined ? { signal: settleSignal } : {}), ...(assertActive !== undefined ? { assertActive } : {}) });
+            return;
+          }
           if (run.state !== "investigating") return;
-          const settledIssue = await readyGithub.getIssue(investigation.issue, readyRepository.repo);
+          const settledIssue = await readyGithub.getIssue(investigation.issue, investigationRepository);
           assertActive?.();
-          const settledLane = await resolveIssueLane(settledIssue, readyRepository.defaultBranch, readyGithub, effective.fastLaneTarget, effective.featurePromotionTarget, effective.productionTarget);
+          const settledRepository = await readyGithub.getRepository(investigationRepository);
+          const settledLane = await resolveIssueLane(settledIssue, settledRepository.defaultBranch, readyGithub, effective.fastLaneTarget, effective.featurePromotionTarget, effective.productionTarget);
           const settled = await resumeInvestigationWorkItem({ run, intent, investigation: investigationArtifact, cwd: ctx.cwd, ...(settleSignal !== undefined ? { signal: settleSignal } : {}), target: { lane: settledLane.kind, targetBranch: settledLane.targetBranch, ...(settledLane.kind === "feature" && settledLane.promotionTarget !== undefined ? { promotionTarget: settledLane.promotionTarget } : {}), ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}) }, scopeHints: { affectedFiles: [], claims: [], metadataRoots: STANDARD_SCOPE_METADATA_ROOTS } }, { runtime: investigationRuntime, artifacts, runs: investigationRuns, decomposer: readyGithub, ...(settleSignal !== undefined ? { signal: settleSignal } : {}), ...(assertActive !== undefined ? { assertActive } : {}) });
           assertActive?.();
           if (settled.outcome?.payload.status === "invalid") await completeInvalidWorkItem({ run: settled.run, investigation: settled.investigation, outcome: settled.outcome }, { host: readyGithub, artifacts, ...(settleSignal !== undefined ? { signal: settleSignal } : {}), ...(assertActive !== undefined ? { assertActive } : {}) });
@@ -4034,8 +4042,50 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord,
       const expansion = await materializeVisibleDecomposition({ github, artifacts, repository: item.repository ?? record.repository, effective, orchestration: durable, node, item: item as VisibleOrchestrationItem, childIssues });
       return expansion ? { items: expansion.items } : undefined;
     },
-    childIssuesFor: async (entry) => decompositionChildIssuesFromArtifacts(entry.issue, await artifacts.list({ repo: record.repository, issue: entry.issue }), entry.runId),
+    childIssuesFor: async (entry) => decompositionChildIssuesFromArtifacts(entry.issue, await artifacts.list({ repo: record.nodes.find((node) => node.id === entry.nodeId)?.repository ?? record.repository, issue: entry.issue }), entry.runId),
   }, items) : undefined;
+  const resumedSettleInvestigation: NonNullable<VisibleDagInput["settleInvestigation"]> | undefined = resumedStore && resumedInvestigationRuntime
+    ? async ({ investigation, result, signal: settleSignal, assertActive }) => {
+        if (result.outcome !== "invalid" && result.outcome !== "decompose") return;
+        assertActive?.();
+        if (settleSignal?.aborted) throw settleSignal.reason ?? new Error("Investigation settlement cancelled");
+        const investigationRepository = record.nodes.find((node) => node.id === investigation.nodeId)?.repository ?? record.repository;
+        const durableArtifacts = await artifacts.list({ repo: investigationRepository, issue: investigation.issue });
+        const currentRunId = investigation.runId;
+        const currentInvestigationId = investigation.investigationArtifactId;
+        if (!currentRunId || !currentInvestigationId) throw new Error(`Cannot settle investigation #${investigation.issue}: durable identity is missing`);
+        const scopedArtifacts = durableArtifacts.filter((artifact) => artifact.runId === currentRunId
+          && (artifact.kind !== "Investigation" || artifact.id === currentInvestigationId));
+        const intent = scopedArtifacts.find((artifact): artifact is DurableArtifact<"Intent"> => artifact.kind === "Intent" && artifact.runId === currentRunId);
+        const investigationArtifact = scopedArtifacts.find((artifact): artifact is DurableArtifact<"Investigation"> => artifact.kind === "Investigation" && artifact.id === currentInvestigationId);
+        if (!intent || !investigationArtifact) throw new Error(`Cannot settle investigation #${investigation.issue}: durable identity is missing`);
+        assertActive?.();
+        const run = await resumedStore.load(intent.runId);
+        if (!run) throw new Error(`Cannot settle investigation #${investigation.issue}: durable run is missing`);
+        if (run.runId !== currentRunId) throw new Error(`Cannot settle investigation #${investigation.issue}: durable run identity mismatched`);
+        const existingOutcome = latestRunOutcome(scopedArtifacts, currentRunId);
+        if (existingOutcome && (existingOutcome.subject.repo.toLowerCase() !== investigationRepository.toLowerCase() || existingOutcome.subject.issue !== investigation.issue)) {
+          throw new Error(`Cannot settle investigation #${investigation.issue}: durable Outcome identity mismatched`);
+        }
+        if (run.state === "invalid" && existingOutcome?.payload.status === "invalid") {
+          await completeInvalidWorkItem({ run, investigation: investigationArtifact, outcome: existingOutcome }, { host: github, artifacts, ...(settleSignal !== undefined ? { signal: settleSignal } : {}), ...(assertActive !== undefined ? { assertActive } : {}) });
+          return;
+        }
+        if (run.state !== "investigating") return;
+        const settledIssue = await github.getIssue(investigation.issue, investigationRepository);
+        assertActive?.();
+        const settledRepository = await github.getRepository(investigationRepository);
+        const settledLane = await resolveIssueLane(settledIssue, settledRepository.defaultBranch, github, effective.fastLaneTarget, effective.featurePromotionTarget, effective.productionTarget);
+        const settled = await resumeInvestigationWorkItem({
+          run, intent, investigation: investigationArtifact, cwd,
+          ...(settleSignal !== undefined ? { signal: settleSignal } : {}),
+          target: { lane: settledLane.kind, targetBranch: settledLane.targetBranch, ...(settledLane.kind === "feature" && settledLane.promotionTarget !== undefined ? { promotionTarget: settledLane.promotionTarget } : {}), ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}) },
+          scopeHints: { affectedFiles: [], claims: [], metadataRoots: STANDARD_SCOPE_METADATA_ROOTS },
+        }, { runtime: resumedInvestigationRuntime, artifacts, runs: resumedStore, decomposer: github, ...(settleSignal !== undefined ? { signal: settleSignal } : {}), ...(assertActive !== undefined ? { assertActive } : {}) });
+        assertActive?.();
+        if (settled.outcome?.payload.status === "invalid") await completeInvalidWorkItem({ run: settled.run, investigation: settled.investigation, outcome: settled.outcome }, { host: github, artifacts, ...(settleSignal !== undefined ? { signal: settleSignal } : {}), ...(assertActive !== undefined ? { assertActive } : {}) });
+      }
+    : undefined;
   return {
     repository: record.repository,
     autoMerge: record.autoMerge,
@@ -4044,7 +4094,7 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord,
     requestedIssueNumbers: [...(record.requestedIssueNumbers ?? record.issueNumbers)],
     items,
     maxParallel: record.maxParallel,
-    ...(investigationFirst ? { investigationFirst: true, ...(resumedWorkers ? { investigationWorker: resumedWorkers.investigationWorker, materializeExecution: resumedWorkers.materializeExecution } : {}) } : {}),
+    ...(investigationFirst ? { investigationFirst: true, ...(resumedWorkers ? { investigationWorker: resumedWorkers.investigationWorker, materializeExecution: resumedWorkers.materializeExecution } : {}), ...(resumedSettleInvestigation ? { settleInvestigation: resumedSettleInvestigation } : {}) } : {}),
     maxDecompositionDepth: effective.maxRemediationDepth,
     serializationEdges: (record.serializationEdges ?? []).map((edge) => ({ ...edge, overlappingClaims: [...edge.overlappingClaims] })),
     revalidateRoute: async (item) => {
