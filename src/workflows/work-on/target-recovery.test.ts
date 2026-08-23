@@ -33,6 +33,15 @@ function packet(runId: string) {
 function build(runId: string, baseSha = sourceBase, headSha = "1".repeat(40)) {
   return createArtifact({ kind: "BuildResult", runId, subject, producer: { role: "builder" }, payload: { branch: workspace.branch, targetBranch: "main", baseSha, headSha, changedPaths: ["src/a.ts"], summary: "built", acceptanceEvidence: [{ criterionId: "criterion-1", criterion: "Guard runs", status: "passed", evidence: "guard() and npm test", anchors: { paths: ["src/a.ts"], symbols: ["guard"], testIds: ["guard-test"], verificationCommandIds: ["test"] } }], checks: [{ command: "npm test", commandId: "test", status: "passed", durationMs: 1 }], decisions: [], residualRisks: [] } });
 }
+function reviewVerdict(runId: string, options: { headSha?: string; repo?: string; issue?: number; pr?: number } = {}) {
+  return createArtifact({
+    kind: "ReviewVerdict",
+    runId,
+    subject: { repo: options.repo ?? subject.repo, issue: options.issue ?? subject.issue, ...(options.pr !== undefined ? { pr: options.pr } : { pr: 7 }) },
+    producer: { role: "reviewer" },
+    payload: { disposition: "request_changes", headSha: options.headSha ?? recoveredHead, baseBranch: "main", reviewerRoles: ["reviewer"], findings: [], checks: [] },
+  });
+}
 async function targetRun(runId: string, i: DurableArtifact<"Intent">, inv: DurableArtifact<"Investigation">, p: DurableArtifact<"BuildPacket">, b: DurableArtifact<"BuildResult">): Promise<{ run: RunState; artifacts: InMemoryArtifactRepository; runs: InMemoryRunRepository; checkpoint: DurableArtifact<"TargetAdvanceCheckpoint"> }> {
   const artifacts = new InMemoryArtifactRepository();
   const runs = new InMemoryRunRepository();
@@ -68,7 +77,7 @@ class Verifier implements VerificationRunner { async run() { return [{ command: 
 function host(git: GitFake) {
   const pr = { repo: subject.repo, number: 7, title: "Fix", body: "", url: "https://example.test/pr/7", state: "OPEN" as const, headSha: recoveredHead, headBranch: workspace.branch, baseBranch: "main" };
   return {
-    getBranchHead: async () => targetBase,
+    getBranchHead: async (_repo: string, branch: string) => branch === "main" ? targetBase : recoveredHead,
     createPullRequest: async () => pr,
     getPullRequest: async () => pr,
     getPullRequestDiff: async () => "diff --git a/src/a.ts b/src/a.ts",
@@ -103,6 +112,73 @@ describe("direct target recovery integration", { concurrency: false }, () => {
     assert.equal(finalCheckpoint?.payload.integrationHeadSha, builds.at(-1)?.payload.headSha);
     assert.equal((await fixture.artifacts.list({ ...subject, pr: 7 }, "ReviewVerdict")).length, 1);
   });
+  it("recovers a remediation target-advance checkpoint with its exact prior verdict", async () => {
+    const runId = "target-remediation-resume";
+    const i = intent(runId); const inv = investigation(runId); const p = packet(runId); const b = build(runId);
+    const fixture = await targetRun(runId, i, inv, p, b);
+    const priorVerdict = reviewVerdict(runId);
+    await fixture.artifacts.append(priorVerdict);
+    const checkpoint = await persistTargetAdvanceCheckpoint({
+      run: fixture.run, packet: p, buildResult: b, verdict: priorVerdict, workspace,
+      targetBranch: "main", observedTargetSha: targetBase, artifacts: fixture.artifacts,
+    });
+    assert.ok(checkpoint);
+    const git = new GitFake();
+    const result = await resumeTargetAdvanceWorkOn({
+      run: fixture.run, checkpoint: checkpoint!, intent: i, investigation: inv, packet: p, buildResult: b,
+      priorVerdict, pullRequest: {
+        repo: subject.repo, number: 7, title: "Fix", body: "", url: "https://example.test/pr/7",
+        state: "OPEN", headSha: recoveredHead, headBranch: workspace.branch, baseBranch: "main",
+      }, workspace, verification: [command],
+    }, deps(fixture, git).dependencies);
+    assert.equal(result.pullRequest?.number, 7);
+    assert.equal(git.commits, 1); assert.equal(git.pushes, 1);
+    const finalCheckpoint = (await fixture.artifacts.list(subject, "TargetAdvanceCheckpoint"))
+      .filter((artifact): artifact is DurableArtifact<"TargetAdvanceCheckpoint"> => artifact.kind === "TargetAdvanceCheckpoint")
+      .at(-1);
+    assert.equal(finalCheckpoint?.payload.phase, "reviewed");
+    assert.equal(finalCheckpoint?.payload.sourceVerdictId, priorVerdict.id);
+  });
+  it("adopts exact fresh/fresh projections from a fenced remediation checkpoint without pushing twice", async () => {
+    const runId = "target-remediation-fenced-replay";
+    const i = intent(runId); const inv = investigation(runId); const p = packet(runId); const b = build(runId);
+    const fixture = await targetRun(runId, i, inv, p, b);
+    const priorVerdict = reviewVerdict(runId, { headSha: recoveredHead });
+    const fresh = build(runId, targetBase, recoveredHead);
+    const verification = createArtifact({
+      kind: "VerificationCheckpoint", runId, subject, producer: { role: "controller" },
+      payload: {
+        checkpoint: "verified-commit", branch: workspace.branch, targetBranch: "main", baseSha: targetBase,
+        parentHeadSha: b.payload.headSha, changedPaths: ["src/a.ts"], pendingChangedPaths: ["src/a.ts"],
+        verifiedContentDigest: "e".repeat(64), commitMessage: "forge: recover", summary: "verified recovery",
+        acceptanceEvidence: fresh.payload.acceptanceEvidence.map((evidence) => ({ ...evidence, status: "passed" as const })), checks: fresh.payload.checks, decisions: [], residualRisks: [],
+      },
+    });
+    await fixture.artifacts.append(priorVerdict);
+    await fixture.artifacts.append(fresh);
+    await fixture.artifacts.append(verification);
+    const checkpoint = await persistTargetAdvanceCheckpoint({
+      run: fixture.run, packet: p, buildResult: fresh, sourceBuildResult: b, verdict: priorVerdict, workspace,
+      targetBranch: "main", observedTargetSha: targetBase, phase: "fenced", freshVerificationCheckpointId: verification.id,
+      freshBuildResultId: fresh.id, integrationHeadSha: recoveredHead, mergeHeadSha: recoveredHead, pullRequest: 7, artifacts: fixture.artifacts,
+    });
+    assert.ok(checkpoint);
+    const git = new GitFake();
+    git.commits = 1;
+    const result = await resumeTargetAdvanceWorkOn({
+      run: fixture.run, checkpoint: checkpoint!, intent: i, investigation: inv, packet: p, buildResult: b,
+      freshBuildResult: fresh, priorVerdict, pullRequest: {
+        repo: subject.repo, number: 7, title: "Fix", body: "", url: "https://example.test/pr/7", state: "OPEN", headSha: recoveredHead,
+        headBranch: workspace.branch, baseBranch: "main",
+      }, workspace, verification: [command],
+    }, deps(fixture, git).dependencies);
+    assert.equal(result.pullRequest?.headSha, recoveredHead);
+    assert.equal(git.pushes, 0);
+    const finalCheckpoint = (await fixture.artifacts.list(subject, "TargetAdvanceCheckpoint"))
+      .filter((artifact): artifact is DurableArtifact<"TargetAdvanceCheckpoint"> => artifact.kind === "TargetAdvanceCheckpoint").at(-1);
+    assert.equal(finalCheckpoint?.payload.phase, "reviewed");
+  });
+
   it("accepts unchanged contract evidence boundaries without expanding the recovered write revision", async () => {
     const runId = "target-evidence-boundaries";
     const i = intent(runId); const inv = investigation(runId);
@@ -209,8 +285,11 @@ describe("direct target recovery integration", { concurrency: false }, () => {
     const fixture = await targetRun(runId, i, inv, p, b); const verdict = createArtifact({ kind: "ReviewVerdict", runId, subject: { ...subject, pr: 7 }, producer: { role: "reviewer" }, payload: { disposition: "approve", headSha: b.payload.headSha, baseBranch: "main", reviewerRoles: ["reviewer"], findings: [], checks: [] } });
     const checkpoint = await persistTargetAdvanceCheckpoint({ run: fixture.run, packet: p, buildResult: b, verdict, workspace, targetBranch: "main", observedTargetSha: targetBase, artifacts: fixture.artifacts });
     assert.equal(checkpoint?.payload.sourceVerdictId, verdict.id);
+    await assert.rejects(() => resumeTargetAdvanceWorkOn({ run: fixture.run, checkpoint: checkpoint!, intent: i, investigation: inv, packet: p, buildResult: b, workspace, verification: [command] }, deps(fixture).dependencies), /source verdict/);
     const wrongVerdict = createArtifact({ kind: "ReviewVerdict", runId, subject: { ...subject, pr: 7 }, producer: { role: "reviewer" }, payload: { ...verdict.payload } }, { id: "wrong-verdict" });
     await assert.rejects(() => resumeTargetAdvanceWorkOn({ run: fixture.run, checkpoint: checkpoint!, intent: i, investigation: inv, packet: p, buildResult: b, priorVerdict: wrongVerdict, workspace, verification: [command] }, deps(fixture).dependencies), /source verdict/);
+    const wrongIdentity = { ...verdict, runId: "other-run" } as typeof verdict;
+    await assert.rejects(() => resumeTargetAdvanceWorkOn({ run: fixture.run, checkpoint: checkpoint!, intent: i, investigation: inv, packet: p, buildResult: b, priorVerdict: wrongIdentity, workspace, verification: [command] }, deps(fixture).dependencies), /source verdict identity/);
   });
   it("propagates durable target checkpoint attempt bounds to terminal recovery", async () => {
     const runId = "target-terminal-attempt";

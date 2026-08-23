@@ -753,10 +753,44 @@ async function workOn(
         if (!targetCheckpoint || !targetBuild || !packet || !investigation) {
           throw new Error(`Run ${resumeRunId} lacks the packet, investigation, BuildResult, and target checkpoint required for target recovery`);
         }
+        const targetSourceVerdictId = targetCheckpoint.payload.sourceVerdictId;
+        const targetPriorVerdict = targetSourceVerdictId !== undefined
+          ? runArtifacts.find((artifact): artifact is DurableArtifact<"ReviewVerdict"> => artifact.kind === "ReviewVerdict" && artifact.id === targetSourceVerdictId)
+          : undefined;
+        if (targetSourceVerdictId !== undefined) {
+          if (!targetPriorVerdict) {
+            throw new Error(`Run ${resumeRunId} target checkpoint references missing source ReviewVerdict ${targetSourceVerdictId}; refusing stale verdict inference`);
+          }
+          if (targetPriorVerdict.runId !== resumeRunId
+            || targetPriorVerdict.subject.repo.toLowerCase() !== targetCheckpoint.payload.repository.toLowerCase()
+            || targetPriorVerdict.subject.issue !== issue.number
+            || targetPriorVerdict.subject.pr === undefined
+            || (targetCheckpoint.payload.pullRequest !== undefined && targetPriorVerdict.subject.pr !== targetCheckpoint.payload.pullRequest)
+            || (targetPriorVerdict.payload.baseBranch !== undefined && targetPriorVerdict.payload.baseBranch !== targetCheckpoint.payload.targetBranch)) {
+            throw new Error(`Run ${resumeRunId} target checkpoint source ReviewVerdict ${targetSourceVerdictId} has mismatched run/repository/PR identity`);
+          }
+        }
         const targetPr = await github.findOpenPullRequest?.(subject.repo, targetBuild.payload.branch);
-        const expectedTargetPrHead = targetFreshBuild?.payload.headSha ?? targetCheckpoint.payload.sourceHeadSha;
-        if (targetPr && targetPr.headSha.toLowerCase() !== expectedTargetPrHead.toLowerCase()) {
-          throw new Error(`Run ${resumeRunId} has an open PR whose head does not match the target checkpoint${targetFreshBuild ? " fresh BuildResult" : ""}`);
+        if (targetSourceVerdictId !== undefined && !targetPr) {
+          throw new Error(`Run ${resumeRunId} target checkpoint source ReviewVerdict ${targetSourceVerdictId} has no matching open PR for identity validation`);
+        }
+        const prePublicationTarget = targetPriorVerdict !== undefined
+          && targetCheckpoint.payload.phase !== "pushed" && targetCheckpoint.payload.phase !== "reviewed";
+        const expectedTargetPrHead = prePublicationTarget
+          ? targetPriorVerdict.payload.headSha
+          : targetFreshBuild?.payload.headSha ?? targetCheckpoint.payload.sourceHeadSha;
+        const allowedTargetPrHeads = new Set([
+          expectedTargetPrHead.toLowerCase(),
+          ...(prePublicationTarget && targetCheckpoint.payload.phase === "fenced" && targetFreshBuild !== undefined
+            ? [targetFreshBuild.payload.headSha.toLowerCase()]
+            : []),
+        ]);
+        if (targetPr && !allowedTargetPrHeads.has(targetPr.headSha.toLowerCase())) {
+          throw new Error(`Run ${resumeRunId} has an open PR whose head does not match the target checkpoint${targetFreshBuild ? " admitted old/fresh heads" : " source ReviewVerdict"}`);
+        }
+        if (targetPr && targetPriorVerdict && (targetPr.number !== targetPriorVerdict.subject.pr
+          || targetPr.repo.toLowerCase() !== targetCheckpoint.payload.repository.toLowerCase())) {
+          throw new Error(`Run ${resumeRunId} target checkpoint source ReviewVerdict ${targetSourceVerdictId} does not match the retained PR identity`);
         }
         const targetRun = await store.load(resumeRunId);
         if (!targetRun || (targetRun.state !== "target_recovery" && targetRun.state !== "retry_wait")) throw new Error(`Run ${resumeRunId} is not durably admitted for target recovery`);
@@ -765,7 +799,8 @@ async function workOn(
         const targetVerification = discoverVerificationCommands(process.cwd(), targetCheckpoint.payload.sourceBaseSha);
         const recovered = await resumeTargetAdvanceWorkOn({
           run: targetRun, checkpoint: targetCheckpoint, intent: intentArtifact!, investigation, packet,
-          buildResult: targetBuild, ...(targetFreshBuild !== undefined ? { freshBuildResult: targetFreshBuild } : {}), ...(targetPr !== undefined ? { pullRequest: targetPr } : {}), workspace: targetWorkspace,
+          buildResult: targetBuild, ...(targetFreshBuild !== undefined ? { freshBuildResult: targetFreshBuild } : {}), ...(targetPr !== undefined ? { pullRequest: targetPr } : {}),
+          ...(targetPriorVerdict !== undefined ? { priorVerdict: targetPriorVerdict } : {}), workspace: targetWorkspace,
           resolveVerificationCatalog: (baseSha: string) => discoverVerificationCommands(process.cwd(), baseSha),
           verification: targetVerification, signal: leaseController.signal,
         }, { runtime, artifacts, runs, git: targetGit, verifier: new ProcessVerificationRunner(), host: github, telemetry: store, verificationReceiptCache: store, leaseGuard, ...(orchestration?.promoteTargetRouteClaim ? { promoteTargetRouteClaim: orchestration.promoteTargetRouteClaim } : {}), onAgentEvent });

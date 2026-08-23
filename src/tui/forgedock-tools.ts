@@ -1421,6 +1421,8 @@ interface ControllerTaskTransport {
   stop?(taskId: string): void;
   list?(): readonly BackgroundTaskRecord[];
   isActive?(taskId: string): boolean;
+  /** Shared-capacity liveness check that does not require local adoption. */
+  isPersistedActive?(taskId: string): boolean;
 }
 
 type DagRecoveryMode = "initial" | "resume" | "rerun";
@@ -1626,9 +1628,10 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         return startNativeControllerTask(pi, backgroundTasks, spec, orchestrationContext, registeredControllerEntryPath);
       },
       wait: async (taskId) => await backgroundTasks.waitForTerminal(taskId),
-      stop: (taskId) => { try { backgroundTasks.cancel(taskId); } catch { /* task already terminal */ } },
+      stop: (taskId) => { try { backgroundTasks.cancelPersisted(taskId); } catch { /* task already terminal or cannot be safely signaled */ } },
       list: () => backgroundTasks.list(),
       isActive: (taskId) => backgroundTasks.isOperationallyActive(taskId),
+      isPersistedActive: (taskId) => backgroundTasks.isPersistedOperationallyActive(taskId),
       findByLaunchIdentity: (identity) => backgroundTasks.findByLaunchKey(orchestrationTransportKey(identity))?.id,
     },
     () => options.orchestrationExecutionAdmission
@@ -4942,8 +4945,12 @@ export class VisibleDagDelegator {
       controller.requestStop(orchestrationId, true);
       const attempts = record.nodes.flatMap((node) => node.attempts ?? []);
       const taskIds = new Set(attempts.flatMap((attempt) => [attempt.taskId, attempt.controllerTaskId, attempt.agentTaskId, attempt.runId].filter((id): id is string => Boolean(id))));
-      await this.stopTaskIds(taskIds, new Set());
-      return structuredClone(await controller.stop(orchestrationId, true));
+      const unresolved = await this.stopTaskIds(taskIds, new Set());
+      const stopped = structuredClone(await controller.stop(orchestrationId, true));
+      if (unresolved.length) {
+        throw new Error(`Orchestration ${orchestrationId} cancellation was durably persisted, but native task drain remains unresolved: ${unresolved.join(", ")}`);
+      }
+      return stopped;
     }
     if (stored.durableRecord.status === "cancelled" || stored.durableRecord.status !== "running") return structuredClone(stored.durableRecord);
     // Raise the semantic barrier before touching any transport task.
@@ -4952,19 +4959,33 @@ export class VisibleDagDelegator {
     const direct = new Set(stored.directChildRunIds);
     const attempts = stored.durableRecord.nodes.flatMap((node) => node.attempts ?? []);
     const taskIds = new Set([...stored.childRunIds, ...attempts.flatMap((attempt) => [attempt.taskId, attempt.controllerTaskId, attempt.agentTaskId, attempt.runId].filter((id): id is string => Boolean(id))) ]);
-    await this.stopTaskIds(taskIds, direct);
+    const unresolved = await this.stopTaskIds(taskIds, direct);
     await stored.completion?.catch(() => undefined);
     const latest = await this.repository().loadOrchestration(orchestrationId);
     if (!latest) throw new Error(`Orchestration DAG ${orchestrationId} disappeared while stopping`);
     stored.durableRecord = latest;
+    if (unresolved.length) {
+      throw new Error(`Orchestration ${orchestrationId} cancellation was durably persisted, but native task drain remains unresolved: ${unresolved.join(", ")}`);
+    }
     return structuredClone(latest);
   }
 
-  private async stopTaskIds(taskIds: ReadonlySet<string>, direct: ReadonlySet<string>): Promise<void> {
+  private async stopTaskIds(taskIds: ReadonlySet<string>, direct: ReadonlySet<string>): Promise<string[]> {
+    const nativeTaskIds = new Set(this.directControllerTransport?.list?.().map((record) => record.id) ?? []);
+    const unresolved = new Set<string>();
     await Promise.allSettled([...taskIds].map(async (taskId) => {
-      if (direct.has(taskId) || this.directControllerTransport?.isActive?.(taskId)) this.directControllerTransport?.stop?.(taskId);
-      else await callSubagentRpc(this.pi, "stop", { id: taskId }).catch(() => undefined);
+      // A replacement TUI may have no locally adopted task. A persisted native
+      // record is still the exact cancellation authority; never fall through to
+      // the Pi RPC, which may claim a different execution or conflict with the
+      // durable orchestration lease.
+      if (direct.has(taskId) || nativeTaskIds.has(taskId) || this.directControllerTransport?.isActive?.(taskId)) {
+        this.directControllerTransport?.stop?.(taskId);
+        if (this.directControllerTransport?.isPersistedActive?.(taskId) === true) unresolved.add(taskId);
+      } else {
+        await callSubagentRpc(this.pi, "stop", { id: taskId }).catch(() => undefined);
+      }
     }));
+    return [...unresolved];
   }
 
   async shutdown(): Promise<boolean> {
@@ -5229,7 +5250,9 @@ export class VisibleDagDelegator {
     ]);
     const externalActive = records.filter((record) =>
       (record.status === "running" || record.status === "detached")
-      && (this.directControllerTransport?.isActive?.(record.id) ?? true)
+      && (this.directControllerTransport?.isPersistedActive?.(record.id)
+        ?? this.directControllerTransport?.isActive?.(record.id)
+        ?? true)
       && !owned.has(record.id)).length;
     const available = configuredLimit - externalActive;
     // Zero capacity is durable backpressure. Let the scheduler retain the

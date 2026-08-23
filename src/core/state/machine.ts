@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { ArtifactKind, Subject } from "../artifacts/schema.js";
+import type { PullRequestMergeGate } from "../ports/forge-host.js";
 
 export type Workflow = "work-on" | "review-pr" | "orchestrate";
 export type RunStateName =
@@ -60,6 +61,7 @@ export type TransitionEvent =
   | "REVIEW_CHANGES_REQUESTED"
   | "REVIEW_BLOCKED"
   | "REMEDIATION_COMPLETED"
+  | "MERGE_ATTEMPT_RECORDED"
   | "MERGE_COMPLETED"
   | "CLOSE_COMPLETED"
   | "BLOCK"
@@ -83,6 +85,17 @@ export interface PersistedScopeManifest {
   source: "issue-hints" | "build-packet" | "remediation";
 }
 
+/** Exact gate evidence durably admitted immediately before a merge command. */
+export interface MergeAttemptProof {
+  schema: "forgedock.merge-attempt/v1";
+  repo: string;
+  pullRequest: number;
+  headSha: string;
+  baseBranch: string;
+  gate: PullRequestMergeGate;
+  admittedAt: string;
+}
+
 export interface RunState {
   schema: "forgedock.run/v1";
   runId: string;
@@ -103,6 +116,8 @@ export interface RunState {
   artifactIds: Partial<Record<ArtifactKind, string[]>>;
   blockedReason?: string;
   failure?: string;
+  /** Durable proof of the exact gate admission preceding mergePullRequest. */
+  mergeAttempt?: MergeAttemptProof;
 }
 
 export interface TransitionRecord {
@@ -155,7 +170,7 @@ const transitions: Readonly<Record<RunStateName, Partial<Record<TransitionEvent,
     CANCEL: "cancelled",
   },
   remediating: { RESUME_REMEDIATION: "remediating", REMEDIATION_COMPLETED: "verifying", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
-  merging: { RESUME_COMPLETION: "merging", TARGET_ADVANCE_DETECTED: "target_recovery", MERGE_COMPLETED: "closing", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
+  merging: { RESUME_COMPLETION: "merging", MERGE_ATTEMPT_RECORDED: "merging", TARGET_ADVANCE_DETECTED: "target_recovery", MERGE_COMPLETED: "closing", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
   closing: { CLOSE_COMPLETED: "completed", BLOCK: "blocked", FAIL: "failed", CANCEL: "cancelled" },
   completed: {},
   invalid: {},
@@ -219,13 +234,43 @@ export function canTransition(state: RunState, event: TransitionEvent): boolean 
   return transitions[state.state][event] !== undefined;
 }
 
+/** Validate the additive merge checkpoint whenever a RunState crosses a persistence boundary. */
+export function assertRunStatePersistence(state: RunState): void {
+  const proof = state.mergeAttempt;
+  if (proof === undefined) return;
+  if (proof.schema !== "forgedock.merge-attempt/v1"
+    || !proof.repo.trim()
+    || !Number.isSafeInteger(proof.pullRequest) || proof.pullRequest < 1
+    || !/^[0-9a-f]{7,64}$/i.test(proof.headSha)
+    || !proof.baseBranch.trim()
+    || !proof.admittedAt.trim()) {
+    throw new Error(`Run ${state.runId} contains an invalid merge-attempt proof`);
+  }
+  if (proof.gate.repo.toLowerCase() !== proof.repo.toLowerCase()
+    || proof.gate.pullRequest !== proof.pullRequest
+    || proof.gate.headSha.toLowerCase() !== proof.headSha.toLowerCase()
+    || proof.gate.baseBranch !== proof.baseBranch
+    || !proof.gate.observedAt.trim()
+    || !Array.isArray(proof.gate.requiredChecks)) {
+    throw new Error(`Run ${state.runId} contains a mismatched merge-attempt gate proof`);
+  }
+  if (proof.gate.requiredChecksProvenance === "github-required"
+    && proof.gate.requiredChecksHeadSha?.toLowerCase() !== proof.headSha.toLowerCase()) {
+    throw new Error(`Run ${state.runId} contains required-check evidence for the wrong merge head`);
+  }
+}
+
 export function transition(
   state: RunState,
   event: TransitionEvent,
-  options: { now?: string; reason?: string; headSha?: string; scopeManifest?: PersistedScopeManifest } = {},
+  options: { now?: string; reason?: string; headSha?: string; scopeManifest?: PersistedScopeManifest; mergeAttempt?: MergeAttemptProof | null } = {},
 ): { state: RunState; record: TransitionRecord } {
   if (options.scopeManifest !== undefined && event !== "BUILD_PACKET_READY") {
     throw new Error(`Scope authority can be replaced only when the Build Packet freezes, not during ${event}`);
+  }
+  assertRunStatePersistence(state);
+  if (options.mergeAttempt !== undefined && options.mergeAttempt !== null) {
+    assertRunStatePersistence({ ...state, mergeAttempt: options.mergeAttempt });
   }
   const next = transitions[state.state][event];
   if (!next) throw new InvalidTransitionError(state.state, event);
@@ -238,6 +283,10 @@ export function transition(
   };
   if (options.headSha !== undefined) nextState.headSha = options.headSha;
   if (options.scopeManifest !== undefined) nextState.scopeManifest = options.scopeManifest;
+  if (options.mergeAttempt !== undefined) {
+    if (options.mergeAttempt === null) delete nextState.mergeAttempt;
+    else nextState.mergeAttempt = options.mergeAttempt;
+  }
 if (event === "RESUME_INVESTIGATION" || event === "RESUME_PREPARATION" || event === "RESUME_VERIFICATION" || event === "RESUME_REVIEW" || event === "RESUME_EXPANDED_REVIEW" || event === "RESUME_REMEDIATION" || event === "RESUME_COMPLETION" || event === "RESUME_CONFLICT_RECOVERY" || event === "RESUME_BUILD" || event === "RESUME_PUBLICATION" || event === "RESUME_TARGET_ADVANCE" || event === "TARGET_RECOVERY_RESUMED" || event === "RETRY_DUE" || event === "RETRY_WAIT_EXPIRED" || event === "RECOVER_REVISION_PUBLICATION" || event === "VERIFICATION_REPAIR_REQUESTED") {
     nextState.attempt = state.attempt + 1;
     delete nextState.blockedReason;

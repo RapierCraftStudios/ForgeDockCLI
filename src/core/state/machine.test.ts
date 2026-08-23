@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import type { PullRequestMergeGate } from "../ports/forge-host.js";
 import { InvalidTransitionError, attachArtifact, createRun, transition } from "./machine.js";
 
 describe("workflow state machine", () => {
@@ -13,13 +14,36 @@ describe("workflow state machine", () => {
       "VERIFICATION_PASSED",
       "PR_PUBLISHED",
       "REVIEW_APPROVED",
-      "MERGE_COMPLETED",
-      "CLOSE_COMPLETED",
     ] as const) {
       run = transition(run, event, { now: "2026-01-01T00:00:01.000Z" }).state;
     }
+    const gate: PullRequestMergeGate = {
+      repo: "acme/widget",
+      pullRequest: 7,
+      headSha: "a".repeat(40),
+      baseBranch: "main",
+      mergeable: true,
+      requiredChecksProvenance: "github-required",
+      requiredChecksHeadSha: "a".repeat(40),
+      requiredChecks: [{ name: "CI", state: "passed" }],
+      observedAt: "2026-01-01T00:00:01.000Z",
+    };
+    const mergeAttempt = {
+      schema: "forgedock.merge-attempt/v1" as const,
+      repo: gate.repo,
+      pullRequest: gate.pullRequest,
+      headSha: gate.headSha,
+      baseBranch: gate.baseBranch,
+      gate,
+      admittedAt: "2026-01-01T00:00:01.000Z",
+    };
+    run = transition(run, "MERGE_ATTEMPT_RECORDED", { now: "2026-01-01T00:00:01.000Z", mergeAttempt }).state;
+    assert.deepEqual(run.mergeAttempt, mergeAttempt);
+    run = transition(run, "MERGE_COMPLETED", { now: "2026-01-01T00:00:01.000Z", mergeAttempt: null }).state;
+    assert.equal(run.mergeAttempt, undefined);
+    run = transition(run, "CLOSE_COMPLETED", { now: "2026-01-01T00:00:01.000Z" }).state;
     assert.equal(run.state, "completed");
-    assert.equal(run.version, 9);
+    assert.equal(run.version, 10);
   });
 
   it("freezes lane identity and target branch across transitions", () => {

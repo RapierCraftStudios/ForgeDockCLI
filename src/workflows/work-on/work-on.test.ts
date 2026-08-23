@@ -7,6 +7,7 @@ import type { ForgeHost, PullRequestMergeGate, PullRequestSnapshot, ReviewFindin
 import { LeaseContinuityError } from "../../core/ports/lease.js";
 import { decideSubjectAdmission } from "../../core/state/admission.js";
 import { reconcileArtifacts } from "../../core/state/reconcile.js";
+import { reconcileFindingRootLedger } from "../review-pr/finding-root-ledger.js";
 import { attachArtifact, createRun, transition } from "../../core/state/machine.js";
 import { AdvertisedRemoteHeadMismatchError, type GitWorkspace, type GitWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
@@ -104,6 +105,7 @@ class EndToEndGit {
   refreshes = 0;
   pristineAssertions = 0;
   createdFrom?: string;
+  pushes = 0;
   async create(input: { baseRef: string }): Promise<GitWorkspace> { this.createdFrom = input.baseRef; return workspace; }
   async fastForwardToRemoteTarget(current: GitWorkspace, advertisedHeadSha: string): Promise<GitWorkspace> {
     this.refreshes += 1;
@@ -121,7 +123,7 @@ class EndToEndGit {
   async prepareWorkspaceDependencies(): Promise<void> {}
   async committedContentMatches(): Promise<boolean> { return true; }
   async commit(): Promise<string> { return sha; }
-  async push(): Promise<void> {}
+  async push(): Promise<void> { this.pushes += 1; }
   async head(): Promise<string> { return sha; }
   async remove(): Promise<void> { this.removed = true; }
 }
@@ -1418,7 +1420,7 @@ describe("complete work-on trajectory", () => {
     const buildResult = createArtifact({
       kind: "BuildResult", runId: intent.runId, subject: intent.subject, producer: { role: "controller" },
       payload: {
-        branch: workspace.branch, headSha: sha, changedPaths: ["src/a.js"], summary: "Added guard",
+        branch: workspace.branch, baseSha: sha, headSha: sha, changedPaths: ["src/a.js"], summary: "Added guard",
         acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "npm test" }],
         checks: [{ command: "npm test", commandId: "test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
       },
@@ -1438,9 +1440,46 @@ describe("complete work-on trajectory", () => {
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
     assert.equal(resumed.run.state, "completed");
     assert.deepEqual(runtime.tasks.map((task) => task.role), ["reviewer"]);
-    assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event).slice(-5), [
-      "RESUME_PUBLICATION", "PR_PUBLISHED", "REVIEW_APPROVED", "MERGE_COMPLETED", "CLOSE_COMPLETED",
+    assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event).slice(-6), [
+      "RESUME_PUBLICATION", "PR_PUBLISHED", "REVIEW_APPROVED", "MERGE_ATTEMPT_RECORDED", "MERGE_COMPLETED", "CLOSE_COMPLETED",
     ]);
+  });
+
+  it("fails closed when a legacy publication BuildResult omits its target base SHA", async () => {
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const intent = createArtifact({
+      kind: "Intent", runId: "run_publish_resume_legacy_base", subject: { repo: "a/b", issue: 8 }, producer: { role: "controller" },
+      payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: ["Guard runs"], dependencies: [] },
+    });
+    const investigationArtifact = createArtifact({ kind: "Investigation", runId: intent.runId, subject: intent.subject, producer: { role: "investigator" }, payload: investigation });
+    const packetArtifact = createArtifact({ kind: "BuildPacket", runId: intent.runId, subject: intent.subject, producer: { role: "packet-author" }, payload: packet });
+    const buildResult = createArtifact({
+      kind: "BuildResult", runId: intent.runId, subject: intent.subject, producer: { role: "controller" },
+      payload: {
+        branch: workspace.branch, headSha: sha, changedPaths: ["src/a.js"], summary: "Legacy build",
+        acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "npm test" }],
+        checks: [{ command: "npm test", commandId: "test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
+      },
+    });
+    let run = createRun({ workflow: "work-on", subject: intent.subject, runId: intent.runId, target: runTarget });
+    await runs.create(run);
+    for (const event of ["START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED", "VERIFICATION_PASSED"] as const) {
+      const advanced = transition(run, event, { headSha: sha });
+      await runs.commit(run.version, advanced.state, advanced.record);
+      run = advanced.state;
+    }
+    await assert.rejects(
+      resumePublicationWorkOn({
+        run, intent, investigation: investigationArtifact, packet: packetArtifact, buildResult,
+        workspace, baseBranch: "main", verification: [targetedTestVerification],
+      }, { runtime: new FakeAgentRuntime([]), artifacts, runs, git, verifier: new EndToEndVerifier(), host }),
+      /exact verified target base SHA/,
+    );
+    assert.equal(git.pushes, 0);
+    assert.equal(host.snapshot.state, "OPEN");
   });
 
   it("recovers a failed stale PR projection only from its newer verified remediation checkpoint", async () => {
@@ -1465,7 +1504,7 @@ describe("complete work-on trajectory", () => {
     const buildResult = createArtifact({
       kind: "BuildResult", runId: intent.runId, subject: intent.subject, producer: { role: "controller" },
       payload: {
-        branch: workspace.branch, headSha: sha, changedPaths: ["src/a.js"], summary: "Remediated guard",
+        branch: workspace.branch, baseSha: sha, headSha: sha, changedPaths: ["src/a.js"], summary: "Remediated guard",
         acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "npm test" }],
         checks: [{ command: "npm test", commandId: "test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
       },
@@ -1489,8 +1528,8 @@ describe("complete work-on trajectory", () => {
       verification: [targetedTestVerification],
     }, { runtime, artifacts, runs, git, verifier: new EndToEndVerifier(), host });
     assert.equal(resumed.run.state, "completed");
-    assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event).slice(-5), [
-      "RECOVER_REVISION_PUBLICATION", "PR_PUBLISHED", "REVIEW_APPROVED", "MERGE_COMPLETED", "CLOSE_COMPLETED",
+    assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event).slice(-6), [
+      "RECOVER_REVISION_PUBLICATION", "PR_PUBLISHED", "REVIEW_APPROVED", "MERGE_ATTEMPT_RECORDED", "MERGE_COMPLETED", "CLOSE_COMPLETED",
     ]);
   });
 
@@ -1516,7 +1555,7 @@ describe("complete work-on trajectory", () => {
     const buildResult = createArtifact({
       kind: "BuildResult", runId: intent.runId, subject: intent.subject, producer: { role: "controller" },
       payload: {
-        branch: workspace.branch, headSha: sha, changedPaths: ["src/a.js"], summary: "Added guard",
+        branch: workspace.branch, baseSha: sha, headSha: sha, changedPaths: ["src/a.js"], summary: "Added guard",
         acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "npm test" }],
         checks: [{ command: "npm test", commandId: "test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
       },
@@ -1555,9 +1594,9 @@ describe("complete work-on trajectory", () => {
     assert.deepEqual(remediator?.workspace.scope.writeRoots, []);
     assert.deepEqual(remediator?.workspace.scope.writePaths, packet.expectedPaths);
     assert.ok(remediator?.workspace.scope.readRoots.includes("src"));
-    assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event).slice(-7), [
+    assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event).slice(-8), [
       "REVIEW_CHANGES_REQUESTED", "REMEDIATION_COMPLETED", "VERIFICATION_PASSED", "PR_PUBLISHED",
-      "REVIEW_APPROVED", "MERGE_COMPLETED", "CLOSE_COMPLETED",
+      "REVIEW_APPROVED", "MERGE_ATTEMPT_RECORDED", "MERGE_COMPLETED", "CLOSE_COMPLETED",
     ]);
   });
 
@@ -1583,7 +1622,7 @@ describe("complete work-on trajectory", () => {
     const buildResult = createArtifact({
       kind: "BuildResult", runId: intent.runId, subject: intent.subject, producer: { role: "controller" },
       payload: {
-        branch: workspace.branch, headSha: sha, changedPaths: ["src/a.js"], summary: "Added guard",
+        branch: workspace.branch, baseSha: sha, headSha: sha, changedPaths: ["src/a.js"], summary: "Added guard",
         acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "npm test" }],
         checks: [{ command: "npm test", commandId: "test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
       },
@@ -1649,7 +1688,7 @@ describe("complete work-on trajectory", () => {
     const buildResult = createArtifact({
       kind: "BuildResult", runId: intent.runId, subject: intent.subject, producer: { role: "controller" },
       payload: {
-        branch: workspace.branch, headSha: sha, changedPaths: ["src/a.js"], summary: "Added guard",
+        branch: workspace.branch, baseSha: sha, headSha: sha, changedPaths: ["src/a.js"], summary: "Added guard",
         acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "npm test" }],
         checks: [{ command: "npm test", commandId: "test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
       },
@@ -1660,13 +1699,24 @@ describe("complete work-on trajectory", () => {
       sourceSnapshot: { reviewedHeadSha: sha, path: "src/a.js", excerpt: "guard()" },
       intentRelevance: "The guard must cover the accepted behavior", remediation: "Complete the guard in src/a.js",
     };
+    const priorRoots = reconcileFindingRootLedger({ packet: packetArtifact, findings: [finding], headSha: sha });
+    const priorRoot = priorRoots[0];
+    if (!priorRoot) throw new Error("Missing prior finding root");
+    const priorFinding = { ...finding, rootId: priorRoot.rootId };
     const priorVerdict = createArtifact({
       kind: "ReviewVerdict", runId: intent.runId, subject: { ...intent.subject, pr: host.snapshot.number }, producer: { role: "controller" },
       payload: {
         headSha: sha, headBranch: workspace.branch, baseBranch: "main", disposition: "request_changes",
-        reviewerRoles: ["correctness"], findings: [finding], checks: [], reviewPlan: currentReviewPlan(packetArtifact),
+        reviewerRoles: ["correctness"], findings: [priorFinding], checks: [], reviewPlan: currentReviewPlan(packetArtifact),
       },
     });
+    const priorRootLedger = createArtifact({
+      kind: "FindingRootLedger", runId: intent.runId, subject: { ...intent.subject, pr: host.snapshot.number }, producer: { role: "controller" },
+      payload: {
+        checkpoint: "finding-root-ledger", pullRequest: host.snapshot.number, headSha: sha, epoch: 1, roots: priorRoots,
+      },
+    });
+    await artifacts.append(priorRootLedger);
     let run = createRun({ workflow: "work-on", subject: intent.subject, runId: intent.runId, target: runTarget });
     await runs.create(run);
     for (const event of [
@@ -1677,7 +1727,7 @@ describe("complete work-on trajectory", () => {
       await runs.commit(run.version, advanced.state, advanced.record);
       run = advanced.state;
     }
-    const runtime = new FakeAgentRuntime([{ summary: "Approved after bounded scope reassessment", findings: [] }]);
+    const runtime = new FakeAgentRuntime([fixOpenRoots]);
     const resumed = await resumeReviewWorkOn({
       run, intent, investigation: investigationArtifact, packet: packetArtifact, buildResult, priorVerdict,
       pullRequest: host.snapshot, workspace, baseBranch: "main", autoMerge: true,
@@ -1686,8 +1736,8 @@ describe("complete work-on trajectory", () => {
 
     assert.equal(resumed.run.state, "completed");
     assert.deepEqual(runtime.tasks.map((task) => task.role), ["reviewer"]);
-    assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event).slice(-4), [
-      "RESUME_REVIEW", "REVIEW_APPROVED", "MERGE_COMPLETED", "CLOSE_COMPLETED",
+    assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event).slice(-5), [
+      "RESUME_REVIEW", "REVIEW_APPROVED", "MERGE_ATTEMPT_RECORDED", "MERGE_COMPLETED", "CLOSE_COMPLETED",
     ]);
   });
 
@@ -1705,7 +1755,7 @@ describe("complete work-on trajectory", () => {
     const buildResult = createArtifact({
       kind: "BuildResult", runId: intent.runId, subject: intent.subject, producer: { role: "controller" },
       payload: {
-        branch: workspace.branch, headSha: sha, changedPaths: ["src/a.js"], summary: "Added guard",
+        branch: workspace.branch, baseSha: sha, headSha: sha, changedPaths: ["src/a.js"], summary: "Added guard",
         acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "npm test" }],
         checks: [{ command: "npm test", commandId: "test", status: "passed", durationMs: 10 }], decisions: [], residualRisks: [],
       },
@@ -1780,8 +1830,8 @@ describe("complete work-on trajectory", () => {
     assert.equal(resumed.run.state, "completed");
     assert.equal(host.issueClosed, true);
     assert.equal(git.removed, true);
-    assert.deepEqual((await runs.history(verdict.runId)).map((record) => record.event).slice(-3), [
-      "RESUME_COMPLETION", "MERGE_COMPLETED", "CLOSE_COMPLETED",
+    assert.deepEqual((await runs.history(verdict.runId)).map((record) => record.event).slice(-4), [
+      "RESUME_COMPLETION", "MERGE_ATTEMPT_RECORDED", "MERGE_COMPLETED", "CLOSE_COMPLETED",
     ]);
   });
 
@@ -1947,8 +1997,8 @@ describe("complete work-on trajectory", () => {
 
     assert.equal(resumed.run.state, "completed");
     assert.deepEqual(resumedRuntime.tasks.map((task) => task.role), ["reviewer"]);
-    assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event).slice(-5), [
-      "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_APPROVED", "MERGE_COMPLETED", "CLOSE_COMPLETED",
+    assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event).slice(-6), [
+      "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_APPROVED", "MERGE_ATTEMPT_RECORDED", "MERGE_COMPLETED", "CLOSE_COMPLETED",
     ]);
   });
 
@@ -2147,7 +2197,7 @@ describe("complete work-on trajectory", () => {
     assert.equal(new Set(runtime.tasks.map((task) => task.id)).size, 4);
     assert.deepEqual((await runs.history(intent.runId)).map((record) => record.event), [
       "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED",
-      "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_APPROVED", "MERGE_COMPLETED", "CLOSE_COMPLETED",
+      "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_APPROVED", "MERGE_ATTEMPT_RECORDED", "MERGE_COMPLETED", "CLOSE_COMPLETED",
     ]);
   });
 });

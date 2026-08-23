@@ -34,6 +34,10 @@
 - Dogfood readiness is now tracked as phased certification waves. Implementation and local regression evidence do not constitute a readiness claim; certification remains open.
 - Orchestration now projects queued claim conflicts, retries, and automatic recovery as `workflow:waiting`; exact DAG/node/attempt fencing prevents stale projections from reclaiming newer active or terminal labels, and resuming workers restores active run labels.
 - TUI-launched orchestration now uses the same attempt-fenced GitHub node-state projection as CLI launches; tokenless preview confirmation preserves one frozen checkpoint across settled/background turns; remediating checkpoints relaunch with bounded scheduler metadata; semantic stop preserves concurrently completed nodes.
+- Investigation-first orchestration now requires a confirmed durable Investigation before packet preparation, replays the confirmed transition on recovery, and reuses the exact attached Build Packet after a building restart.
+- Packet waves now retain a monotonic all-wave packet union, preserve authoritative dependencies across waves, backpressure safely when sampled transport capacity is zero, and resume when capacity returns.
+- Packet reuse now fences node, run, subject, base, and investigation identity, canonicalizes overlap paths while rejecting absolute, traversal, and wildcard paths, and preserves monotonic attempt identities across restarts.
+- TUI orchestration now accounts for persisted native tasks in shared transport capacity and uses process-incarnation ownership for restart-safe adoption, cancellation, and capacity reporting.
 
 ### Fixed
 
@@ -48,6 +52,9 @@
 - Build Packet preparation now treats concrete packet paths as exact isolated-worktree write grants without requiring issue or investigation hints; investigation affected-surface hints remain optional read-only verification hints, so malformed or missing targets are dropped without fuzzy expansion while protected paths remain denied.
 - Explicit `/orchestrate stop <dag-id>` now activates `forgedock_orchestrate`, the tool that owns semantic stop, and passes the exact DAG stop authorization instead of routing through ordinary resume.
 - Ordinary `/orchestrate resume <dag-id>` remains isolated to the durable resume tool.
+- Publication and target-advance recovery now require exact target-base/head, PR route/head, and retained BuildResult/verdict identity fences; transient GitHub transport failures remain recoverable checkpoints.
+- Review now preserves unresolved prior-root authority when findings are omitted or the root ledger is unavailable, blocking approval without fabricating current-head evidence; same-head reassessment requires explicit root status.
+- Merged closure recovery now accepts only exact durable merge proof or a matching terminal Outcome, validates the retained PR identity, and refuses externally merged PRs without an authoritative checkpoint.
 
 ## 1.8.1 - 2026-08-17
 

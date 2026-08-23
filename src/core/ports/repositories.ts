@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { ArtifactKind, DurableArtifact, Subject } from "../artifacts/schema.js";
-import type { RunState, TransitionRecord } from "../state/machine.js";
+import { assertRunStatePersistence, type RunState, type TransitionRecord } from "../state/machine.js";
 import type { IssueSnapshot, ReviewFindingPublicationFence } from "./forge-host.js";
 import { findRunningOrchestrationIssueConflicts, MAX_ORCHESTRATION_PAGE_SIZE, OrchestrationIssueOwnershipConflictError, orchestrationRecordIssueIdentities, type OrchestrationExecutionFence, type OrchestrationListCursor, type OrchestrationRecord, type OrchestrationRepository } from "./orchestration.js";
 
@@ -250,6 +250,7 @@ export class InMemoryRunRepository implements RunRepository {
   readonly progress = new Map<string, RunProgressRecord[]>();
 
   async create(state: RunState): Promise<void> {
+    assertRunStatePersistence(state);
     if (this.runs.has(state.runId)) throw new Error(`Run already exists: ${state.runId}`);
     this.runs.set(state.runId, structuredClone(state));
     this.records.set(state.runId, []);
@@ -262,6 +263,7 @@ export class InMemoryRunRepository implements RunRepository {
   }
 
   async commit(expectedVersion: number, state: RunState, record: TransitionRecord): Promise<void> {
+    assertRunStatePersistence(state);
     const current = this.runs.get(state.runId);
     if (!current) throw new Error(`Unknown run: ${state.runId}`);
     if (current.version !== expectedVersion) {

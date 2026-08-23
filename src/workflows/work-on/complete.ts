@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
+import { classifyRetryableError } from "../../core/retry.js";
 import { pullRequestMergeability, type ForgeHost, type PullRequestMergeGate, type PullRequestSnapshot } from "../../core/ports/forge-host.js";
 import { summarizeControllerTiming, summarizeQuality, summarizeTelemetry, type TelemetryRepository } from "../../core/ports/telemetry.js";
 import type { BatchMemberContract } from "../orchestrate/batching.js";
@@ -13,7 +14,7 @@ import {
 } from "../review-pr/polling.js";
 import { renderTrajectoryComment, trajectoryCommentMarker, trajectoryReceiptFromArtifacts } from "./trajectory.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
-import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
+import { attachArtifact, transition, type MergeAttemptProof, type RunState } from "../../core/state/machine.js";
 import { deterministicOutcomeId, WorkflowExecutionError, retryableExternalWorkflowError } from "./investigate.js";
 import { resolveReviewCiConfig, type EffectiveReviewCiConfig } from "../../core/config/forgedock-config.js";
 import { assertRunTargetsBranch } from "./lane.js";
@@ -208,12 +209,62 @@ export async function completeWorkItem(
     assertRunTargetsBranch(run, input.pullRequest.baseBranch);
     let pullRequest = await dependencies.host.getPullRequest(input.pullRequest.repo, input.pullRequest.number);
     assertRunTargetsBranch(run, pullRequest.baseBranch);
+    assertPullRequestRouteIdentity(pullRequest, input.pullRequest.repo, input.pullRequest.number);
     if (pullRequest.headSha !== input.verdict.payload.headSha) {
       throw new Error(`Approved SHA ${input.verdict.payload.headSha} is stale; current PR head is ${pullRequest.headSha}`);
     }
+    const issue = run.subject.issue;
+    if (!issue) throw new Error("work-on completion requires an issue subject");
+    const childIssues = [...new Set(input.childIssues ?? [])]
+      .filter((child) => Number.isSafeInteger(child) && child > 0 && child !== issue);
+    const terminalOutcomeId = deterministicOutcomeId(
+      run.runId,
+      run.subject,
+      `merged:pr:${input.pullRequest.number}:sha:${input.verdict.payload.headSha}`,
+    );
+    const durableTerminal = (await dependencies.artifacts.list(run.subject, "Outcome"))
+      .find((artifact): artifact is DurableArtifact<"Outcome"> => artifact.kind === "Outcome" && artifact.id === terminalOutcomeId);
     const ciPolicy = input.ciPolicy ?? resolveReviewCiConfig();
-    if (!alreadyMergedCheckpoint && pullRequest.state !== "MERGED" && !input.autoMerge) return { run, awaitingHuman: true };
-    if (alreadyMergedCheckpoint || pullRequest.state === "MERGED" || input.autoMerge) {
+    const mergeAttempt = run.mergeAttempt;
+    if (mergeAttempt !== undefined) {
+      assertMergeAttemptIdentity(
+        mergeAttempt,
+        run,
+        input.pullRequest.repo,
+        input.pullRequest.number,
+        input.verdict.payload.headSha,
+        run.targetBranch!,
+        ciPolicy,
+      );
+    }
+    const hasDurableMergeProof = alreadyMergedCheckpoint || durableTerminal !== undefined;
+    const hasAdmittedMergeAttempt = mergeAttempt !== undefined;
+    if (hasDurableMergeProof) {
+      // A closing run or a durable terminal Outcome is the only authority that
+      // permits resuming an already-merged PR without re-reading the open-PR
+      // merge gate. The live PR identity is still authoritative and exact.
+      assertMergedPullRequestIdentity(
+        pullRequest,
+        input.pullRequest.repo,
+        input.pullRequest.number,
+        input.verdict.payload.headSha,
+        run.targetBranch!,
+      );
+      if (durableTerminal) assertMatchingMergedOutcome(durableTerminal, run, pullRequest, childIssues);
+      mergedExactHead = true;
+    } else if (pullRequest.state === "MERGED") {
+      if (!hasAdmittedMergeAttempt) {
+        // A PR merged outside this run has no durable merge admission or
+        // checkpoint. Do not treat its current state as permission to close the
+        // issue or adopt a terminal Outcome.
+        throw new Error(`Pull request #${pullRequest.number} is already MERGED without a durable merge checkpoint; refusing external merge`);
+      }
+      // The command may have succeeded immediately before this controller lost
+      // its post-command reread. Adopt only the exact durable attempt proof.
+      mergedExactHead = true;
+    }
+    if (!hasDurableMergeProof && !mergedExactHead && pullRequest.state !== "MERGED" && !input.autoMerge) return { run, awaitingHuman: true };
+    if (!hasDurableMergeProof && !mergedExactHead && input.autoMerge) {
       let admissionAttempt = 0;
       while (true) {
         const admission = await waitForAuthoritativeMergeGate({
@@ -240,9 +291,15 @@ export async function completeWorkItem(
           );
         }
         pullRequest = admission.pullRequest;
-        if (admission.alreadyMerged) break;
+        if (admission.alreadyMerged) {
+          throw new Error(`Pull request #${pullRequest.number} became MERGED without a durable merge checkpoint; refusing external merge`);
+        }
         throwIfAborted(input.signal);
         dependencies.leaseGuard?.assertValid();
+        const mergeAttemptProof = createMergeAttemptProof(pullRequest, admission.gate, run.targetBranch!);
+        const admitted = transition(run, "MERGE_ATTEMPT_RECORDED", { mergeAttempt: mergeAttemptProof });
+        await dependencies.runs.commit(run.version, admitted.state, admitted.record);
+        run = admitted.state;
         try {
           await dependencies.host.mergePullRequest(
             pullRequest.repo,
@@ -342,7 +399,7 @@ export async function completeWorkItem(
     }
 
     if (!alreadyMergedCheckpoint) {
-      const merged = transition(run, "MERGE_COMPLETED", { headSha: pullRequest.headSha });
+      const merged = transition(run, "MERGE_COMPLETED", { headSha: pullRequest.headSha, mergeAttempt: null });
       await dependencies.runs.commit(run.version, merged.state, merged.record);
       run = merged.state;
     } else {
@@ -356,19 +413,7 @@ export async function completeWorkItem(
         run.targetBranch!,
       );
     }
-    const issue = run.subject.issue;
-    if (!issue) throw new Error("work-on completion requires an issue subject");
-    const childIssues = [...new Set(input.childIssues ?? [])]
-      .filter((child) => Number.isSafeInteger(child) && child > 0 && child !== issue);
-    const terminalOutcomeId = deterministicOutcomeId(
-      run.runId,
-      run.subject,
-      `merged:pr:${pullRequest.number}:sha:${pullRequest.headSha}`,
-    );
-    const durableTerminal = (await dependencies.artifacts.list(run.subject, "Outcome"))
-      .find((artifact): artifact is DurableArtifact<"Outcome"> => artifact.kind === "Outcome" && artifact.id === terminalOutcomeId);
     if (durableTerminal) {
-      assertMatchingMergedOutcome(durableTerminal, run, pullRequest, childIssues);
       const completedChildren = new Set(durableTerminal.payload.childIssues.map(parseChildIssueReference));
       for (const childIssue of childIssues) {
         const observed = await readIssue(dependencies.host, run.subject.repo, childIssue);
@@ -524,14 +569,26 @@ export async function completeWorkItem(
   } catch (error) {
     if (input.signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
     const reason = error instanceof Error ? error.message : String(error);
+    if (error instanceof WorkflowExecutionError && error.recoverable) throw error;
     const externalRetry = retryableExternalWorkflowError(error, run);
     if (externalRetry) throw externalRetry;
     // MERGE_COMPLETED is already durable and the exact approved head was
     // proved authoritative. Transport exhaustion during comment/closure
     // projection must retain that closing checkpoint for resume, not strand
     // the delivery as an ordinary FAIL.
-    if (mergedExactHead && isRecoverableCompletionTransportFailure(error)) {
-      throw new WorkflowExecutionError(reason, run, { cause: error, recoverable: true });
+    if (isRecoverableCompletionTransportFailure(error)) {
+      // Preserve the current checkpoint for any transient host outage. Before
+      // merge this leaves the run in merging; after exact merge it retains the
+      // closing checkpoint. The typed classification lets schedulers retry
+      // without converting transport loss into a semantic FAIL/BLOCK.
+      const disposition = classifyRetryableError(error, { domain: "github" });
+      throw new WorkflowExecutionError(reason, run, {
+        cause: error,
+        recoverable: true,
+        retryDisposition: disposition.retryable
+          ? disposition
+          : { ...disposition, disposition: "retryable", retryable: true, code: "completion-transport" },
+      });
     }
     const failed = transition(run, "FAIL", { reason });
     await dependencies.runs.commit(run.version, failed.state, failed.record);
@@ -566,6 +623,10 @@ async function readMergeGate(
       expectedBaseBranch,
     );
   } catch (error) {
+    // A transient transport/API failure is not an authoritative unavailable
+    // gate. Preserve it for retry so a temporary outage cannot become a
+    // durable semantic merge blocker.
+    if (isRecoverableCompletionTransportFailure(error)) throw error;
     return unavailable(error instanceof Error ? error.message : String(error));
   }
 }
@@ -608,14 +669,10 @@ async function waitForAuthoritativeMergeGate(input: {
         input.expectedHeadSha,
         input.expectedBaseBranch,
       );
-      const mergedAssessment = assessMergeAdmission(revalidated, gate, input.policy);
-      return {
-        gate,
-        pullRequest: revalidated,
-        ...(mergedAssessment.ready ? { alreadyMerged: true as const } : {
-          terminalReason: `Merge admission is blocked: ${formatPullRequestCiBlock(mergedAssessment, input.policy.failureAction, "after")}`,
-        }),
-      };
+      // A merge observed while waiting for gate evidence is external to this
+      // invocation. Even a nonpassing gate cannot be converted into a blocked
+      // Outcome, because no durable merge attempt authorized that merge.
+      throw new Error(`Pull request #${revalidated.number} became MERGED during merge-gate polling without a durable merge checkpoint; refusing external merge`);
     }
     assertOpenPullRequestIdentity(revalidated, pullRequest.repo, pullRequest.number, input.expectedHeadSha, input.expectedBaseBranch);
     pullRequest = revalidated;
@@ -661,6 +718,62 @@ function assertMergeGateIdentity(
   }
   if (gate.baseBranch !== expectedBaseBranch) {
     throw new Error(`Merge admission target is stale: expected ${expectedBaseBranch}, gate observed ${gate.baseBranch}`);
+  }
+}
+
+function assertPullRequestRouteIdentity(
+  pullRequest: PullRequestSnapshot,
+  expectedRepo: string,
+  expectedNumber: number,
+): void {
+  if (pullRequest.repo.toLowerCase() !== expectedRepo.toLowerCase() || pullRequest.number !== expectedNumber) {
+    throw new Error(`Pull request identified ${pullRequest.repo}#${pullRequest.number}, expected ${expectedRepo}#${expectedNumber}`);
+  }
+}
+
+function createMergeAttemptProof(
+  pullRequest: PullRequestSnapshot,
+  gate: PullRequestMergeGate,
+  expectedBaseBranch: string,
+): MergeAttemptProof {
+  assertMergeGateIdentity(gate, pullRequest.repo, pullRequest.number, pullRequest.headSha, expectedBaseBranch);
+  return {
+    schema: "forgedock.merge-attempt/v1",
+    repo: pullRequest.repo,
+    pullRequest: pullRequest.number,
+    headSha: pullRequest.headSha,
+    baseBranch: expectedBaseBranch,
+    gate: structuredClone(gate),
+    admittedAt: new Date().toISOString(),
+  };
+}
+
+function assertMergeAttemptIdentity(
+  proof: MergeAttemptProof,
+  run: RunState,
+  expectedRepo: string,
+  expectedNumber: number,
+  expectedHeadSha: string,
+  expectedBaseBranch: string,
+  policy: EffectiveReviewCiConfig,
+): void {
+  if (proof.schema !== "forgedock.merge-attempt/v1"
+    || proof.repo.toLowerCase() !== expectedRepo.toLowerCase()
+    || proof.pullRequest !== expectedNumber
+    || proof.headSha !== expectedHeadSha
+    || proof.baseBranch !== expectedBaseBranch
+    || proof.repo.toLowerCase() !== run.subject.repo.toLowerCase()) {
+    throw new Error(`Durable merge attempt proof does not match ${expectedRepo}#${expectedNumber} at ${expectedHeadSha}`);
+  }
+  assertMergeGateIdentity(proof.gate, expectedRepo, expectedNumber, expectedHeadSha, expectedBaseBranch);
+  const assessment = assessMergeAdmission(
+    { number: expectedNumber, headBranch: "", baseBranch: expectedBaseBranch, headSha: expectedHeadSha },
+    proof.gate,
+    policy,
+    { productionTarget: expectedBaseBranch },
+  );
+  if (!assessment.ready) {
+    throw new Error(`Durable merge attempt proof is not an admitted merge gate for ${expectedRepo}#${expectedNumber}`);
   }
 }
 
@@ -717,9 +830,11 @@ function transientMergeGateReason(gate: PullRequestMergeGate): MergeGatePollProg
 }
 
 function isRecoverableCompletionTransportFailure(error: unknown): boolean {
+  const classification = classifyRetryableError(error, { domain: "github" });
+  if (classification.retryable) return true;
   const message = error instanceof Error ? error.message : String(error);
-  return /marker remains unresolved|HTTP (?:429|5\d{2})\b/i.test(message)
-    || /(?:ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|socket hang up|network timeout|TLS handshake timeout|temporarily unavailable|no server is currently available)/i.test(message);
+  return /marker remains unresolved|HTTP (?:408|425|429|5\d{2})\b/i.test(message)
+    || /(?:ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|EPIPE|ECONNABORTED|socket hang up|network timeout|TLS handshake timeout|temporarily unavailable|no server is currently available)/i.test(message);
 }
 
 function transientMergeAdmissionError(error: unknown): MergeGatePollProgress["reason"] | undefined {

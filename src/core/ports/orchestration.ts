@@ -40,11 +40,23 @@ export type OrchestrationRecoveryMode = "initial" | "resume" | "relaunch" | "rea
 /** Durable phases for the investigation-first native orchestrator. */
 export type OrchestrationPhase = "investigating" | "packetizing" | "executing";
 
+/** Exact durable identity binding a Build Packet to its investigation checkpoint. */
+export interface OrchestrationPacketIdentity {
+  nodeId: string;
+  packetId: string;
+  runId: string;
+  investigationId: string;
+  subject: { repo: string; issue: number };
+  baseSha: string;
+}
+
 export interface OrchestrationPacketRecord {
   nodeId: string;
   wave: number;
   status: "queued" | "running" | "completed" | "failed";
   attemptCount: number;
+  /** Optional only for legacy records; new completed records bind exact identity. */
+  identity?: OrchestrationPacketIdentity;
   packetId?: string;
   expectedPaths?: string[];
   semanticDependencies?: string[];

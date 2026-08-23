@@ -8,6 +8,7 @@ import { createRun, transition, type RunState, type TransitionEvent } from "../.
 import { AgentRunError, type AgentEventSink, type AgentRunResult, type AgentRuntime, type AgentTask, type RuntimeCapabilities } from "../../runtime/agent-runtime.js";
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import { computeReviewPlanId, planReviewPanel, type ReviewPlan, type ReviewPlanContext } from "./planner.js";
+import { reconcileFindingRootLedger } from "./finding-root-ledger.js";
 import { isTransientReviewerTransportFailure, materializeReviewFindings, renderReviewerSubmissionComment, renderReviewerWaveComment, resolveFindingIssuePolicy, resolveReviewerAttemptTimeoutMs, resumeReviewFindingProjection, reviewPullRequest, ReviewerSubmissionSchema, selectReviewerRoles, type ReviewerSubmission } from "./review.js";
 
 const sha = "a".repeat(40);
@@ -18,6 +19,8 @@ class FakeHost implements ForgeHost {
   comments: Array<{ marker: string; body: string }> = [];
   findingIssues: Array<{ finding: { id: string }; reviewerRoles: readonly string[] }> = [];
   reconciliations: Array<{ activeFindings: readonly { id: string }[] }> = [];
+  projectedOpenFindingIds = new Set<string>();
+  closedProjectedFindingIds: string[] = [];
   remediationDeltaPaths: readonly string[] = ["src/lock.ts"];
   remediationDeltaHunks: readonly string[] = ["src/lock.ts:L1-L1"];
   remediationDeltaRequests: Array<{ baseSha: string; headSha: string }> = [];
@@ -53,12 +56,19 @@ class FakeHost implements ForgeHost {
   }
   async materializeReviewFinding(input: { finding: { id: string }; reviewerRoles: readonly string[] }) {
     this.findingIssues.push(input);
+    this.projectedOpenFindingIds.add(input.finding.id);
     this.events?.push(`issue:${input.finding.id}`);
     const number = 100 + this.findingIssues.length;
     return { repo: pr.repo, number, title: input.finding.id, body: "", url: `https://github.test/a/b/issues/${number}`, state: "OPEN" as const };
   }
   async reconcileReviewFindings(input: { activeFindings: readonly { id: string }[] }): Promise<readonly number[]> {
     this.reconciliations.push(input);
+    const activeIds = new Set(input.activeFindings.map(({ id }) => id));
+    for (const findingId of this.projectedOpenFindingIds) {
+      if (activeIds.has(findingId)) continue;
+      this.projectedOpenFindingIds.delete(findingId);
+      this.closedProjectedFindingIds.push(findingId);
+    }
     return [];
   }
   async mergePullRequest(): Promise<void> {}
@@ -134,6 +144,32 @@ const followUpAdjudication = (task: AgentTask<unknown>) => ({
     findingId: match[1]!, disposition: "follow_up", rationale: "Requires a new adjacent protocol guarantee.",
   })),
 });
+
+function priorRootArtifacts(
+  run: RunState,
+  packet: DurableArtifact<"BuildPacket">,
+  finding: DurableArtifact<"ReviewVerdict">["payload"]["findings"][number],
+  headSha: string,
+) {
+  const roots = reconcileFindingRootLedger({ packet, findings: [finding], headSha });
+  const linkedFinding = { ...finding, rootId: roots[0]!.rootId };
+  const reviewPlan = planReviewPanel({
+    changedPaths: ["src/lock.ts"], diff: "+work();", packet,
+    context: reviewPlanContext(run, headSha),
+  });
+  const priorVerdict = createArtifact({
+    kind: "ReviewVerdict", runId: run.runId, subject: { ...run.subject, pr: pr.number }, producer: { role: "controller" },
+    payload: {
+      headSha, headBranch: "fix", baseBranch: "main", disposition: "request_changes",
+      reviewerRoles: ["correctness"], findings: [linkedFinding], checks: [], reviewPlan,
+    },
+  });
+  const ledger = createArtifact({
+    kind: "FindingRootLedger", runId: run.runId, subject: { ...run.subject, pr: pr.number }, producer: { role: "controller" },
+    payload: { checkpoint: "finding-root-ledger", pullRequest: pr.number, headSha, epoch: 1, roots },
+  });
+  return { priorVerdict, ledger, rootId: roots[0]!.rootId };
+}
 
 describe("fresh-context PR review", () => {
   it("blocks closure when a blocking finding has stale source proof", async () => {
@@ -466,6 +502,101 @@ describe("fresh-context PR review", () => {
     }, { runtime, host, artifacts: new InMemoryArtifactRepository(), runs }), /newly pushed pull-request revision/);
     assert.equal(runtime.tasks.length, 0);
     assert.equal(host.findingIssues.length, 0);
+  });
+
+  it("blocks a new-head clean review when a prior root is omitted", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const packet = { ...context.packet, payload: { ...context.packet.payload, risks: [] } };
+    const oldHead = "b".repeat(40);
+    const newHead = "c".repeat(40);
+    const priorFinding = {
+      ...inScope, id: "prior-root", title: "Prior root remains unresolved", severity: "high" as const, confidence: "high" as const,
+      evidence: "The prior guard is incomplete.", location: "src/lock.ts:1", intentRelevance: "The frozen criterion is not met.", remediation: "Complete the guard.",
+      mustFix: true, blocking: true, reviewerRoles: ["correctness" as const],
+      sourceSnapshot: { reviewedHeadSha: oldHead, path: "src/lock.ts", excerpt: "lock" },
+    };
+    const prior = priorRootArtifacts(run, packet, priorFinding, oldHead);
+    const store = new InMemoryArtifactRepository();
+    await store.append(prior.ledger);
+    const nextPullRequest = { ...pr, headSha: newHead };
+    const buildResult = { ...context.buildResult, payload: { ...context.buildResult.payload, headSha: newHead } };
+    const host = new FakeHost();
+    host.projectedOpenFindingIds.add("prior-root");
+    host.snapshots = [nextPullRequest, nextPullRequest, nextPullRequest, nextPullRequest];
+    const result = await reviewPullRequest({
+      run, pullRequest: nextPullRequest, intent: context.intent, investigation: context.investigation,
+      packet, buildResult, priorVerdict: prior.priorVerdict, workspace: process.cwd(), readExactBlob: sourceBlob,
+    }, { runtime: new FakeAgentRuntime([clean, clean]), host, artifacts: store, runs });
+
+    assert.equal(result.verdict.payload.disposition, "blocked");
+    assert.equal(result.verdict.payload.findings.some(({ id }) => id === "prior-root"), false, "stale representative must not be re-admitted");
+    assert.deepEqual(host.reconciliations, [], "blocked omission must not stale-close projected roots");
+    assert.deepEqual([...host.projectedOpenFindingIds], ["prior-root"]);
+    assert.deepEqual(host.closedProjectedFindingIds, []);
+    const ledgers = await store.list({ repo: "a/b", issue: 2, pr: pr.number }, "FindingRootLedger");
+    const latestLedger = ledgers.at(-1);
+    assert.equal(latestLedger?.kind, "FindingRootLedger");
+    assert.equal(latestLedger?.kind === "FindingRootLedger" ? latestLedger.payload.roots[0]?.state : undefined, "fix-attempted");
+  });
+
+  for (const status of ["fixed", "rejected"] as const) {
+    it(`allows same-head reassessment only after an explicit ${status} root assessment`, async () => {
+      const runs = new InMemoryRunRepository();
+      const run = await reviewingRun(runs);
+      const context = artifacts(run);
+      const packet = { ...context.packet, payload: { ...context.packet.payload, risks: [] } };
+      const priorFinding = {
+        ...inScope, id: `prior-${status}`, title: `Prior ${status} root`, severity: "high" as const, confidence: "high" as const,
+        evidence: "The prior guard is incomplete.", location: "src/lock.ts:1", intentRelevance: "The frozen criterion is not met.", remediation: "Complete the guard.",
+        mustFix: true, blocking: true, reviewerRoles: ["correctness" as const],
+      };
+      const prior = priorRootArtifacts(run, packet, priorFinding, sha);
+      const store = new InMemoryArtifactRepository();
+      await store.append(prior.ledger);
+      const host = new FakeHost();
+      host.projectedOpenFindingIds.add(`prior-${status}`);
+      const submission = (task: AgentTask<unknown>) => ({
+        summary: `Explicit ${status} assessment at ${sha}`,
+        findings: [],
+        rootAssessments: [...new Set(task.objective.match(/root-[a-f0-9]{20}/g) ?? [])].map((rootId) => ({
+          rootId, status, evidence: `Current-head ${sha} evidence supports ${status}.`,
+        })),
+      });
+      const result = await reviewPullRequest({
+        run, pullRequest: pr, intent: context.intent, investigation: context.investigation,
+        packet, buildResult: context.buildResult, priorVerdict: prior.priorVerdict, allowSameHeadReassessment: true,
+        workspace: process.cwd(), readExactBlob: sourceBlob,
+      }, { runtime: new FakeAgentRuntime([submission, submission]), host, artifacts: store, runs });
+
+      assert.equal(result.verdict.payload.disposition, "approve");
+      assert.deepEqual(host.closedProjectedFindingIds, [`prior-${status}`]);
+      assert.deepEqual([...host.projectedOpenFindingIds], []);
+      const ledgers = await store.list({ repo: "a/b", issue: 2, pr: pr.number }, "FindingRootLedger");
+      const latestLedger = ledgers.at(-1);
+      assert.equal(latestLedger?.kind, "FindingRootLedger");
+      assert.equal(latestLedger?.kind === "FindingRootLedger" ? latestLedger.payload.roots[0]?.state : undefined, status);
+    });
+  }
+
+  it("blocks same-head reassessment when prior root-ledger authority is missing", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const packet = { ...context.packet, payload: { ...context.packet.payload, risks: [] } };
+    const priorFinding = {
+      ...inScope, id: "missing-ledger-root", title: "Prior root", severity: "high" as const, confidence: "high" as const,
+      evidence: "The prior guard is incomplete.", location: "src/lock.ts:1", intentRelevance: "The frozen criterion is not met.", remediation: "Complete the guard.",
+      mustFix: true, blocking: true, reviewerRoles: ["correctness" as const],
+    };
+    const prior = priorRootArtifacts(run, packet, priorFinding, sha);
+    const result = await reviewPullRequest({
+      run, pullRequest: pr, intent: context.intent, investigation: context.investigation,
+      packet, buildResult: context.buildResult, priorVerdict: prior.priorVerdict, allowSameHeadReassessment: true,
+      workspace: process.cwd(), readExactBlob: sourceBlob,
+    }, { runtime: new FakeAgentRuntime([clean, clean]), host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs });
+    assert.equal(result.verdict.payload.disposition, "blocked");
   });
 
   it("threads an exact host-observed prior-SHA remediation delta into continuity policy", async () => {

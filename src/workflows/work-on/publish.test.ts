@@ -81,7 +81,7 @@ describe("PR publication", () => {
     const run = await publishingRun(runs);
     const intent = createArtifact({ kind: "Intent", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: [], dependencies: [] } });
     const packet = createArtifact({ kind: "BuildPacket", runId: run.runId, subject: run.subject, producer: { role: "packet-author" }, payload: { scope: ["Fix"], acceptanceCriteria: ["Pass"], context: [], implementationPlan: ["Edit"], expectedPaths: ["src/a.ts"], verificationPlan: ["npm test"], risks: [], outOfScope: [] } });
-    const buildResult = createArtifact({ kind: "BuildResult", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { branch: workspace.branch, headSha: sha, changedPaths: ["src/a.ts"], summary: "Fixed", acceptanceEvidence: [{ criterion: "Pass", status: "passed", evidence: "test" }], checks: [{ command: "npm test", status: "passed", durationMs: 1 }], decisions: [], residualRisks: [] } });
+    const buildResult = createArtifact({ kind: "BuildResult", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { branch: workspace.branch, baseSha: sha, headSha: sha, changedPaths: ["src/a.ts"], summary: "Fixed", acceptanceEvidence: [{ criterion: "Pass", status: "passed", evidence: "test" }], checks: [{ command: "npm test", status: "passed", durationMs: 1 }], decisions: [], residualRisks: [] } });
     const git = new PublishGit(); const host = new PublishHost();
     const result = await publishPullRequest({ run, intent, packet, buildResult, workspace }, { git, host, runs });
     assert.equal(result.run.state, "reviewing");
@@ -112,7 +112,7 @@ describe("PR publication", () => {
     const run = await publishingRun(runs);
     const intent = createArtifact({ kind: "Intent", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: [], dependencies: [] } });
     const packet = createArtifact({ kind: "BuildPacket", runId: run.runId, subject: run.subject, producer: { role: "packet-author" }, payload: { scope: ["Fix"], acceptanceCriteria: ["Pass"], context: [], implementationPlan: ["Edit"], expectedPaths: ["src/a.ts"], verificationPlan: ["npm test"], risks: [], outOfScope: [] } });
-    const buildResult = createArtifact({ kind: "BuildResult", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { branch: workspace.branch, headSha: sha, changedPaths: ["src/a.ts"], summary: "Fixed", acceptanceEvidence: [], checks: [], decisions: [], residualRisks: [] } });
+    const buildResult = createArtifact({ kind: "BuildResult", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { branch: workspace.branch, baseSha: sha, headSha: sha, changedPaths: ["src/a.ts"], summary: "Fixed", acceptanceEvidence: [], checks: [], decisions: [], residualRisks: [] } });
     const git = new PublishGit();
     git.observedHead = "a".repeat(40);
     await assert.rejects(
@@ -127,7 +127,7 @@ describe("PR publication", () => {
     const run = await publishingRun(runs);
     const intent = createArtifact({ kind: "Intent", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: [], dependencies: [] } });
     const packet = createArtifact({ kind: "BuildPacket", runId: run.runId, subject: run.subject, producer: { role: "packet-author" }, payload: { scope: ["Fix"], acceptanceCriteria: ["Pass"], context: [], implementationPlan: ["Edit"], expectedPaths: ["src/a.ts"], verificationPlan: ["npm test"], risks: [], outOfScope: [] } });
-    const buildResult = createArtifact({ kind: "BuildResult", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { branch: workspace.branch, headSha: sha, changedPaths: ["src/a.ts"], summary: "Fixed", acceptanceEvidence: [], checks: [], decisions: [], residualRisks: [] } });
+    const buildResult = createArtifact({ kind: "BuildResult", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { branch: workspace.branch, baseSha: sha, headSha: sha, changedPaths: ["src/a.ts"], summary: "Fixed", acceptanceEvidence: [], checks: [], decisions: [], residualRisks: [] } });
     const host = new PublishHost();
     host.existing = { repo: "a/b", number: 3, title: "Fix", body: "existing", url: "https://github.test/pr/3", state: "OPEN", headSha: "c".repeat(40), headBranch: workspace.branch, baseBranch: "main" };
     const result = await publishPullRequest({ run, intent, packet, buildResult, workspace }, { git: new PublishGit(), host, runs });
@@ -139,7 +139,7 @@ describe("PR publication", () => {
   it("reconciles a crash after PR creation before the publication transition commits", async () => {
     const intentPayload = { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: [], dependencies: [] };
     const packetPayload = { scope: ["Fix"], acceptanceCriteria: ["Pass"], context: [], implementationPlan: ["Edit"], expectedPaths: ["src/a.ts"], verificationPlan: ["npm test"], risks: [], outOfScope: [] };
-    const buildPayload = { branch: workspace.branch, headSha: sha, changedPaths: ["src/a.ts"], summary: "Fixed", acceptanceEvidence: [], checks: [], decisions: [], residualRisks: [] };
+    const buildPayload = { branch: workspace.branch, baseSha: sha, headSha: sha, changedPaths: ["src/a.ts"], summary: "Fixed", acceptanceEvidence: [], checks: [], decisions: [], residualRisks: [] };
     const firstRuns = new FailOncePublicationCommitRepository();
     const firstRun = await publishingRun(firstRuns);
     const firstIntent = createArtifact({ kind: "Intent", runId: firstRun.runId, subject: firstRun.subject, producer: { role: "controller" }, payload: intentPayload });
@@ -168,7 +168,7 @@ describe("PR publication", () => {
     const run = await publishingRun(runs);
     const intent = createArtifact({ kind: "Intent", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: [], dependencies: [] } });
     const packet = createArtifact({ kind: "BuildPacket", runId: run.runId, subject: run.subject, producer: { role: "packet-author" }, payload: { scope: ["Fix"], acceptanceCriteria: ["Pass"], context: [], implementationPlan: ["Edit"], expectedPaths: ["src/a.ts"], verificationPlan: ["npm test"], risks: [], outOfScope: [] } });
-    const buildResult = createArtifact({ kind: "BuildResult", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { branch: workspace.branch, headSha: sha, changedPaths: ["src/a.ts"], summary: "Fixed", acceptanceEvidence: [], checks: [], decisions: [], residualRisks: [] } });
+    const buildResult = createArtifact({ kind: "BuildResult", runId: run.runId, subject: run.subject, producer: { role: "controller" }, payload: { branch: workspace.branch, baseSha: sha, headSha: sha, changedPaths: ["src/a.ts"], summary: "Fixed", acceptanceEvidence: [], checks: [], decisions: [], residualRisks: [] } });
     const host = new PublishHost();
     host.existing = { repo: "a/b", number: 3, title: "Fix", body: "existing", url: "https://github.test/pr/3", state: "OPEN", headSha: sha, headBranch: workspace.branch, baseBranch: "milestone/other" };
     const git = new PublishGit();
@@ -191,7 +191,7 @@ describe("PR publication", () => {
     const buildResult = createArtifact({
       kind: "BuildResult", runId, subject: packet.subject, producer: { role: "controller" },
       payload: {
-        branch: workspace.branch, headSha: sha,
+        branch: workspace.branch, baseSha: sha, headSha: sha,
         changedPaths: Array.from({ length: 100 }, (_, index) => `docs/${index}-${"p".repeat(1_000)}.md`), summary: "s".repeat(70_000),
         acceptanceEvidence: Array.from({ length: 100 }, (_, index) => ({ criterion: `criterion ${index} ${"y".repeat(2_000)}`, status: "passed" as const, evidence: "e".repeat(2_000) })),
         checks: Array.from({ length: 100 }, (_, index) => ({ command: `check-${index} ${"c".repeat(2_000)}`, status: "passed" as const, durationMs: 1, summary: "o".repeat(2_000) })),

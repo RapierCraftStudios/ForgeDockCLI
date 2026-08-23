@@ -29,6 +29,7 @@ import type {
   OrchestrationWorkerAttemptStatus,
   OrchestrationInvestigationOutcome,
   OrchestrationInvestigationRecord,
+  OrchestrationPacketIdentity,
   OrchestrationPacketRecord,
   OrchestrationShadowContractionProposal,
 } from "../../core/ports/orchestration.js";
@@ -54,7 +55,7 @@ import {
   rateLimitWindowKey,
 } from "./scheduler.js";
 import { buildOrchestrationSnapshot } from "./view-model.js";
-import { compileExecutionDag } from "./packet-wave.js";
+import { compileExecutionDag, normalizePacketPaths, normalizeSemanticDependencies } from "./packet-wave.js";
 
 export interface CreateOrchestrationInput {
   orchestrationId?: string;
@@ -95,6 +96,7 @@ export type OrchestrationInvestigationWorker = (
 
 export interface OrchestrationPacketResult {
   packetId?: string;
+  identity?: OrchestrationPacketIdentity;
   expectedPaths: readonly string[];
   semanticDependencies: readonly string[];
   baseSha: string;
@@ -321,6 +323,10 @@ interface PersistenceState {
   deferredStartedEvents: Array<{ itemId: string }>;
   signal?: AbortSignal;
   error?: unknown;
+  /** Non-durable transport source retained so fixed getters are not re-read. */
+  transportCapacitySource?: number | (() => number | Promise<number>);
+  /** Raw transport sample captured before scheduler issue-slot capping. */
+  sampledTransportCapacity?: number;
 }
 
 type PreparedAction =
@@ -589,11 +595,13 @@ export class OrchestrationController {
         signal,
       };
       control.state = state;
-      const dynamicTransportCapacity = typeof this.dependencies.transportCapacity === "function";
+      const transportCapacitySource = this.dependencies.transportCapacity;
+      const dynamicTransportCapacity = typeof transportCapacitySource === "function";
       // A live transport can be temporarily out of slots. Keep the durable
       // run admitted with an effective cap of zero and let the scheduler
       // backpressure queued work until a later sample is available.
       const transportCapacity = await this.resolveTransportCapacity(dynamicTransportCapacity);
+      state.transportCapacitySource = transportCapacitySource;
       const effectiveMaxParallel = Math.min(state.record.maxParallel, transportCapacity);
       this.replaceRecord(state, {
         ...state.record,
@@ -632,25 +640,16 @@ export class OrchestrationController {
       let schedule: ScheduleResult = scheduleResultFromRecord(state.record, []);
       let pass = prepared;
       while (pass.items.length) {
-        const observeTransportCapacity = (capacity: number): void => {
-          // This is intentionally an in-memory observation. The next
-          // controller checkpoint (attempt, heartbeat, worker transition, or
-          // final snapshot) persists it without writing once per poll tick.
-          executionState.record.effectiveMaxParallel = Math.min(executionState.record.maxParallel, capacity);
-        };
         const current = await runSchedule(
           pass.items,
           state.record.maxParallel,
           (item, schedulerContext) => this.executePreparedWorker(executionState, item, schedulerContext, pass.actions.get(item.id)),
           {
-            capacity: dynamicTransportCapacity
-              ? async () => {
-                  const capacity = await this.resolveTransportCapacity(true);
-                  executionState.record.transportCapacity = capacity;
-                  return capacity;
-                }
-              : transportCapacity,
-            onCapacityObserved: observeTransportCapacity,
+            // Keep the requested issue-slot ceiling as the scheduler's valid
+            // bound. A live transport sample of zero is represented by the
+            // capacity source and must backpressure queued work rather than
+            // turning maxParallel into the invalid value zero.
+            ...this.schedulerCapacity(executionState),
             ...(signal !== undefined ? { signal } : {}),
             serializationEdges: pass.serializationEdges,
             resumedItemIds: pass.resumedItemIds,
@@ -748,7 +747,7 @@ export class OrchestrationController {
     const startedAt = Date.now();
     const current = await runSchedule(
       items,
-      state.record.effectiveMaxParallel ?? state.record.maxParallel,
+      state.record.maxParallel,
       async (item, schedulerContext) => {
         const attempt = await this.beginAttempt(state, item.id, "initial");
         activeInvestigations += 1;
@@ -805,7 +804,19 @@ export class OrchestrationController {
         activeInvestigations -= 1;
         return { status: result.outcome === "confirmed" ? "completed" : result.outcome === "invalid" ? "invalid" : "skipped", ...(result.childIssues ? { childIssues: result.childIssues } : {}) };
       },
-      { serializationEdges: [] },
+      {
+        // Investigation workers use the same live transport admission as
+        // mutation workers. Keep maxParallel valid even when the sample is
+        // zero; runSchedule will wait and poll for recovery.
+        ...this.schedulerCapacity(state),
+        ...(state.signal !== undefined ? { signal: state.signal } : {}),
+        serializationEdges: [],
+        onEvent: (event) => {
+          if (event.type === "queued" && event.waitReasons?.size) {
+            this.handleScheduleEvent(state, event, new Map());
+          }
+        },
+      },
     );
     this.applyScheduleResult(state, current);
     const latest = [...(state.record.investigations ?? [])].filter((entry) => entry.wave === wave);
@@ -872,13 +883,18 @@ export class OrchestrationController {
     assertInvestigationActive();
     let nextItems = materialized.items.map(cloneScheduledItem);
     let nextEdges = (materialized.serializationEdges ?? materializeClaimDependencies(nextItems).edges).map(cloneSerializationEdge);
-    if (this.dependencies.packetWorker && state.record.packets?.length) {
+    if (this.dependencies.packetWorker && nextItems.length) {
+      const durablePackets = state.record.packets;
+      if (!durablePackets) throw new Error("Packet barrier has no durable packet records");
+      const packetsByNode = indexPacketRecords(durablePackets, state.record.nodes);
       const confirmedPacketIds = new Set(nextItems.map((candidate) => candidate.id));
       const packetInputs = nextItems.map((item) => {
-        const packet = state.record.packets?.find((candidate) => candidate.nodeId === item.id && candidate.status === "completed");
-        if (!packet?.expectedPaths?.length || !packet.baseSha) throw new Error(`Packet barrier has no completed packet for ${item.id}`);
+        const packet = packetsByNode.get(item.id);
+        if (packet?.status !== "completed" || !packet.expectedPaths?.length || !packet.baseSha) {
+          throw new Error(`Packet barrier has no completed packet for ${item.id}`);
+        }
         if (packet.semanticDependencies === undefined) throw new Error(`Packet ${item.id} lacks authoritative semantic dependency evidence`);
-        const semanticDependencies = [...new Set(packet.semanticDependencies)];
+        const semanticDependencies = normalizeSemanticDependencies(packet.semanticDependencies);
         if (semanticDependencies.some((dependency) => !confirmedPacketIds.has(dependency))) {
           throw new Error(`Packet ${item.id} references unknown semantic dependency`);
         }
@@ -961,49 +977,110 @@ export class OrchestrationController {
     const worker = this.dependencies.packetWorker;
     if (!worker) return;
     const packets = state.record.packets ?? [];
-    const byNode = new Map(packets.filter((packet) => packet.wave === wave).map((packet) => [packet.nodeId, packet]));
+    // Packet identity is the durable node identity. A node may belong to only
+    // one investigation wave; accepting a duplicate would let a stale packet
+    // preview win a later update and would make the union non-CAS-like.
+    const byNode = indexPacketRecords(packets, state.record.nodes);
+    const packetForNode = (nodeId: string): OrchestrationPacketRecord | undefined => byNode.get(nodeId);
+    const packetSnapshot = (): OrchestrationPacketRecord[] => [...byNode.values()].map((packet) => structuredClone(packet));
     const confirmed = investigations.filter((entry) => entry.status === "completed" && entry.outcome === "confirmed");
-    const pending = confirmed.filter((entry) => byNode.get(entry.nodeId)?.status !== "completed");
+    const pending: OrchestrationInvestigationRecord[] = [];
+    for (const entry of confirmed) {
+      const packet = packetForNode(entry.nodeId);
+      if (packet?.status !== "completed") {
+        pending.push(entry);
+        continue;
+      }
+      const item = itemFromNodeRecord(requiredNode(state.record, entry.nodeId));
+      try {
+        assertReusablePacketRecord(packet, entry, item, wave);
+      } catch {
+        // Legacy, stale, or contradictory packet evidence is never reused.
+        // Repacketize it under the current investigation checkpoint.
+        byNode.set(entry.nodeId, {
+          nodeId: entry.nodeId,
+          wave,
+          status: "queued",
+          attemptCount: packet.attemptCount,
+        });
+        pending.push(entry);
+      }
+    }
+    const pendingIds = new Set(pending.map((entry) => entry.nodeId));
     this.replaceRecord(state, {
       ...state.record,
       phase: "packetizing",
+      nodes: state.record.nodes.map((node) => {
+        if (!pendingIds.has(node.id)) return node;
+        const { error: _error, waitReason: _waitReason, ...rest } = node;
+        return { ...rest, status: "queued" as const };
+      }),
       packetWave: wave,
       packetBarrier: {
         ...(state.record.packetBarrier ?? { expected: confirmed.length, completed: 0, startedAt: this.now() }),
         expected: confirmed.length,
-        completed: confirmed.filter((entry) => byNode.get(entry.nodeId)?.status === "completed").length,
+        // This count is deliberately scoped to the current wave. The packet
+        // array itself is a monotonic all-wave union.
+        completed: confirmed.filter((entry) => packetForNode(entry.nodeId)?.status === "completed").length,
       },
       updatedAt: this.now(),
     });
     await this.flush(state);
-    const confirmedIds = new Set((state.record.investigations ?? [])
+    const allInvestigations = state.record.investigations ?? [];
+    const confirmedIds = new Set(allInvestigations
       .filter((entry) => entry.status === "completed" && entry.outcome === "confirmed")
       .map((entry) => entry.nodeId));
+    const currentConfirmedIds = new Set(confirmed.map((entry) => entry.nodeId));
+    const knownInvestigationIds = new Set(allInvestigations.map((entry) => entry.nodeId));
+    const packetWorkerItems = new Map<string, ScheduledWorkItem>();
     const packetItems = pending.map((entry) => {
       const item = itemFromNodeRecord(requiredNode(state.record, entry.nodeId));
+      // The packet worker must see confirmed dependencies from prior waves so
+      // its authoritative semantic evidence can retain them. The scheduler
+      // only sees dependencies that still need admission in this wave;
+      // completed prior/current packets are external satisfied predecessors.
+      const confirmedDependencies = [...new Set(item.dependencies.filter((dependency) => {
+        if (confirmedIds.has(dependency)) return true;
+        if (knownInvestigationIds.has(dependency)) return false;
+        throw new Error(`Packet ${item.id} references unknown investigation dependency ${dependency}`);
+      }))];
+      packetWorkerItems.set(item.id, { ...item, dependencies: confirmedDependencies, claims: [] });
       return {
         ...item,
-        dependencies: item.dependencies.filter((dependency) => confirmedIds.has(dependency)),
+        dependencies: confirmedDependencies.filter((dependency) => currentConfirmedIds.has(dependency) && pendingIds.has(dependency)),
         claims: [],
       };
     });
     const current = await runSchedule(
       packetItems,
-      state.record.effectiveMaxParallel ?? state.record.maxParallel,
+      state.record.maxParallel,
       async (item, schedulerContext) => {
         assertActive();
         const investigation = investigations.find((entry) => entry.nodeId === item.id);
         if (!investigation) throw new Error(`Packet ${item.id} has no investigation evidence`);
-        const previous = byNode.get(item.id);
+        const workerItem = packetWorkerItems.get(item.id);
+        if (!workerItem) throw new Error(`Packet ${item.id} has no packet worker input`);
+        const previous = packetForNode(item.id);
+        const {
+          error: _previousError,
+          completedAt: _previousCompletedAt,
+          packetId: _previousPacketId,
+          identity: _previousIdentity,
+          expectedPaths: _previousExpectedPaths,
+          semanticDependencies: _previousSemanticDependencies,
+          baseSha: _previousBaseSha,
+          ...previousWithoutTerminal
+        } = previous ?? { nodeId: item.id, wave, status: "queued" as const, attemptCount: 0 };
         const packet: OrchestrationPacketRecord = {
-          ...(previous ?? { nodeId: item.id, wave, status: "queued", attemptCount: 0 }),
+          ...previousWithoutTerminal,
+          nodeId: item.id,
           wave,
           status: "running",
           attemptCount: (previous?.attemptCount ?? 0) + 1,
           startedAt: this.now(),
         };
         byNode.set(item.id, packet);
-        this.replaceRecord(state, { ...state.record, packets: [...byNode.values()], updatedAt: this.now() });
+        this.replaceRecord(state, { ...state.record, packets: packetSnapshot(), updatedAt: this.now() });
         await this.flush(state);
         const attempt = await this.beginAttempt(state, item.id, "initial");
         const context = this.workerContext(state, item, schedulerContext, attempt.attemptId, "initial") as OrchestrationPacketWorkerContext;
@@ -1012,39 +1089,62 @@ export class OrchestrationController {
         context.investigation = structuredClone(investigation);
         context.assertActive = assertActive;
         try {
-          const result = await worker(item, context);
+          const result = await worker(workerItem, context);
           assertActive();
           const paths = normalizePacketPaths(result.expectedPaths);
           if (!paths.length) throw new Error(`Packet ${item.id} has no bounded expected paths`);
           if (!result.baseSha.trim()) throw new Error(`Packet ${item.id} has no exact base SHA`);
-          const semanticDependencies = [...new Set(result.semanticDependencies)];
+          if (result.semanticDependencies === undefined || !Array.isArray(result.semanticDependencies)) {
+            throw new Error(`Packet ${item.id} lacks authoritative semantic dependency evidence`);
+          }
+          const semanticDependencies = normalizeSemanticDependencies(result.semanticDependencies);
           if (semanticDependencies.some((dependency) => !confirmedIds.has(dependency))) {
             throw new Error(`Packet ${item.id} references unknown semantic dependency`);
           }
+          const packetId = result.packetId ?? result.identity?.packetId;
+          const expectedIdentity = packetId && investigation.runId && investigation.investigationArtifactId
+            ? packetIdentityFor(item, investigation, packetId, result.baseSha)
+            : undefined;
+          const identity = result.identity === undefined
+            ? expectedIdentity
+            : assertPacketIdentity(result.identity, expectedIdentity, item.id);
           const completed: OrchestrationPacketRecord = {
             ...packet, status: "completed",
-            ...(result.packetId !== undefined ? { packetId: result.packetId } : {}),
+            ...(packetId !== undefined ? { packetId } : {}),
+            ...(identity !== undefined ? { identity } : {}),
             expectedPaths: paths, semanticDependencies, baseSha: result.baseSha,
             completedAt: this.now(),
           };
           byNode.set(item.id, completed);
-          this.replaceRecord(state, { ...state.record, packets: [...byNode.values()], updatedAt: this.now() });
+          this.replaceRecord(state, { ...state.record, packets: packetSnapshot(), updatedAt: this.now() });
           await this.flush(state);
           await this.finishAttempt(state, item.id, attempt.attemptId, { status: "completed" });
           return { status: "completed" as const };
         } catch (error) {
           const failed: OrchestrationPacketRecord = { ...packet, status: "failed", error: error instanceof Error ? error.message : String(error) };
           byNode.set(item.id, failed);
-          this.replaceRecord(state, { ...state.record, packets: [...byNode.values()], updatedAt: this.now() });
+          this.replaceRecord(state, { ...state.record, packets: packetSnapshot(), updatedAt: this.now() });
           await this.flush(state);
           await this.failAttempt(state, item.id, attempt.attemptId, error);
           throw error;
         }
       },
-      { serializationEdges: [] },
+      {
+        ...this.schedulerCapacity(state),
+        ...(state.signal !== undefined ? { signal: state.signal } : {}),
+        serializationEdges: [],
+        // Packet scheduling has no mutation launch action, but queued wait
+        // projections (especially zero transport capacity) still belong in
+        // the durable node record.
+        onEvent: (event) => {
+          if (event.type === "queued" && event.waitReasons?.size) {
+            this.handleScheduleEvent(state, event, new Map());
+          }
+        },
+      },
     );
     this.applyScheduleResult(state, current);
-    const completed = confirmed.filter((entry) => byNode.get(entry.nodeId)?.status === "completed").length;
+    const completed = confirmed.filter((entry) => packetForNode(entry.nodeId)?.status === "completed").length;
     this.replaceRecord(state, {
       ...state.record,
       phase: "packetizing",
@@ -1053,11 +1153,15 @@ export class OrchestrationController {
         completed,
         ...(completed === confirmed.length ? { completedAt: this.now() } : {}),
       },
-      packets: [...byNode.values()],
+      packets: packetSnapshot(),
       updatedAt: this.now(),
     });
     await this.flush(state);
-    if (completed !== confirmed.length) throw new Error(`Packet barrier failed for wave ${wave}`);
+    if (completed !== confirmed.length) {
+      const packetFailure = current.errors.values().next().value as Error | undefined;
+      throw packetFailure ?? new Error(`Packet barrier failed for wave ${wave}`);
+    }
+
   }
 
   private updateInvestigationBarrier(state: PersistenceState, wave: number): void {
@@ -2432,8 +2536,43 @@ export class OrchestrationController {
     if (state.error !== undefined) throw state.error;
   }
 
-  private async resolveTransportCapacity(allowZero = false): Promise<number> {
-    const source = this.dependencies.transportCapacity;
+  private schedulerCapacity(state: PersistenceState): {
+    capacity: number | (() => number | Promise<number>);
+    onCapacityObserved: (capacity: number) => void;
+  } {
+    const source = state.transportCapacitySource ?? this.dependencies.transportCapacity;
+    const capacity = typeof source === "function"
+      ? async (): Promise<number> => {
+          state.sampledTransportCapacity = 0;
+          const sampled = await source();
+          state.sampledTransportCapacity = sampled;
+          return sampled;
+        }
+      : source;
+    return {
+      capacity,
+      onCapacityObserved: (observed) => {
+        const raw = typeof source === "number"
+          ? source
+          : (Number.isSafeInteger(state.sampledTransportCapacity) && state.sampledTransportCapacity! >= 0
+            ? state.sampledTransportCapacity!
+            : observed);
+        const effectiveMaxParallel = Math.min(state.record.maxParallel, observed);
+        if (state.record.transportCapacity === raw && state.record.effectiveMaxParallel === effectiveMaxParallel) return;
+        this.replaceRecord(state, {
+          ...state.record,
+          transportCapacity: raw,
+          effectiveMaxParallel,
+          updatedAt: this.now(),
+        });
+      },
+    };
+  }
+
+  private async resolveTransportCapacity(
+    allowZero = false,
+    source: number | (() => number | Promise<number>) = this.dependencies.transportCapacity,
+  ): Promise<number> {
     let capacity: number;
     try {
       capacity = typeof source === "function" ? await source() : source;
@@ -2525,6 +2664,84 @@ export class OrchestrationController {
       // Event observers are diagnostics, never orchestration authority.
     }
   }
+}
+
+function packetIdentityFor(
+  item: ScheduledWorkItem,
+  investigation: OrchestrationInvestigationRecord,
+  packetId: string,
+  baseSha: string,
+): OrchestrationPacketIdentity {
+  if (!investigation.runId?.trim() || !investigation.investigationArtifactId?.trim()) {
+    throw new Error(`Packet ${item.id} lacks exact investigation identity`);
+  }
+  return {
+    nodeId: item.id,
+    packetId,
+    runId: investigation.runId,
+    investigationId: investigation.investigationArtifactId,
+    subject: { repo: item.repository ?? "", issue: item.issue },
+    baseSha,
+  };
+}
+
+function assertPacketIdentity(
+  actual: OrchestrationPacketIdentity,
+  expected: OrchestrationPacketIdentity | undefined,
+  itemId: string,
+): OrchestrationPacketIdentity {
+  if (!actual || typeof actual !== "object") throw new Error(`Packet ${itemId} has invalid packet identity`);
+  if (actual.nodeId !== itemId || !actual.packetId?.trim() || !actual.runId?.trim() || !actual.investigationId?.trim()
+    || !actual.subject?.repo?.trim() || actual.subject.issue < 1 || !actual.baseSha?.trim()) {
+    throw new Error(`Packet ${itemId} has incomplete packet identity`);
+  }
+  if (expected !== undefined && (actual.nodeId !== expected.nodeId
+    || actual.packetId !== expected.packetId
+    || actual.runId !== expected.runId
+    || actual.investigationId !== expected.investigationId
+    || actual.subject.issue !== expected.subject.issue
+    || actual.subject.repo.trim().toLowerCase() !== expected.subject.repo.trim().toLowerCase()
+    || actual.baseSha !== expected.baseSha)) {
+    throw new Error(`Packet ${itemId} packet identity drifted from investigation checkpoint`);
+  }
+  return structuredClone(actual);
+}
+
+function assertReusablePacketRecord(
+  packet: OrchestrationPacketRecord,
+  investigation: OrchestrationInvestigationRecord,
+  item: ScheduledWorkItem,
+  wave: number,
+): void {
+  if (packet.wave !== wave || packet.status !== "completed" || !packet.packetId || !packet.baseSha || !packet.expectedPaths?.length) {
+    throw new Error(`Packet ${item.id} durable packet is not reusable`);
+  }
+  normalizePacketPaths(packet.expectedPaths);
+  normalizeSemanticDependencies(packet.semanticDependencies ?? (() => { throw new Error(`Packet ${item.id} lacks authoritative semantic dependency evidence`); })());
+  const expected = packetIdentityFor(item, investigation, packet.packetId, packet.baseSha);
+  assertPacketIdentity(packet.identity!, expected, item.id);
+  if (packet.identity?.baseSha !== packet.baseSha) throw new Error(`Packet ${item.id} packet base identity drifted`);
+}
+
+function indexPacketRecords(
+  packets: readonly OrchestrationPacketRecord[],
+  nodes: readonly OrchestrationNodeRecord[],
+): Map<string, OrchestrationPacketRecord> {
+  const knownNodes = new Set(nodes.map((node) => node.id));
+  const packetIds = new Set<string>();
+  const byNode = new Map<string, OrchestrationPacketRecord>();
+  for (const packet of packets) {
+    if (!packet.nodeId.trim()) throw new Error("Packet record has no durable node identity");
+    if (!knownNodes.has(packet.nodeId)) throw new Error(`Packet record references unknown node ${packet.nodeId}`);
+    if (byNode.has(packet.nodeId)) throw new Error(`Duplicate durable packet identity for ${packet.nodeId}`);
+    if (packet.packetId !== undefined) {
+      if (packetIds.has(packet.packetId)) throw new Error(`Duplicate packet identity ${packet.packetId}`);
+      packetIds.add(packet.packetId);
+    }
+    if (!Number.isSafeInteger(packet.wave) || packet.wave < 1) throw new Error(`Packet ${packet.nodeId} has an invalid wave`);
+    byNode.set(packet.nodeId, structuredClone(packet));
+  }
+  return byNode;
 }
 
 function investigationWorkflowLabel(record: OrchestrationRecord, node: OrchestrationNodeRecord): "workflow:investigating" | "workflow:waiting" | "workflow:invalid" | "workflow:decomposed" {
@@ -2964,17 +3181,6 @@ function mergeResultWithRecord(result: ScheduleResult, record: OrchestrationReco
   return merged;
 }
 
-function normalizePacketPaths(paths: readonly string[]): string[] {
-  const normalized = new Set<string>();
-  for (const raw of paths) {
-    const path = raw.replaceAll("\\", "/").trim().replace(/^\.\//, "");
-    if (!path || path.startsWith("/") || path.split("/").includes("..") || path.includes("*") || path.includes("{")) {
-      throw new Error(`Unsafe Build Packet expected path: ${raw}`);
-    }
-    normalized.add(path);
-  }
-  return [...normalized].sort();
-}
 function uniqueIssueNumbers(values: readonly number[]): number[] {
   const result: number[] = [];
   const seen = new Set<number>();

@@ -151,19 +151,16 @@ export async function recordTargetFenceOutcome(
   }));
 }
 
-/**
- * Fence the target branch immediately before a delivery push. Older durable
- * BuildResults may not carry a base SHA, so those legacy checkpoints retain
- * their existing compatibility behavior; every current controller build has
- * one through GitWorkspace/BuildResult.
- */
+/** Fence the target branch immediately before a delivery push. */
 export async function assertTargetHeadUnchanged(
   host: ForgeHost,
   repo: string,
   targetBranch: string,
   expectedBaseSha?: string,
 ): Promise<void> {
-  if (expectedBaseSha === undefined) return;
+  if (!expectedBaseSha) {
+    throw new Error(`Publication requires an exact verified target base SHA for ${targetBranch}`);
+  }
   if (!host.getBranchHead) throw new Error(`Publication requires an authoritative target branch head reader for ${targetBranch}`);
   const observed = await host.getBranchHead(repo, targetBranch);
   if (observed.toLowerCase() !== expectedBaseSha.toLowerCase()) {

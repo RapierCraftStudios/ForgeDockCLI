@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { ForgeDockBackgroundTasks, NESTED_AGENT_BRIDGE_RESTART_REQUIRED, TUI_RESTART_TERMINAL_CAUSE } from "./background-tasks.js";
+import { ForgeDockBackgroundTasks, NESTED_AGENT_BRIDGE_RESTART_REQUIRED, processIncarnationWitness, TUI_RESTART_TERMINAL_CAUSE } from "./background-tasks.js";
 import { ForgeDockObserver } from "../observability/observer.js";
 import { SqliteObservationStore } from "../observability/sqlite-store.js";
 import { createObservationProducer } from "../observability/contracts.js";
@@ -339,7 +339,7 @@ test("native background cancellation terminates the owned task", async () => {
   await tasks.shutdown();
 });
 
-test("non-cancelling shutdown leaves native controllers detached and adoptable", async () => {
+test("non-cancelling shutdown leaves native controllers detached but not adoptable", async () => {
   const first = fixture();
   const record = first.tasks.start({
     command: process.execPath,
@@ -353,12 +353,14 @@ test("non-cancelling shutdown leaves native controllers detached and adoptable",
   const adopter = new ForgeDockBackgroundTasks(first.pi);
   adopter.initialize(first.ctx);
   assert.equal(adopter.list().find((candidate) => candidate.id === record.id)?.status, "detached");
-  assert.equal(adopter.isOperationallyActive(record.id), true);
-  assert.equal(adopter.cancel(record.id).status, "cancelled");
+  assert.equal(adopter.isOperationallyActive(record.id), false);
+  assert.equal(adopter.isPersistedOperationallyActive(record.id), true);
+  assert.throws(() => adopter.cancel(record.id), /not supervised/i);
+  process.kill(record.pid, "SIGTERM");
   await adopter.shutdown();
 });
 
-test("terminal restart adopts a still-live controller instead of marking it failed", async () => {
+test("terminal restart leaves a still-live controller external and unresolved", async () => {
   const first = fixture();
   const record = first.tasks.start({
     command: process.execPath,
@@ -368,9 +370,11 @@ test("terminal restart adopts a still-live controller instead of marking it fail
   });
   const second = new ForgeDockBackgroundTasks(first.pi);
   second.initialize(first.ctx);
-  assert.equal(second.list().find((candidate) => candidate.id === record.id)?.status, "detached");
-  assert.match(second.output(record.id), /detached/);
-  assert.equal(second.cancel(record.id).status, "cancelled");
+  assert.equal(second.list().find((candidate) => candidate.id === record.id)?.status, "running");
+  assert.match(second.output(record.id), /running/);
+  assert.equal(second.isOperationallyActive(record.id), false);
+  assert.equal(second.isPersistedOperationallyActive(record.id), true);
+  assert.throws(() => second.cancel(record.id), /not supervised/i);
   // Keep the original supervisor from overwriting the adopted cancellation
   // when its child exit event arrives.
   first.tasks.cancel(record.id);
@@ -549,7 +553,7 @@ test("restart guidance matches each controller recovery contract", async () => {
   }
 });
 
-test("an adopter preserves the original supervisor's durable completion result", async () => {
+test("a replacement supervisor preserves the original supervisor's durable completion result", async () => {
   const first = fixture();
   const record = first.tasks.start({
     command: process.execPath,
@@ -559,7 +563,7 @@ test("an adopter preserves the original supervisor's durable completion result",
   });
   const second = new ForgeDockBackgroundTasks(first.pi);
   second.initialize(first.ctx);
-  assert.equal(second.list().find((candidate) => candidate.id === record.id)?.status, "detached");
+  assert.equal(second.list().find((candidate) => candidate.id === record.id)?.status, "running");
   await eventually(() => assert.equal(first.tasks.list().find((candidate) => candidate.id === record.id)?.status, "completed"));
   await eventually(() => assert.equal(second.list().find((candidate) => candidate.id === record.id)?.status, "completed"));
   await first.tasks.shutdown();
@@ -637,8 +641,108 @@ test("an adopted process that disappears without a task result is not rewritten 
   const ctx = { cwd, ui: { notify: () => undefined, setStatus: () => undefined } } as unknown as ExtensionContext;
   const tasks = new ForgeDockBackgroundTasks(pi);
   tasks.initialize(ctx);
-  assert.equal(tasks.list().find((candidate) => candidate.id === record.id)?.status, "detached");
+  assert.equal(tasks.list().find((candidate) => candidate.id === record.id)?.status, "running");
   await assert.rejects(tasks.waitForTerminal(record.id), /without a locally observable controller result/);
   assert.equal(tasks.list().find((candidate) => candidate.id === record.id)?.status, "detached");
   await tasks.shutdown();
+});
+
+test("persisted PID reuse evidence fails closed for adoption and cancellation", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "forgedock-background-pid-reuse-"));
+  const directory = join(cwd, ".forgedock", "tasks");
+  mkdirSync(directory, { recursive: true });
+  const id = "task_pid_reuse";
+  const record = {
+    id,
+    command: process.execPath,
+    args: ["controller"],
+    cwd,
+    pid: process.pid,
+    // Deliberately identify a different incarnation of this live PID.
+    processIncarnation: "proc-start:an-old-incarnation",
+    logPath: join(directory, `${id}.log`),
+    status: "detached" as const,
+    startedAt: new Date().toISOString(),
+  };
+  writeFileSync(join(directory, `${id}.json`), JSON.stringify(record));
+  const pi = { sendMessage: () => undefined } as unknown as ExtensionAPI;
+  const ctx = { cwd, ui: { notify: () => undefined, setStatus: () => undefined } } as unknown as ExtensionContext;
+  const tasks = new ForgeDockBackgroundTasks(pi);
+  tasks.initialize(ctx);
+  assert.equal(tasks.isOperationallyActive(id), false);
+  // A mismatched witness is unresolved external evidence until the PID exits;
+  // capacity remains conservatively occupied and stop must not signal it.
+  assert.equal(tasks.isPersistedOperationallyActive(id), true);
+  assert.equal(tasks.cancelPersisted(id).status, "detached");
+  assert.equal(tasks.list().find((candidate) => candidate.id === id)?.status, "detached");
+  await tasks.shutdown();
+});
+
+test("Linux process witnesses bind boot, session, and start identities", () => {
+  if (process.platform !== "linux") return;
+  assert.match(processIncarnationWitness(process.pid) ?? "", /^proc-boot:[^:]+:session:\d+:start:\d+$/);
+});
+
+test("legacy live bridge records remain unresolved until their PID exits", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "forgedock-background-legacy-live-"));
+  const directory = join(cwd, ".forgedock", "tasks");
+  mkdirSync(directory, { recursive: true });
+  const child = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { windowsHide: true, stdio: "ignore" });
+  assert.ok(child.pid);
+  const id = "task_legacy_live";
+  writeFileSync(join(directory, `${id}.json`), JSON.stringify({
+    id,
+    command: process.execPath,
+    args: ["controller"],
+    cwd,
+    pid: child.pid,
+    logPath: join(directory, `${id}.log`),
+    status: "running",
+    startedAt: new Date().toISOString(),
+    restartRequired: NESTED_AGENT_BRIDGE_RESTART_REQUIRED,
+    resumeScope: "orchestration",
+  }));
+  const pi = { sendMessage: () => undefined } as unknown as ExtensionAPI;
+  const ctx = { cwd, ui: { notify: () => undefined, setStatus: () => undefined } } as unknown as ExtensionContext;
+  const tasks = new ForgeDockBackgroundTasks(pi);
+  tasks.initialize(ctx);
+  assert.equal(tasks.list().find((record) => record.id === id)?.status, "running");
+  assert.equal(tasks.list().find((record) => record.id === id)?.terminalCause, undefined);
+  assert.equal(tasks.isPersistedOperationallyActive(id), true);
+  child.kill("SIGTERM");
+  await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  tasks.initialize(ctx);
+  assert.equal(tasks.list().find((record) => record.id === id)?.status, "blocked");
+  assert.equal(tasks.list().find((record) => record.id === id)?.terminalCause, TUI_RESTART_TERMINAL_CAUSE);
+  await tasks.shutdown();
+});
+
+test("unsupported process witnesses retain live persisted tasks without signaling", async () => {
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  const cwd = mkdtempSync(join(tmpdir(), "forgedock-background-unsupported-"));
+  const directory = join(cwd, ".forgedock", "tasks");
+  mkdirSync(directory, { recursive: true });
+  const child = spawn(process.execPath, ["-e", "setInterval(()=>{},1000)"], { windowsHide: true, stdio: "ignore" });
+  assert.ok(child.pid);
+  try {
+    Object.defineProperty(process, "platform", { configurable: true, value: "freebsd" });
+    assert.equal(processIncarnationWitness(child.pid), undefined);
+    const id = "task_unsupported_live";
+    writeFileSync(join(directory, `${id}.json`), JSON.stringify({
+      id, command: process.execPath, args: ["controller"], cwd, pid: child.pid,
+      logPath: join(directory, `${id}.log`), status: "running", startedAt: new Date().toISOString(),
+    }));
+    const pi = { sendMessage: () => undefined } as unknown as ExtensionAPI;
+    const ctx = { cwd, ui: { notify: () => undefined, setStatus: () => undefined } } as unknown as ExtensionContext;
+    const tasks = new ForgeDockBackgroundTasks(pi);
+    tasks.initialize(ctx);
+    assert.equal(tasks.list().find((record) => record.id === id)?.status, "running");
+    assert.equal(tasks.isPersistedOperationallyActive(id), true);
+    assert.equal(tasks.cancelPersisted(id).status, "running");
+    await tasks.shutdown();
+  } finally {
+    child.kill("SIGTERM");
+    await new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    if (originalPlatform) Object.defineProperty(process, "platform", originalPlatform);
+  }
 });

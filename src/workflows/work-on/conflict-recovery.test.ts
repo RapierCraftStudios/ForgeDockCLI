@@ -457,6 +457,7 @@ describe("approved target-conflict recovery", () => {
       packet: values.packet,
       buildResult,
       workspace: { ...workspace, baseSha: targetSha },
+      expectedTargetHeadSha: targetSha,
     }, { git, host, runs });
     assert.equal(retried.run.state, "reviewing");
     assert.equal(git.pushCalls, 2, "typed publication restart retries the existing delivery safely");

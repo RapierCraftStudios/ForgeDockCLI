@@ -85,7 +85,7 @@ export interface WorkOnResult {
   awaitingHuman?: boolean;
 }
 function assertTargetRecoveryIdentity(input: TargetAdvanceResumeInput): void {
-  const { run, checkpoint, intent, packet, buildResult, workspace, pullRequest } = input;
+  const { run, checkpoint, intent, packet, buildResult, workspace, pullRequest, priorVerdict } = input;
   if (checkpoint.runId !== run.runId || checkpoint.subject.repo.toLowerCase() !== run.subject.repo.toLowerCase()
     || checkpoint.subject.issue !== run.subject.issue || checkpoint.subject.pr !== run.subject.pr) {
     throw new Error("Target recovery checkpoint run/subject identity does not match the admitted run");
@@ -107,25 +107,56 @@ function assertTargetRecoveryIdentity(input: TargetAdvanceResumeInput): void {
     || recoveryAttempt > recoveryMax || recoveryMax > TARGET_RECOVERY_MAX_ATTEMPTS) {
     throw new Error(`Target recovery checkpoint attempt must satisfy 1 <= number <= max <= ${TARGET_RECOVERY_MAX_ATTEMPTS}`);
   }
+  if (checkpoint.payload.sourceVerdictId !== undefined) {
+    if (!priorVerdict || priorVerdict.id !== checkpoint.payload.sourceVerdictId) {
+      throw new Error("Target recovery checkpoint source verdict identity does not match the retained PR verdict");
+    }
+    if (priorVerdict.runId !== run.runId
+      || priorVerdict.subject.repo.toLowerCase() !== checkpoint.payload.repository.toLowerCase()
+      || priorVerdict.subject.issue !== run.subject.issue
+      || priorVerdict.subject.pr === undefined
+      || (checkpoint.payload.pullRequest !== undefined && priorVerdict.subject.pr !== checkpoint.payload.pullRequest)
+      || (priorVerdict.payload.baseBranch !== undefined && priorVerdict.payload.baseBranch !== checkpoint.payload.targetBranch)
+      || (priorVerdict.payload.headBranch !== undefined && priorVerdict.payload.headBranch !== workspace.branch)) {
+      throw new Error("Target recovery checkpoint source verdict identity does not match the admitted run");
+    }
+    if (!pullRequest) throw new Error("Target recovery checkpoint source verdict requires a retained pull request");
+  } else if (priorVerdict !== undefined && checkpoint.payload.phase !== "target-read") {
+    throw new Error("Target recovery retained an unexpected source verdict");
+  }
   const retainedHead = checkpoint.payload.freshBuildResultId && checkpoint.payload.phase !== "target-read"
     ? (checkpoint.payload.integrationHeadSha ?? checkpoint.payload.mergeHeadSha ?? checkpoint.payload.sourceHeadSha)
     : checkpoint.payload.sourceHeadSha;
+  // A remediation checkpoint is created before its new revision is pushed. Until
+  // the `pushed` receipt, the retained PR is still at the source verdict head;
+  // the BuildResult head is the un-published workspace revision. A fenced
+  // checkpoint is the one narrow crash window where the exact fresh head may
+  // already be present in both remote projections; publication reconciliation
+  // validates that pair again before adopting it.
+  const retainedPullRequestHead = priorVerdict !== undefined
+    && checkpoint.payload.phase !== "pushed" && checkpoint.payload.phase !== "reviewed"
+    ? priorVerdict.payload.headSha
+    : retainedHead;
+  const reconciledFencedHead = checkpoint.payload.phase === "fenced"
+    && input.freshBuildResult !== undefined
+    && checkpoint.payload.freshBuildResultId === input.freshBuildResult.id
+    ? input.freshBuildResult.payload.headSha
+    : undefined;
+  const allowedPullRequestHeads = new Set([
+    retainedPullRequestHead.toLowerCase(),
+    ...(reconciledFencedHead !== undefined ? [reconciledFencedHead.toLowerCase()] : []),
+  ]);
   if (pullRequest !== undefined
     && (pullRequest.repo.toLowerCase() !== checkpoint.payload.repository.toLowerCase()
       || pullRequest.number !== checkpoint.payload.pullRequest && checkpoint.payload.pullRequest !== undefined
       || pullRequest.baseBranch !== checkpoint.payload.targetBranch
       || pullRequest.headBranch !== workspace.branch
-      || pullRequest.headSha.toLowerCase() !== retainedHead.toLowerCase())) {
+      || !allowedPullRequestHeads.has(pullRequest.headSha.toLowerCase())
+      || (priorVerdict !== undefined && pullRequest.number !== priorVerdict.subject.pr))) {
     throw new Error("Target recovery checkpoint does not match the retained pull request route or head");
   }
   if (checkpoint.payload.targetBranch !== run.targetBranch || checkpoint.payload.repository.toLowerCase() !== run.subject.repo.toLowerCase()) {
     throw new Error("Target recovery checkpoint target route does not match the admitted run");
-  }
-  if (checkpoint.payload.sourceVerdictId !== undefined && input.priorVerdict?.id !== checkpoint.payload.sourceVerdictId) {
-    throw new Error("Target recovery checkpoint source verdict does not match the retained PR verdict");
-  }
-  if (checkpoint.payload.sourceVerdictId === undefined && input.priorVerdict !== undefined && checkpoint.payload.phase !== "target-read") {
-    throw new Error("Target recovery retained an unexpected source verdict");
   }
   if (checkpoint.payload.routeClaimKey !== normalizedTargetRouteClaim(checkpoint.payload.repository, checkpoint.payload.targetBranch)
     || JSON.stringify([...checkpoint.payload.expectedPaths].sort()) !== JSON.stringify([...packet.payload.expectedPaths].sort())) {
@@ -337,7 +368,26 @@ async function resumeTargetAdvanceWorkOnInternal(
       });
     }
     const published = pullRequest
-      ? await publishRemediationRevision({ run: recoveredRun, pullRequest, packet: input.packet, buildResult: recoveredFresh, workspace: input.workspace, expectedTargetHeadSha: targetSha }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts })
+      ? await publishRemediationRevision({
+        run: recoveredRun,
+        pullRequest,
+        packet: input.packet,
+        buildResult: recoveredFresh,
+        sourceBuildResult: input.buildResult,
+        workspace: input.workspace,
+        expectedTargetHeadSha: targetSha,
+        ...(input.priorVerdict !== undefined
+          ? {
+            verdict: input.priorVerdict,
+            ...(checkpoint.phase === "fenced"
+              ? {
+                expectedExistingHeadSha: input.priorVerdict.payload.headSha,
+                fencedReplay: true as const,
+              }
+              : {}),
+          }
+          : {}),
+      }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts })
       : await publishPullRequest({ run: recoveredRun, intent: input.intent, packet: input.packet, buildResult: recoveredFresh, workspace: input.workspace }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts });
     await persistTargetAdvanceCheckpoint({
       run: published.run, packet: input.packet, buildResult: recoveredFresh, sourceBuildResult: input.buildResult,
@@ -535,6 +585,7 @@ async function resumeTargetAdvanceWorkOnInternal(
     run: publishing.state, packet: input.packet, buildResult: freshBuildResult, sourceBuildResult: input.buildResult, workspace,
     targetBranch: checkpoint.targetBranch, observedTargetSha: targetSha, phase: "fenced",
     attempt: checkpoint.attempt.number, maxAttempts: checkpoint.attempt.max,
+    ...(input.priorVerdict !== undefined ? { verdict: input.priorVerdict } : {}),
     freshVerificationCheckpointId: verificationCheckpoint.id,
     freshBuildResultId: freshBuildResult.id,
     integrationHeadSha: newHead,
@@ -543,7 +594,16 @@ async function resumeTargetAdvanceWorkOnInternal(
     artifacts: dependencies.artifacts,
   });
   const published = pullRequest
-    ? await publishRemediationRevision({ run: publishing.state, pullRequest, packet: input.packet, buildResult: freshBuildResult, workspace, expectedTargetHeadSha: targetSha }, {
+    ? await publishRemediationRevision({
+      run: publishing.state,
+      pullRequest,
+      packet: input.packet,
+      buildResult: freshBuildResult,
+      sourceBuildResult: input.buildResult,
+      workspace,
+      expectedTargetHeadSha: targetSha,
+      ...(input.priorVerdict !== undefined ? { verdict: input.priorVerdict } : {}),
+    }, {
       git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
     })
     : await publishPullRequest({ run: publishing.state, intent: input.intent, packet: input.packet, buildResult: freshBuildResult, workspace }, {
@@ -565,6 +625,7 @@ async function resumeTargetAdvanceWorkOnInternal(
     run: reviewed.run, packet: input.packet, buildResult: freshBuildResult, sourceBuildResult: input.buildResult,
     workspace, targetBranch: checkpoint.targetBranch, observedTargetSha: targetSha, phase: "reviewed",
     attempt: checkpoint.attempt.number, maxAttempts: checkpoint.attempt.max,
+    ...(input.priorVerdict !== undefined ? { verdict: input.priorVerdict } : {}),
     freshVerificationCheckpointId: verificationCheckpoint.id,
     freshBuildResultId: freshBuildResult.id,
     integrationHeadSha: newHead,
@@ -1092,6 +1153,13 @@ function frozenPacketCommands(
   if (!workspace.baseSha) throw new Error("Frozen packet verification requires an exact workspace base SHA");
   return selectPacketVerificationCommands(packet.payload, catalog, workspace.baseSha)
     .map((command) => ({ ...command, cwd: workspace.path }));
+}
+
+function exactBuildResultBaseSha(buildResult: DurableArtifact<"BuildResult">): string {
+  if (!buildResult.payload.baseSha) {
+    throw new Error("Remediation publication requires an exact verified BuildResult base SHA");
+  }
+  return buildResult.payload.baseSha;
 }
 
 export async function workOn(
@@ -2420,7 +2488,7 @@ async function continueBuildDelivery(
     run = remediationVerification.run;
     if (!remediationVerification.buildResult) return { run, pullRequest };
     buildResult = remediationVerification.buildResult;
-    const revision = await publishRemediationRevision({ run, pullRequest, packet: input.packet, ...(verdict ? { verdict } : {}), buildResult, workspace: input.workspace }, {
+    const revision = await publishRemediationRevision({ run, pullRequest, packet: input.packet, ...(verdict ? { verdict } : {}), buildResult, workspace: input.workspace, expectedTargetHeadSha: exactBuildResultBaseSha(buildResult) }, {
       git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
     });
     run = revision.run;
@@ -2582,7 +2650,7 @@ export async function resumeWorkOn(
       run = verified.run;
       if (!verified.buildResult) return { run, pullRequest };
       buildResult = verified.buildResult;
-      const revision = await publishRemediationRevision({ run, pullRequest, packet: input.packet, ...(verdict ? { verdict } : {}), buildResult, workspace: input.workspace }, {
+      const revision = await publishRemediationRevision({ run, pullRequest, packet: input.packet, ...(verdict ? { verdict } : {}), buildResult, workspace: input.workspace, expectedTargetHeadSha: exactBuildResultBaseSha(buildResult) }, {
         git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
       });
       run = revision.run;
@@ -2780,7 +2848,7 @@ export async function resumeReviewWorkOn(
     run = verified.run;
     if (!verified.buildResult) return { run, pullRequest };
     buildResult = verified.buildResult;
-    let revision = await publishRemediationRevision({ run, pullRequest, packet: input.packet, ...(verdict ? { verdict } : {}), buildResult, workspace: input.workspace }, {
+    let revision = await publishRemediationRevision({ run, pullRequest, packet: input.packet, ...(verdict ? { verdict } : {}), buildResult, workspace: input.workspace, expectedTargetHeadSha: exactBuildResultBaseSha(buildResult) }, {
       git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
     });
     run = revision.run;
@@ -2844,7 +2912,7 @@ export async function resumeReviewWorkOn(
       run = verified.run;
       if (!verified.buildResult) return { run, pullRequest };
       buildResult = verified.buildResult;
-      revision = await publishRemediationRevision({ run, pullRequest, packet: input.packet, ...(verdict ? { verdict } : {}), buildResult, workspace: input.workspace }, {
+      revision = await publishRemediationRevision({ run, pullRequest, packet: input.packet, ...(verdict ? { verdict } : {}), buildResult, workspace: input.workspace, expectedTargetHeadSha: exactBuildResultBaseSha(buildResult) }, {
         git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
       });
       run = revision.run;
@@ -3170,7 +3238,7 @@ export async function resumePublicationWorkOn(
       run = verified.run;
       if (!verified.buildResult) return { run, pullRequest };
       buildResult = verified.buildResult;
-      const revision = await publishRemediationRevision({ run, pullRequest, packet: input.packet, ...(verdict ? { verdict } : {}), buildResult, workspace: input.workspace }, {
+      const revision = await publishRemediationRevision({ run, pullRequest, packet: input.packet, ...(verdict ? { verdict } : {}), buildResult, workspace: input.workspace, expectedTargetHeadSha: exactBuildResultBaseSha(buildResult) }, {
         git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts,
       });
       run = revision.run;
@@ -3467,7 +3535,7 @@ export async function resumeConflictRecoveryWorkOn(
       run = verified.run;
       if (!verified.buildResult) return { run, pullRequest };
       buildResult = verified.buildResult;
-      const published = await publishRemediationRevision({ run, pullRequest, packet: input.packet, ...(verdict ? { verdict } : {}), buildResult, workspace: input.workspace }, {
+      const published = await publishRemediationRevision({ run, pullRequest, packet: input.packet, ...(verdict ? { verdict } : {}), buildResult, workspace: input.workspace, expectedTargetHeadSha: exactBuildResultBaseSha(buildResult) }, {
         git: dependencies.git,
         host: dependencies.host,
         runs: dependencies.runs,

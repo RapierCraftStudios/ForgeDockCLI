@@ -3,6 +3,20 @@
 import type { OrchestrationPlanMetadata } from "../../core/ports/orchestration.js";
 import { materializeClaimDependencies, validateGraph, type ClaimSerializationEdge, type ScheduledWorkItem } from "./scheduler.js";
 
+/** Exact source identity which makes a completed packet safe to reuse. */
+export interface PacketWaveIdentity {
+  /** Stable orchestration node identity. */
+  nodeId: string;
+  /** Durable investigation/work run which produced the packet. */
+  runId: string;
+  /** Repository-qualified issue subject used by that run. */
+  subject: { repo: string; issue: number };
+  /** Exact revision read while producing the packet. */
+  baseRef: string;
+  /** Durable Investigation artifact identity. */
+  investigationId: string;
+}
+
 /** The durable, read-only result needed to compile a mutation DAG. */
 export interface PacketWaveItem {
   id: string;
@@ -10,6 +24,8 @@ export interface PacketWaveItem {
   expectedPaths: readonly string[];
   /** Exact base used while reading and authoring the packet. */
   baseRef: string;
+  /** Exact node/run/subject/base/investigation lineage for restart reuse. */
+  identity?: PacketWaveIdentity;
   /** Confirmed semantic edges from investigation/issue evidence. */
   semanticDependencies: readonly string[];
   /** Invalid and decomposed issues never enter the mutation DAG. */
@@ -57,8 +73,16 @@ export interface CompiledPacketDag {
  */
 export function compileExecutionDag(input: PacketDagInput): CompiledPacketDag {
   if (!input.baseRef.trim()) throw new Error("Packet DAG requires an exact base reference");
-  const byId = new Map(input.items.map((item) => [item.id, item]));
-  const packets = new Map(input.packets.map((packet) => [packet.id, packet]));
+  const byId = new Map<string, ScheduledWorkItem>();
+  for (const item of input.items) {
+    if (byId.has(item.id)) throw new Error(`Duplicate packet DAG item identity ${item.id}`);
+    byId.set(item.id, item);
+  }
+  const packets = new Map<string, PacketWaveItem>();
+  for (const packet of input.packets) {
+    if (packets.has(packet.id)) throw new Error(`Duplicate packet identity ${packet.id}`);
+    packets.set(packet.id, packet);
+  }
   const included = input.items.filter((item) => {
     const packet = packets.get(item.id);
     return packet?.outcome !== "invalid" && packet?.outcome !== "decomposed";
@@ -68,12 +92,12 @@ export function compileExecutionDag(input: PacketDagInput): CompiledPacketDag {
     const packet = packets.get(item.id);
     if (!packet) throw new Error(`Packet barrier incomplete: missing packet for ${item.id}`);
     if (packet.baseRef !== input.baseRef) throw new Error(`Packet base drift for ${item.id}: ${packet.baseRef} != ${input.baseRef}`);
-    const paths = normalizePaths(packet.expectedPaths);
+    const paths = normalizePacketPaths(packet.expectedPaths);
     if (!paths.length) {
       if (input.fallback !== "preview-claims") throw new Error(`Packet ${item.id} has no bounded expected paths`);
     }
     if (packet.semanticDependencies === undefined) throw new Error(`Packet ${item.id} lacks authoritative semantic dependency evidence`);
-    const dependencies = unique(packet.semanticDependencies);
+    const dependencies = normalizeSemanticDependencies(packet.semanticDependencies);
     for (const dependency of dependencies) {
       if (!byId.has(dependency)) throw new Error(`Packet ${item.id} references unknown semantic dependency ${dependency}`);
     }
@@ -90,7 +114,7 @@ export function compileExecutionDag(input: PacketDagInput): CompiledPacketDag {
         dependencies,
       } satisfies DependencyProvenance,
     };
-    const claims = paths.length ? paths : normalizePaths(item.claims);
+    const claims = paths.length ? paths : normalizePreviewClaims(item.claims);
     const memberIssues = [...new Set([...(item.memberIssues ?? []), ...(packet.childIssues ?? [])])];
     compiled.push({
       ...item,
@@ -122,20 +146,50 @@ export function compileExecutionDag(input: PacketDagInput): CompiledPacketDag {
   };
 }
 
-function normalizePaths(paths: readonly string[]): string[] {
+export function normalizePacketPaths(paths: readonly string[]): string[] {
   const result = new Set<string>();
   for (const raw of paths) {
+    if (typeof raw !== "string") throw new Error(`Unsafe packet expected path: ${String(raw)}`);
+    const slashSeparated = raw.replaceAll("\\", "/").trim();
+    // Reject absolute POSIX/UNC paths and Windows drive paths before resolving
+    // segments. Resolving first would let repo/../outside escape the boundary.
+    if (!slashSeparated || slashSeparated.startsWith("/") || /^[A-Za-z]:/.test(slashSeparated)) {
+      throw new Error(`Unsafe packet expected path: ${raw}`);
+    }
+    if (/[?*[\]{}]/.test(slashSeparated)) throw new Error(`Unsafe packet expected path: ${raw}`);
+    const segments: string[] = [];
+    for (const segment of slashSeparated.split("/")) {
+      if (segment === "..") throw new Error(`Unsafe packet expected path: ${raw}`);
+      if (!segment || segment === ".") continue;
+      segments.push(segment);
+    }
+    if (!segments.length) throw new Error(`Unsafe packet expected path: ${raw}`);
+    result.add(segments.join("/"));
+  }
+  return [...result].sort();
+}
+
+/** Normalize authoritative semantic edges without silently dropping blanks. */
+export function normalizeSemanticDependencies(values: readonly string[]): string[] {
+  const result = new Set<string>();
+  for (const value of values) {
+    if (typeof value !== "string" || !value.trim()) throw new Error("Packet semantic dependency must not be blank");
+    result.add(value.trim());
+  }
+  return [...result];
+}
+
+function normalizePreviewClaims(paths: readonly string[]): string[] {
+  const result = new Set<string>();
+  for (const raw of paths) {
+    if (typeof raw !== "string") throw new Error(`Unsafe packet expected path: ${String(raw)}`);
     const path = raw.replaceAll("\\", "/").trim().replace(/^\.\//, "");
-    if (!path || path.startsWith("/") || path.split("/").includes("..") || path.includes("*")) {
+    if (!path || path.startsWith("/") || path.split("/").includes("..") || path.includes("*") || path.includes("{")) {
       throw new Error(`Unsafe packet expected path: ${raw}`);
     }
     result.add(path);
   }
   return [...result].sort();
-}
-
-function unique(values: readonly string[]): string[] {
-  return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
 }
 
 function countComponents(items: readonly ScheduledWorkItem[], edges: readonly ClaimSerializationEdge[]): number {
@@ -159,6 +213,8 @@ export type PacketWaveStatus = "queued" | "running" | "completed" | "failed";
 
 export interface PacketWaveAttempt {
   id: string;
+  /** Monotonic ordinal retained for stores which do not preserve attempt history. */
+  attempt?: number;
   status: PacketWaveStatus;
   startedAt?: string;
   completedAt?: string;
@@ -182,39 +238,56 @@ export interface PacketWaveOptions {
   /** Base used by every read-only packet authoring operation. */
   baseRef: string;
   now?: () => string;
+  /** Resolve the exact identity expected for a packet on this run/resume. */
+  identityFor?: (item: ScheduledWorkItem) => PacketWaveIdentity | undefined;
   /** Read-only operation; it must persist the packet before resolving. */
   materialize(item: ScheduledWorkItem): Promise<PacketWaveItem>;
 }
 
-/** Run/resume a bounded packet wave. Completed packets are reused. */
+/** Run/resume a bounded packet wave. Completed packets are reused only when their full identity matches. */
 export async function runPacketWave(
   items: readonly ScheduledWorkItem[],
   store: PacketWaveStore,
   options: PacketWaveOptions,
 ): Promise<readonly PacketWaveItem[]> {
   if (!Number.isSafeInteger(options.concurrency) || options.concurrency < 1) throw new Error("Packet wave concurrency must be positive");
+  if (!options.baseRef.trim()) throw new Error("Packet wave requires an exact base reference");
   const now = options.now ?? (() => new Date().toISOString());
   let state = await store.load();
+  // A different base describes a new packet wave. Do not carry completed
+  // packets across it, but preserve the existing restart behavior of starting
+  // a fresh wave rather than treating an intentional base change as corruption.
   if (state && state.baseRef !== options.baseRef) state = undefined;
   state ??= { baseRef: options.baseRef, attempts: {}, packets: {} };
   state.packets ??= {};
   const results = new Map<string, PacketWaveItem>();
   for (const item of items) {
+    const attempt = state.attempts[item.id];
     const packet = state.packets[item.id];
-    if (packet && state.attempts[item.id]?.status === "completed") results.set(item.id, packet);
+    if (attempt?.status !== "completed") continue;
+    if (!attempt) throw new Error(`Packet ${item.id} completed attempt has no durable attempt`);
+    assertPacketWaveAttemptRecord(item.id, attempt);
+    if (!packet) throw new Error(`Packet ${item.id} completed attempt has no durable packet`);
+    assertPacketIdentity(item, packet, options, true);
+    results.set(item.id, packet);
   }
   const pending = items.filter((item) => !results.has(item.id));
   let cursor = 0;
   const worker = async () => {
     while (cursor < pending.length) {
       const item = pending[cursor++]!;
-      const previous = state!.attempts[item.id];
-      const attempt: PacketWaveAttempt = { id: `${item.id}:${(previous ? 2 : 1)}`, status: "running", startedAt: now() };
+      const attemptNumber = nextAttemptNumber(item.id, state!.attempts);
+      const attempt: PacketWaveAttempt = {
+        id: `${item.id}:${attemptNumber}`,
+        attempt: attemptNumber,
+        status: "running",
+        startedAt: now(),
+      };
       state!.attempts[item.id] = attempt;
       await store.save(state!);
       try {
         const packet = await options.materialize(item);
-        if (packet.baseRef !== options.baseRef) throw new Error(`Packet ${item.id} returned base ${packet.baseRef}, expected ${options.baseRef}`);
+        assertPacketIdentity(item, packet, options, false);
         results.set(item.id, packet);
         state!.packets![item.id] = packet;
         state!.attempts[item.id] = { ...attempt, status: "completed", completedAt: now() };
@@ -228,4 +301,73 @@ export async function runPacketWave(
   };
   await Promise.all(Array.from({ length: Math.min(options.concurrency, pending.length) }, worker));
   return [...results.values()];
+}
+
+function assertPacketIdentity(
+  item: ScheduledWorkItem,
+  packet: PacketWaveItem,
+  options: PacketWaveOptions,
+  completedReuse: boolean,
+): void {
+  if (!packet || typeof packet !== "object") throw new Error(`Packet ${item.id} is not a durable packet object`);
+  if (packet.id !== item.id) throw new Error(`Packet ${item.id} has node identity drift: ${packet.id}`);
+  if (packet.issue !== item.issue) throw new Error(`Packet ${item.id} has subject issue drift: ${packet.issue} != ${item.issue}`);
+  if (packet.baseRef !== options.baseRef) throw new Error(`Packet ${item.id} has base identity drift: ${packet.baseRef} != ${options.baseRef}`);
+
+  const expected = options.identityFor?.(item);
+  if (expected !== undefined) validateExpectedIdentity(item, expected, options.baseRef);
+  const identity = packet.identity;
+  if (!identity) {
+    if (completedReuse || expected !== undefined) {
+      throw new Error(`Packet ${item.id} lacks exact node/run/subject/base/investigation identity`);
+    }
+    return;
+  }
+  validatePacketIdentity(item, packet, identity, options.baseRef);
+  if (!expected) return;
+  if (identity.nodeId !== expected.nodeId) throw new Error(`Packet ${item.id} has node identity drift`);
+  if (identity.runId !== expected.runId) throw new Error(`Packet ${item.id} has run identity drift`);
+  if (!sameSubject(identity.subject, expected.subject)) throw new Error(`Packet ${item.id} has subject identity drift`);
+  if (identity.baseRef !== expected.baseRef) throw new Error(`Packet ${item.id} has base identity drift`);
+  if (identity.investigationId !== expected.investigationId) throw new Error(`Packet ${item.id} has investigation identity drift`);
+}
+
+function validateExpectedIdentity(item: ScheduledWorkItem, identity: PacketWaveIdentity, baseRef: string): void {
+  if (identity.nodeId !== item.id) throw new Error(`Packet ${item.id} expected identity has node drift`);
+  if (identity.baseRef !== baseRef) throw new Error(`Packet ${item.id} expected identity has base drift`);
+  if (!identity.runId.trim() || !identity.investigationId.trim()) throw new Error(`Packet ${item.id} expected identity is incomplete`);
+  if (identity.subject.issue !== item.issue || !identity.subject.repo.trim()) throw new Error(`Packet ${item.id} expected identity has subject drift`);
+}
+
+function validatePacketIdentity(
+  item: ScheduledWorkItem,
+  packet: PacketWaveItem,
+  identity: PacketWaveIdentity,
+  baseRef: string,
+): void {
+  if (identity.nodeId !== item.id || identity.nodeId !== packet.id) throw new Error(`Packet ${item.id} has node identity drift`);
+  if (!identity.runId.trim() || !identity.investigationId.trim()) throw new Error(`Packet ${item.id} has incomplete run/investigation identity`);
+  if (identity.subject.issue !== item.issue || !identity.subject.repo.trim()) throw new Error(`Packet ${item.id} has subject identity drift`);
+  if (identity.baseRef !== baseRef || identity.baseRef !== packet.baseRef) throw new Error(`Packet ${item.id} has base identity drift`);
+}
+
+function sameSubject(left: PacketWaveIdentity["subject"], right: PacketWaveIdentity["subject"]): boolean {
+  return left.issue === right.issue && left.repo.trim().toLowerCase() === right.repo.trim().toLowerCase();
+}
+
+function nextAttemptNumber(itemId: string, attempts: Record<string, PacketWaveAttempt>): number {
+  const record = attempts[itemId];
+  if (!record) return 1;
+  assertPacketWaveAttemptRecord(itemId, record);
+  if (record.attempt! >= Number.MAX_SAFE_INTEGER) throw new Error(`Packet ${itemId} attempt identity exhausted`);
+  return record.attempt! + 1;
+}
+
+function assertPacketWaveAttemptRecord(itemId: string, record: PacketWaveAttempt): void {
+  if (!Number.isSafeInteger(record.attempt) || record.attempt! < 1 || record.attempt! >= Number.MAX_SAFE_INTEGER) {
+    throw new Error(`Packet ${itemId} has an invalid persisted attempt ordinal`);
+  }
+  if (record.id !== `${itemId}:${record.attempt}`) {
+    throw new Error(`Packet ${itemId} has a malformed persisted attempt identity`);
+  }
 }

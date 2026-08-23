@@ -39,6 +39,8 @@ export interface BackgroundTaskRecord {
   args: string[];
   cwd: string;
   pid: number;
+  /** Non-secret process-launch witness used to reject PID reuse during adoption or signaling. */
+  processIncarnation?: string;
   logPath: string;
   stderrLogPath?: string;
   status: BackgroundTaskStatus;
@@ -158,48 +160,28 @@ export class ForgeDockBackgroundTasks {
         if (!isBackgroundTaskRecord(parsed) || !recordBelongsToTaskFile(parsed, directory, name)) continue;
         const record = parsed;
         if (record.status === "running" || record.status === "detached") {
+          // A fresh TUI never adopts or signals a persisted process. The PID
+          // may belong to a prior supervisor incarnation, a legacy task, or a
+          // reused process. Keep a live PID unresolved so shared capacity is
+          // conservatively consumed until the process exits.
+          if (isProcessAlive(record.pid)) {
+            this.#records.set(record.id, record);
+            this.notifyLegacyUnresolved(record);
+            continue;
+          }
+          // Once the PID is dead, reconcile only the operational projection.
+          // Durable workflow state remains authoritative for semantic result.
           if (record.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED) {
-            // A second terminal can inspect the task directory while the
-            // original TUI still owns this controller and its in-memory
-            // nested-agent bridge. It must not present that healthy task as
-            // interrupted or terminate it merely because the bridge cannot
-            // be reattached by the second terminal.
-            if (this.bridgeOwnerIsLive(record)) {
-              this.#records.set(record.id, record);
-              continue;
-            }
-            // The nested-agent bridge lives in the previous TUI process. It
-            // cannot be reattached from a fresh terminal, so adopting this
-            // controller would present a healthy PID with a dead reviewer
-            // transport. Stop it and make the interruption an explicit,
-            // resumable checkpoint instead.
-            if (isProcessAlive(record.pid)) terminateProcessTree(record.pid);
             record.status = "blocked";
             record.completedAt ??= new Date().toISOString();
             record.exitCode ??= 2;
             record.terminalCause = TUI_RESTART_TERMINAL_CAUSE;
             this.persist(record);
             this.notifyRestartRequired(record);
-            this.#records.set(record.id, record);
-            continue;
+          } else {
+            record.status = "detached";
+            this.persist(record);
           }
-          record.status = "detached";
-          if (isProcessAlive(record.pid)) {
-            // A terminal restart must not turn a still-running controller into a
-            // false failure. Adopt it as a detached task and supervise its PID
-            // and durable log until it exits.
-            this.#live.set(record.id, {
-              record,
-              ...(record.stderrLogPath ? { stderrLogPath: record.stderrLogPath } : {}),
-              stdoutOffset: fileSize(record.logPath),
-              stderrOffset: fileSize(record.stderrLogPath),
-              adopted: true,
-            });
-          }
-          // A restarted supervisor cannot recover an already-consumed process
-          // exit code. Persist only the operational loss of attachment; the
-          // controller/GitHub result must decide semantic completion or failure.
-          this.persist(record);
         }
         this.#records.set(record.id, record);
       } catch {
@@ -257,12 +239,14 @@ export class ForgeDockBackgroundTasks {
     closeSync(stdoutFd);
     closeSync(stderrFd);
     if (!child.pid) throw new Error("ForgeDock background controller failed to start");
+    const processIncarnation = processIncarnationWitness(child.pid);
     const record: BackgroundTaskRecord = {
       id,
       command: input.command,
       args: [...input.args],
       cwd: input.cwd,
       pid: child.pid,
+      ...(processIncarnation !== undefined ? { processIncarnation } : {}),
       logPath,
       stderrLogPath,
       status: "running",
@@ -318,15 +302,22 @@ export class ForgeDockBackgroundTasks {
     return [...this.#records.values()].find((record) => record.launchKey === launchKey);
   }
 
-  /**
-   * Operational liveness is supervisor-owned, not inferred from a stale
-   * persisted `running`/`detached` label. Dead detached records remain audit
-   * evidence but must not consume controller transport capacity.
-   */
+  /** Current-supervisor liveness is proved by its held ChildProcess object. */
   isOperationallyActive(id: string): boolean {
     const live = this.#live.get(id);
     if (!live || ["completed", "blocked", "failed", "cancelled"].includes(live.record.status)) return false;
-    return isProcessAlive(live.record.pid);
+    return live.child !== undefined && isChildProcessLive(live.child, live.record);
+  }
+
+  /**
+   * Persisted tasks are never adopted or signaled by a replacement TUI. A live
+   * PID is therefore conservative unresolved evidence and consumes shared
+   * capacity even when its witness is legacy, unavailable, or unsupported.
+   */
+  isPersistedOperationallyActive(id: string): boolean {
+    const record = this.recordsFromDisk().get(id);
+    if (!record || ["completed", "blocked", "failed", "cancelled"].includes(record.status)) return false;
+    return isProcessAlive(record.pid);
   }
 
   async waitForTerminal(id: string, options: { warnAfterMs?: number } = {}): Promise<BackgroundTaskRecord> {
@@ -437,13 +428,38 @@ export class ForgeDockBackgroundTasks {
       }
       return latest;
     }
+    return this.cancelLive(live);
+  }
+
+  /**
+   * Reconcile a persisted native task without adopting or signaling it. A live
+   * external PID remains unresolved so semantic stop can report its drain.
+   */
+  cancelPersisted(id: string): BackgroundTaskRecord {
+    const latest = this.recordsFromDisk().get(id);
+    if (!latest) throw new Error(`Unknown ForgeDock background task: ${id}`);
+    const live = this.#live.get(id);
+    if (live) return this.cancelLive(live);
+    if (["completed", "blocked", "failed", "cancelled"].includes(latest.status)) return latest;
+    if (isProcessAlive(latest.pid)) return { ...latest, args: [...latest.args] };
+    latest.status = "cancelled";
+    latest.completedAt = new Date().toISOString();
+    this.#records.set(id, latest);
+    this.persist(latest);
+    return { ...latest, args: [...latest.args] };
+  }
+
+  private cancelLive(live: LiveTask): BackgroundTaskRecord {
     if (["completed", "blocked", "failed", "cancelled"].includes(live.record.status)) {
       return { ...live.record, args: [...live.record.args] };
     }
     live.record.status = "cancelled";
     live.record.completedAt = new Date().toISOString();
     this.persist(live.record);
-    terminateProcessTree(live.child ?? live.record.pid);
+    if (canSignalLiveTask(live)) {
+      const guard = () => canSignalLiveTask(live);
+      if (live.child) terminateProcessTree(live.child, guard);
+    }
     this.renderStatus();
     return { ...live.record, args: [...live.record.args] };
   }
@@ -478,7 +494,7 @@ export class ForgeDockBackgroundTasks {
       }
       // SIGINT gives the controller a chance to flush its durable checkpoint
       // and process-signal handlers before the bounded hard-stop fallback.
-      for (const task of bridgeTasks) interruptProcessTree(task.child ?? task.record.pid);
+      for (const task of bridgeTasks) interruptProcessTree(task.child ?? task.record.pid, () => canSignalLiveTask(task));
       await Promise.all(bridgeTasks.map((task) => waitForProcessExit(task, 5_000)));
       await Promise.allSettled(bridgeTasks.map((task) => boundedCleanup(this.cleanupTask(task), 2_000)));
       for (const task of bridgeTasks) this.notifyRestartRequired(task.record);
@@ -613,7 +629,7 @@ export class ForgeDockBackgroundTasks {
         continue;
       }
       if (task.record.status !== "detached") continue;
-      if (isProcessAlive(task.record.pid)) continue;
+      if (isOwnedProcessLive(task.record)) continue;
       this.captureLogDeltas(task);
       void this.#observationAdapter?.discarded(task.record.id);
       this.#live.delete(task.record.id);
@@ -636,6 +652,17 @@ export class ForgeDockBackgroundTasks {
     const recent = running[0]?.record;
     const elapsed = recent ? Math.max(0, Math.round((Date.now() - Date.parse(recent.startedAt)) / 1_000)) : 0;
     this.#ctx.ui.setStatus("forgedock-tasks", `◆ ${running.length} background task${running.length === 1 ? "" : "s"} · ${recent?.id ?? ""} · ${elapsed}s`);
+  }
+
+  private notifyLegacyUnresolved(record: BackgroundTaskRecord): void {
+    const message = `${renderRecord(record)} — live task from another supervisor cannot be adopted or safely signaled; it remains unresolved and consumes native capacity until its PID exits. Durable workflow state remains authoritative.`;
+    const notify = this.#ctx?.ui.notify;
+    if (typeof notify === "function") notify.call(this.#ctx!.ui, message, "warning");
+    try {
+      this.#pi.sendMessage({ customType: "forgedock-background-task", content: message, display: true }, { deliverAs: "nextTurn" });
+    } catch {
+      // Session startup/teardown can race notification delivery.
+    }
   }
 
   private notifyRestartRequired(record: BackgroundTaskRecord): void {
@@ -679,10 +706,10 @@ function isBackgroundTaskRecord(value: unknown): value is BackgroundTaskRecord {
     && (record.restartRequired === undefined || record.restartRequired === NESTED_AGENT_BRIDGE_RESTART_REQUIRED)
     && (record.resumeScope === undefined || ["orchestration", "work-on", "review-pr-rerun", "promote", "workflow"].includes(record.resumeScope))
     && (record.launchKey === undefined || (typeof record.launchKey === "string" && record.launchKey.length > 0 && record.launchKey.length <= 512))
+    && (record.processIncarnation === undefined || (typeof record.processIncarnation === "string" && record.processIncarnation.length > 0 && record.processIncarnation.length <= 256))
     && (record.ownerId === undefined || (typeof record.ownerId === "string" && record.ownerId.length > 0 && record.ownerId.length <= 128))
     && (record.ownerPid === undefined || (Number.isInteger(record.ownerPid) && (record.ownerPid ?? 0) > 0))
     && (record.ownerHeartbeatAt === undefined || typeof record.ownerHeartbeatAt === "string")
-    && (record.ownerIncarnation === undefined || (typeof record.ownerIncarnation === "string" && record.ownerIncarnation.length > 0 && record.ownerIncarnation.length <= 256))
     && (record.ownerIncarnation === undefined || (typeof record.ownerIncarnation === "string" && record.ownerIncarnation.length > 0 && record.ownerIncarnation.length <= 256))
     && (record.ownerReleasedAt === undefined || typeof record.ownerReleasedAt === "string")
     && ["running", "detached", "completed", "blocked", "failed", "cancelled"].includes(record.status ?? "");
@@ -780,7 +807,7 @@ function findLiveReplacementTask(
       });
       return parts[0] === identity[0] && parts[1] === identity[1] && parts[2] !== identity[2]
         && (candidate.status === "running" || candidate.status === "detached")
-        && isProcessAlive(candidate.pid);
+        && isOwnedProcessLive(candidate);
     })
     .sort((left, right) => right.startedAt.localeCompare(left.startedAt))[0];
 }
@@ -808,21 +835,23 @@ function boundedCleanup(cleanup: Promise<void>, timeoutMs: number): Promise<void
   ]);
 }
 
-export function interruptProcessTree(childOrPid: ChildProcess | number): void {
+export function interruptProcessTree(childOrPid: ChildProcess | number, canSignal?: () => boolean): void {
   const pid = typeof childOrPid === "number" ? childOrPid : childOrPid.pid;
-  if (!pid) return;
+  const guard = canSignal ?? (typeof childOrPid === "number" ? () => false : () => isChildProcessLive(childOrPid));
+  if (!pid || !guard()) return;
   if (process.platform === "win32") {
-    if (typeof childOrPid !== "number") childOrPid.kill();
+    if (typeof childOrPid !== "number" && guard()) childOrPid.kill("SIGINT");
     return;
   }
+  if (!guard()) return;
   try { process.kill(-pid, "SIGINT"); }
   catch {
-    if (typeof childOrPid !== "number") childOrPid.kill("SIGINT");
+    if (typeof childOrPid !== "number" && guard()) childOrPid.kill("SIGINT");
   }
 }
 
 function waitForProcessExit(task: LiveTask, timeoutMs: number): Promise<void> {
-  if (!isProcessAlive(task.record.pid)) return Promise.resolve();
+  if (!canSignalLiveTask(task)) return Promise.resolve();
   return new Promise((resolve) => {
     let settled = false;
     const finish = () => {
@@ -830,32 +859,34 @@ function waitForProcessExit(task: LiveTask, timeoutMs: number): Promise<void> {
       settled = true;
       clearTimeout(timer);
       task.child?.removeListener("exit", finish);
-      if (isProcessAlive(task.record.pid)) terminateProcessTree(task.child ?? task.record.pid);
+      if (canSignalLiveTask(task)) {
+        terminateProcessTree(task.child!, () => canSignalLiveTask(task));
+      }
       resolve();
     };
     const timer = setTimeout(finish, timeoutMs);
     timer.unref?.();
     task.child?.once("exit", finish);
-    if (!isProcessAlive(task.record.pid)) finish();
+    if (!canSignalLiveTask(task)) finish();
   });
 }
 
-export function terminateProcessTree(childOrPid: ChildProcess | number): void {
+export function terminateProcessTree(childOrPid: ChildProcess | number, canSignal?: () => boolean): void {
   const pid = typeof childOrPid === "number" ? childOrPid : childOrPid.pid;
-  if (!pid) return;
+  const guard = canSignal ?? (typeof childOrPid === "number" ? () => false : () => isChildProcessLive(childOrPid));
+  if (!pid || !guard()) return;
   if (process.platform === "win32") {
     const result = spawnSync("taskkill.exe", ["/pid", String(pid), "/T", "/F"], { windowsHide: true, shell: false, stdio: "ignore" });
-    if (result.error || result.status !== 0) {
-      if (typeof childOrPid !== "number") childOrPid.kill();
-      else { try { process.kill(pid, "SIGTERM"); } catch { /* already exited */ } }
-    }
+    if ((result.error || result.status !== 0) && typeof childOrPid !== "number" && guard()) childOrPid.kill();
     return;
   }
+  if (!guard()) return;
   try { process.kill(-pid, "SIGTERM"); }
   catch {
-    if (typeof childOrPid !== "number") childOrPid.kill("SIGTERM");
+    if (typeof childOrPid !== "number" && guard()) childOrPid.kill("SIGTERM");
   }
   const force = setTimeout(() => {
+    if (!guard()) return;
     try { process.kill(-pid, "SIGKILL"); } catch { /* already exited */ }
   }, 2_000);
   force.unref();
@@ -871,6 +902,25 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
+function isChildProcessLive(child: ChildProcess, record?: BackgroundTaskRecord): boolean {
+  const pid = child.pid;
+  if (!pid || child.exitCode !== null || child.signalCode !== null || !isProcessAlive(pid)) return false;
+  if (record?.processIncarnation !== undefined) {
+    const witness = processIncarnationWitness(pid);
+    if (witness === undefined || witness !== record.processIncarnation) return false;
+  }
+  return true;
+}
+
+function canSignalLiveTask(task: LiveTask): boolean {
+  return task.child !== undefined && isChildProcessLive(task.child, task.record);
+}
+
+function isOwnedProcessLive(record: BackgroundTaskRecord): boolean {
+  if (!isProcessAlive(record.pid) || !record.processIncarnation) return false;
+  return processIncarnationWitness(record.pid) === record.processIncarnation;
+}
+
 /**
  * Return a non-secret process incarnation witness. Linux exposes a monotonic
  * process start tick in /proc; on platforms without a safe local primitive we
@@ -879,12 +929,16 @@ function isProcessAlive(pid: number): boolean {
 export function processIncarnationWitness(pid: number): string | undefined {
   if (process.platform === "linux") {
     try {
+      const bootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
       const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
       const closeParen = stat.lastIndexOf(")");
-      if (closeParen < 0) return undefined;
+      if (closeParen < 0 || !bootId) return undefined;
       const fields = stat.slice(closeParen + 2).trim().split(/\s+/);
+      const sessionId = fields[3];
       const startTicks = fields[19];
-      return startTicks ? `proc-start:${startTicks}` : undefined;
+      return bootId && sessionId && startTicks
+        ? `proc-boot:${bootId}:session:${sessionId}:start:${startTicks}`
+        : undefined;
     } catch {
       return undefined;
     }

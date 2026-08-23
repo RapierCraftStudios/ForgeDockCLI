@@ -13,7 +13,7 @@ import { ConcurrentRunUpdateError, remediationAdmissionKey, reviewFindingPublica
 import type { AgentRunReceipt, TelemetryRepository } from "../../core/ports/telemetry.js";
 import { isCacheableVerificationResult, verificationReceiptCacheKey, type VerificationReceiptCache, type VerificationReceiptCacheEntry, type VerificationReceiptCacheKey } from "../../core/ports/verification-receipt-cache.js";
 import type { CheckResult } from "../../core/ports/verification.js";
-import type { RunState, TransitionRecord } from "../../core/state/machine.js";
+import { assertRunStatePersistence, type RunState, type TransitionRecord } from "../../core/state/machine.js";
 import { initializeSqliteDatabase, withSqliteBusyRetry, withSqliteBusyRetrySync } from "../../core/sqlite-retry.js";
 import type { ExternalOperationCoordinator } from "../../core/external-operation-retry.js";
 
@@ -218,6 +218,7 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   }
 
   async create(state: RunState): Promise<void> {
+    assertRunStatePersistence(state);
     try {
       await withSqliteBusyRetry(() => this.#database.prepare("INSERT INTO runs (run_id, version, state_json) VALUES (?, ?, ?)")
         .run(state.runId, state.version, JSON.stringify(state)));
@@ -229,7 +230,10 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
 
   async load(runId: string): Promise<RunState | undefined> {
     const row = this.#database.prepare("SELECT state_json FROM runs WHERE run_id = ?").get(runId) as { state_json: string } | undefined;
-    return row ? JSON.parse(row.state_json) as RunState : undefined;
+    if (!row) return undefined;
+    const state = JSON.parse(row.state_json) as RunState;
+    assertRunStatePersistence(state);
+    return state;
   }
 
   listRuns(limit = 50): RunState[] {
@@ -568,6 +572,7 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
   }
 
   async commit(expectedVersion: number, state: RunState, record: TransitionRecord): Promise<void> {
+    assertRunStatePersistence(state);
     if (state.version !== expectedVersion + 1 || record.sequence !== state.version) {
       throw new Error("Run commit must advance exactly one version");
     }

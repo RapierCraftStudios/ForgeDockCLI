@@ -1948,3 +1948,113 @@ it("normalizes packet scheduler dependencies to confirmed investigations before 
   assert.deepEqual(result.record.nodes.find((node) => node.id === "node-460")?.dependencies, ["node-459"]);
   assert.equal(result.record.nodes.some((node) => node.dependencies.includes("node-458")), false);
 });
+
+it("retains the complete packet union across investigation waves and fences prior-wave dependencies", async () => {
+  const repository = new RecordingOrchestrationRepository();
+  const packetInputs: Array<{ id: string; dependencies: readonly string[] }> = [];
+  const materializedPacketIds: string[][] = [];
+  const executed: string[] = [];
+  const service = controller(repository, async (scheduled) => {
+    executed.push(scheduled.id);
+  }, {
+    investigationWorker: async (scheduled) => ({ outcome: "confirmed", baseSha: "base-1", evidence: { runId: `run-${scheduled.id}` } }),
+    packetWorker: async (scheduled) => {
+      packetInputs.push({ id: scheduled.id, dependencies: [...scheduled.dependencies] });
+      return {
+        packetId: `packet-${scheduled.id}`,
+        expectedPaths: [`src/${scheduled.id}.ts`],
+        semanticDependencies: scheduled.dependencies,
+        baseSha: "base-1",
+      };
+    },
+    materializeExecution: async ({ wave, packets }) => {
+      materializedPacketIds.push((packets ?? []).filter((packet) => packet.status === "completed").map((packet) => packet.nodeId).sort());
+      return wave === 1
+        ? { items: [item("a", 1)], nextInvestigationItems: [item("b", 2, ["a"])] }
+        : { items: [item("a", 1), item("b", 2, ["a"])] };
+    },
+  });
+  const result = await service.createAndRun({
+    repository: "owner/repo", maxParallel: 2, investigationFirst: true,
+    items: [item("a", 1)],
+  });
+  assert.deepEqual(materializedPacketIds, [["a"], ["a", "b"]]);
+  assert.deepEqual(packetInputs, [{ id: "a", dependencies: [] }, { id: "b", dependencies: ["a"] }]);
+  assert.deepEqual(result.record.packets?.map((packet) => packet.nodeId).sort(), ["a", "b"]);
+  assert.equal(result.record.packetBarrier?.expected, 1, "the final barrier remains scoped to wave two");
+  assert.equal(result.record.packetBarrier?.completed, 1);
+  assert.deepEqual(executed, ["a", "b"]);
+});
+
+it("treats an initially empty dynamic transport as recoverable backpressure", async () => {
+  const repository = new RecordingOrchestrationRepository();
+  let available = 0;
+  const started: string[] = [];
+  const service = controller(repository, async (scheduled) => { started.push(scheduled.id); }, {
+    transportCapacity: () => available,
+  });
+  const execution = service.createAndRun({ repository: "owner/repo", maxParallel: 1, items: [item("waiting", 1)] });
+  await new Promise<void>((resolve) => setTimeout(resolve, 35));
+  assert.deepEqual(started, []);
+  const waiting = await repository.loadOrchestration("dag-test");
+  assert.equal(waiting?.effectiveMaxParallel, 0);
+  available = 1;
+  const result = await execution;
+  assert.deepEqual(result.schedule.startOrder, ["waiting"]);
+  assert.equal(result.record.status, "completed");
+});
+
+it("backpressures a packet wave at zero capacity and resumes after recovery", async () => {
+  const repository = new RecordingOrchestrationRepository();
+  const release = deferred<void>();
+  let available = 1;
+  const packetStarted: string[] = [];
+  const service = controller(repository, async () => undefined, {
+    transportCapacity: () => available,
+    investigationWorker: async (scheduled) => ({ outcome: "confirmed", baseSha: "base-1", evidence: { runId: scheduled.id } }),
+    packetWorker: async (scheduled) => {
+      packetStarted.push(scheduled.id);
+      if (scheduled.id === "a") {
+        available = 0;
+        await release.promise;
+      }
+      return { packetId: `packet-${scheduled.id}`, expectedPaths: [`src/${scheduled.id}.ts`], semanticDependencies: [], baseSha: "base-1" };
+    },
+    materializeExecution: async () => ({ items: [item("a", 1), item("b", 2)] }),
+  });
+  const execution = service.createAndRun({
+    repository: "owner/repo", maxParallel: 1, investigationFirst: true,
+    items: [item("a", 1), item("b", 2)],
+  });
+  await waitUntil(() => packetStarted.length === 1, "first packet did not start");
+  release.resolve();
+  await waitUntil(async () => {
+    const waiting = await repository.loadOrchestration("dag-test");
+    const reason = waiting?.nodes.find((node) => node.id === "b")?.waitReason;
+    return reason?.kind === "capacity" && reason.maxParallel === 0;
+  }, "packet capacity wait was not durable");
+  assert.equal((await repository.loadOrchestration("dag-test"))?.effectiveMaxParallel, 0);
+  available = 1;
+  const result = await execution;
+  assert.deepEqual(packetStarted, ["a", "b"]);
+  assert.equal(result.record.status, "completed");
+});
+
+it("fails closed when a packet omits semantic dependency evidence", async () => {
+  const repository = new RecordingOrchestrationRepository();
+  const service = controller(repository, async () => undefined, {
+    investigationWorker: async () => ({ outcome: "confirmed", baseSha: "base-1" }),
+    packetWorker: async () => ({
+      packetId: "missing-evidence",
+      expectedPaths: ["src/missing.ts"],
+      semanticDependencies: undefined as never,
+      baseSha: "base-1",
+    }),
+    materializeExecution: async () => ({ items: [item("missing", 1)] }),
+  });
+  await assert.rejects(
+    service.createAndRun({ repository: "owner/repo", maxParallel: 1, investigationFirst: true, items: [item("missing", 1)] }),
+    /lacks authoritative semantic dependency evidence/,
+  );
+  assert.equal((await repository.loadOrchestration("dag-test"))?.status, "failed");
+});

@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { describe, it } from "node:test";
 import { createInvestigationFirstWorkers } from "./investigation-first.js";
-import type { OrchestrationRecord } from "../../core/ports/orchestration.js";
+import type { OrchestrationRecord, OrchestrationInvestigationRecord } from "../../core/ports/orchestration.js";
+import type { OrchestrationInvestigationWorkerContext, OrchestrationPacketWorkerContext } from "./controller.js";
 import type { ScheduledWorkItem } from "./scheduler.js";
+import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
+import type { AgentRuntime } from "../../runtime/agent-runtime.js";
 
 const item = (id: string, issue: number, dependencies: readonly string[] = []): ScheduledWorkItem => ({
   id, issue, priority: 1, dependencies: [...dependencies], claims: [`src/${id}.ts`],
@@ -75,5 +79,160 @@ describe("investigation-first execution handoff", () => {
       }),
       /unknown semantic dependency/,
     );
+  });
+});
+
+interface FactoryFixture {
+  item: ScheduledWorkItem;
+  workers: ReturnType<typeof createInvestigationFirstWorkers>;
+  runs: InMemoryRunRepository;
+  artifacts: InMemoryArtifactRepository;
+  investigation: OrchestrationInvestigationRecord;
+  packetContext: OrchestrationPacketWorkerContext;
+  subject: { repo: string; issue: number };
+  runId: string;
+  runtimeCalls: () => number;
+}
+
+async function createFactoryFixture(): Promise<FactoryFixture> {
+  const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  const workItem = item("integration", 101);
+  const subject = { repo: "owner/repo", issue: workItem.issue };
+  const runs = new InMemoryRunRepository();
+  const artifacts = new InMemoryArtifactRepository();
+  let runtimeCallCount = 0;
+  const runtime = {
+    run: async (task: { role: string }) => {
+      runtimeCallCount += 1;
+      if (task.role === "investigator") {
+        return {
+          output: {
+            outcome: "confirmed",
+            confidence: "high",
+            summary: "The issue is confirmed by the repository contract.",
+            evidence: [{ claim: "The contract is missing", source: "src/integration.ts:1", detail: "The integration boundary lacks the required behavior." }],
+            rootCause: "The integration boundary does not preserve the contract.",
+            affectedSurfaces: ["src/integration.ts"],
+            risks: [],
+            recommendation: "Implement the missing contract and add a regression test.",
+          },
+          sessionRef: "session-investigation",
+          provider: "test",
+          model: "test",
+        };
+      }
+      return {
+        output: {
+          scope: ["src/integration.ts"],
+          acceptanceCriteria: ["The integration contract is preserved."],
+          context: [{ source: "src/integration.ts", relevance: "The source contains the affected boundary." }],
+          implementationPlan: ["Update the integration boundary and add its regression test."],
+          expectedPaths: ["src/integration.ts"],
+          verificationPlan: ["`git diff --check`"],
+          risks: [],
+          outOfScope: [],
+        },
+        sessionRef: "session-packet",
+        provider: "test",
+        model: "test",
+      };
+    },
+    close: async () => undefined,
+  } as unknown as AgentRuntime;
+  const workers = createInvestigationFirstWorkers({
+    repository: subject.repo,
+    checkoutRoot: process.cwd(),
+    runtime,
+    artifacts,
+    runs,
+    resolveRoute: async () => ({
+      issue: { title: "Integration issue", body: "Preserve the contract.", url: "https://example.test/issues/101" },
+      targetBranch: "staging",
+      lane: "fast",
+      baseSha,
+    }),
+    getBranchHead: async () => baseSha,
+    sourceItems: () => [workItem],
+    materializeDecomposition: async () => undefined,
+  }, [workItem]);
+  const taskRuns: string[] = [];
+  const commonContext = {
+    promoteClaims: async () => undefined,
+    promoteTargetRouteClaim: async () => undefined,
+    orchestrationId: "dag-integration",
+    executionAttempt: 1,
+    attemptId: "attempt-integration",
+    recovery: "initial" as const,
+    recordTask: async (identity: { runId?: string }) => {
+      if (identity.runId !== undefined) taskRuns.push(identity.runId);
+    },
+    heartbeat: async () => undefined,
+    assertActive: () => undefined,
+  };
+  const investigated = await workers.investigationWorker(workItem, {
+    ...commonContext,
+    phase: "investigation",
+    wave: 1,
+  } as unknown as OrchestrationInvestigationWorkerContext);
+  const runId = String(investigated.evidence?.runId ?? "");
+  const investigationId = String(investigated.evidence?.investigationId ?? "");
+  assert.ok(runId);
+  assert.ok(investigationId);
+  if (!investigated.evidence) throw new Error("Investigation worker did not return durable evidence");
+  const evidence = investigated.evidence;
+  const investigation: OrchestrationInvestigationRecord = {
+    issue: workItem.issue,
+    nodeId: workItem.id,
+    runId,
+    investigationArtifactId: investigationId,
+    wave: 1,
+    baseSha,
+    targetBranch: "staging",
+    lane: "fast",
+    status: "completed",
+    outcome: "confirmed",
+    evidence,
+    attemptCount: 1,
+  };
+  const packetContext = {
+    ...commonContext,
+    phase: "packet",
+    wave: 1,
+    investigation,
+  } as unknown as OrchestrationPacketWorkerContext;
+  await workers.packetWorker(workItem, packetContext);
+  return { item: workItem, workers, runs, artifacts, investigation, packetContext, subject, runId, runtimeCalls: () => runtimeCallCount };
+}
+
+describe("investigation-first factory recovery", () => {
+  it("replays the confirmed transition before preparing from an investigating run", async () => {
+    const fixture = await createFactoryFixture();
+    const run = await fixture.runs.load(fixture.runId);
+    assert.equal(run?.state, "building");
+    const history = await fixture.runs.history(fixture.runId);
+    assert.deepEqual(history.map((record) => record.event), [
+      "START_INVESTIGATION",
+      "INVESTIGATION_CONFIRMED",
+      "BUILD_PACKET_READY",
+    ]);
+    assert.equal(history.filter((record) => record.event === "INVESTIGATION_CONFIRMED").length, 1);
+    assert.equal((await fixture.artifacts.list(fixture.subject, "BuildPacket")).length, 1);
+    assert.equal(fixture.runtimeCalls(), 2);
+  });
+
+  it("reuses the exact durable packet after a building crash window", async () => {
+    const fixture = await createFactoryFixture();
+    const beforeHistory = await fixture.runs.history(fixture.runId);
+    const beforeArtifacts = await fixture.artifacts.list(fixture.subject);
+    const beforeRuntimeCalls = fixture.runtimeCalls();
+    const firstPacketId = beforeArtifacts.find((artifact) => artifact.kind === "BuildPacket")?.id;
+    const result = await fixture.workers.packetWorker(fixture.item, fixture.packetContext);
+    const afterHistory = await fixture.runs.history(fixture.runId);
+    const afterArtifacts = await fixture.artifacts.list(fixture.subject);
+    assert.equal(result.packetId, firstPacketId);
+    assert.equal(fixture.runtimeCalls(), beforeRuntimeCalls);
+    assert.deepEqual(afterHistory, beforeHistory);
+    assert.equal(afterArtifacts.length, beforeArtifacts.length);
+    assert.equal(afterArtifacts.filter((artifact) => artifact.kind === "BuildPacket").length, 1);
   });
 });

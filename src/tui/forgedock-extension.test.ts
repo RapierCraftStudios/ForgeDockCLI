@@ -3629,6 +3629,95 @@ test("explicit orchestration stop routes to forgedock_orchestrate and invokes du
   assert.equal((await repository.loadOrchestration(orchestrationId))?.status, "cancelled");
 });
 
+test("restarted TUI semantic stop cancels persisted native task without RPC fallback", async () => {
+  const orchestrationId = "dag_restart_stop_native";
+  const nativeTaskId = "task_native_restarted";
+  const repository = new InMemoryOrchestrationRepository();
+  await repository.createOrchestration({
+    schema: "forgedock.orchestration/v1",
+    orchestrationId,
+    repository: "owner/repo",
+    issueNumbers: [1],
+    requestedIssueNumbers: [1],
+    maxParallel: 1,
+    autoMerge: true,
+    status: "running",
+    createdAt: "2030-01-01T00:00:00.000Z",
+    updatedAt: "2030-01-01T00:00:00.000Z",
+    nodes: [{
+      id: "issue-1", issue: 1, priority: 1, dependencies: [], claims: [], status: "running", childRunIds: [],
+      attempts: [{ attemptId: "attempt-1", attempt: 1, recovery: "initial", status: "running", startedAt: "2030-01-01T00:00:00.000Z", updatedAt: "2030-01-01T00:00:00.000Z", taskId: nativeTaskId, controllerTaskId: nativeTaskId }],
+    }],
+  });
+  let nativeStops = 0;
+  let rpcStops = 0;
+  const state = fakePi(["read"], {
+    orchestrationRepository: repository,
+    orchestrationExecutionAdmission: new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository()),
+    dispatchReadinessCheck: async () => undefined,
+    controllerEntryPath: null,
+  });
+  const originalEmit = state.pi.events.emit.bind(state.pi.events);
+  state.pi.events.emit = ((name: string, data: any) => {
+    if (name === "subagents:rpc:v1:request" && data.method === "stop") rpcStops++;
+    originalEmit(name, data);
+  }) as typeof state.pi.events.emit;
+  const transport = {
+    list: () => [{ id: nativeTaskId, command: "node", args: [], cwd: process.cwd(), pid: 999999999, logPath: "", status: "detached" as const, startedAt: new Date(0).toISOString() }],
+    isActive: () => false,
+    isPersistedActive: () => true,
+    stop: () => { nativeStops++; },
+    start: async () => "unexpected",
+    wait: async () => undefined,
+  };
+  const delegator = new VisibleDagDelegator(
+    state.pi,
+    () => repository,
+    undefined,
+    transport,
+    () => new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository()),
+  );
+  await assert.rejects(
+    delegator.stop(orchestrationId, true),
+    /cancellation was durably persisted.*drain remains unresolved/i,
+  );
+  assert.equal((await repository.loadOrchestration(orchestrationId))?.status, "cancelled");
+  assert.equal(nativeStops, 1);
+  assert.equal(rpcStops, 0);
+  await delegator.shutdown();
+});
+
+test("shared persisted native records consume capacity in a second TUI", async () => {
+  const state = fakePi();
+  const repository = new InMemoryOrchestrationRepository();
+  const sharedRecords = [{ id: "task-first-tui", command: "node", args: [], cwd: process.cwd(), pid: 1234, logPath: "", status: "running" as const, startedAt: new Date(0).toISOString() }];
+  let starts = 0;
+  let persistedLive = true;
+  const transport = {
+    list: () => sharedRecords,
+    isActive: () => false,
+    isPersistedActive: () => persistedLive,
+    start: async () => { starts++; return "unexpected"; },
+    wait: async () => undefined,
+  };
+  const admission = new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository());
+  const secondTui = new VisibleDagDelegator(state.pi, () => repository, undefined, transport, () => admission);
+  const run = secondTui.start({
+    repository: "a/b",
+    items: [{ id: "issue-capacity-cross-tui", issue: 1, title: "Capacity", summary: "Capacity", priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [1] }],
+    maxParallel: 1,
+    taskFor: () => ({ agent: "forgedock-issue-worker", task: "Deliver issue #1", cwd: process.cwd() }),
+    controllerTaskFor: () => ({ args: [], cwd: process.cwd() }),
+    assertCompleted: async () => undefined,
+    onComplete: () => undefined,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(starts, 0);
+  persistedLive = false;
+  await secondTui.shutdown();
+  await assert.rejects(run, /shutdown|cancelled/i);
+});
+
 test("fresh TUI stop initializes durable context and reports terminal status truthfully", async () => {
   const repository = new InMemoryOrchestrationRepository();
   const admission = new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository());

@@ -1,22 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { createHash } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { createArtifact } from "../../core/artifacts/schema.js";
+import { assertArtifact, createArtifact, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import type {
   OrchestrationExecutionMaterializer,
   OrchestrationInvestigationWorker,
   OrchestrationPacketWorker,
 } from "./controller.js";
-import type { OrchestrationRecord, OrchestrationInvestigationRecord } from "../../core/ports/orchestration.js";
+import type { OrchestrationRecord, OrchestrationInvestigationRecord, OrchestrationPacketIdentity } from "../../core/ports/orchestration.js";
 import type { ScheduledWorkItem, ClaimSerializationEdge } from "./scheduler.js";
-import { investigateWorkItem } from "../work-on/investigate.js";
+import { investigateWorkItem, resumeInvestigationWorkItem } from "../work-on/investigate.js";
 import { prepareBuildPacket, type VerificationCatalog } from "../work-on/prepare.js";
-import { STANDARD_SCOPE_METADATA_ROOTS, type AgentRuntime } from "../../runtime/agent-runtime.js";
+import { STANDARD_SCOPE_METADATA_ROOTS, scopeManifestForBuildPacket, type AgentRuntime } from "../../runtime/agent-runtime.js";
+import { attachArtifact, transition, type RunState } from "../../core/state/machine.js";
 import type { ThinkingLevel } from "../../core/config/forgedock-config.js";
 import { materializeClaimDependencies } from "./scheduler.js";
-import { compileExecutionDag } from "./packet-wave.js";
+import { compileExecutionDag, normalizePacketPaths, normalizeSemanticDependencies } from "./packet-wave.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -144,24 +146,87 @@ export function createInvestigationFirstWorkers(
   };
 
   const packetWorker: OrchestrationPacketWorker = async (item, context) => {
-    const investigation = context.investigation;
-    const runId = investigation.runId ?? String(investigation.evidence?.runId ?? "");
-    if (!runId) throw new Error(`Packet ${item.id} has no durable investigation run`);
-    const run = await options.runs.load(runId);
-    if (!run) throw new Error(`Packet ${item.id} investigation run ${runId} is missing`);
-    const artifacts = await options.artifacts.list({ repo: item.repository ?? options.repository, issue: item.issue });
-    const intent = [...artifacts].reverse().find((artifact) => artifact.kind === "Intent" && artifact.runId === runId);
-    const investigationArtifact = [...artifacts].reverse().find((artifact) => artifact.kind === "Investigation" && artifact.id === investigation.investigationArtifactId);
-    if (!intent || intent.kind !== "Intent") throw new Error(`Packet ${item.id} is missing its durable Intent`);
-    if (!investigationArtifact || investigationArtifact.kind !== "Investigation") throw new Error(`Packet ${item.id} is missing its durable Investigation artifact`);
     const route = await options.resolveRoute(item);
-    const baseSha = investigation.baseSha ?? route.baseSha ?? await options.getBranchHead(item.repository ?? options.repository, route.targetBranch);
+    const checkpoint = await loadExactInvestigationCheckpoint(options, item, context.investigation);
+    const baseSha = await resolveExactBaseSha(options, item, route, checkpoint.investigation, context.investigation);
+    assertRouteMatchesCheckpoint(route, checkpoint.run, context.investigation, item.id);
     await assertExactCheckout(options.checkoutRoot, baseSha);
+
+    let run = checkpoint.run;
+    if (run.state === "investigating") {
+      const resumed = await resumeInvestigationWorkItem({
+        run,
+        intent: checkpoint.intent,
+        investigation: checkpoint.investigation,
+        cwd: options.checkoutRoot,
+        target: {
+          lane: route.lane,
+          targetBranch: route.targetBranch,
+          ...(route.promotionTarget !== undefined ? { promotionTarget: route.promotionTarget } : {}),
+          ...(options.productionTarget !== undefined ? { productionTarget: options.productionTarget } : {}),
+        },
+        scopeHints: {
+          affectedFiles: item.affectedFiles ?? [],
+          claims: item.claims,
+          metadataRoots: STANDARD_SCOPE_METADATA_ROOTS,
+        },
+        ...(context.signal !== undefined ? { signal: context.signal } : {}),
+      }, {
+        runtime: options.runtime,
+        artifacts: options.artifacts,
+        runs: options.runs,
+        ...(context.signal !== undefined ? { signal: context.signal } : {}),
+        assertActive: context.assertActive,
+      });
+      run = resumed.run;
+      if (run.state !== "preparing") {
+        throw new Error(`Packet ${item.id} investigation recovery ended in ${run.state}, expected preparing`);
+      }
+    }
+
+    if (run.state === "building") {
+      const packet = reusableBuildPacket(checkpoint.artifacts, run, checkpoint.subject, baseSha, item.id, checkpoint.investigation);
+      await assertExactCheckout(options.checkoutRoot, baseSha);
+      const observed = await options.getBranchHead(item.repository ?? options.repository, route.targetBranch);
+      assertExactSha(`Packet ${item.id} base`, baseSha, observed);
+      await context.recordTask({ runId: run.runId });
+      return {
+        packetId: packet.id,
+        identity: packetIdentity(item, packet.id, run, checkpoint.investigation, baseSha),
+        expectedPaths: packet.payload.expectedPaths,
+        semanticDependencies: item.dependencies,
+        baseSha,
+      };
+    }
+
+    if (run.state !== "preparing") {
+      throw new Error(`Packet ${item.id} requires preparing or building state, found ${run.state}`);
+    }
+    const orphan = findReusableBuildPacket(checkpoint.artifacts, run, checkpoint.subject, baseSha, item.id, checkpoint.investigation);
+    if (orphan) {
+      const scopeManifest = scopeManifestForBuildPacket(
+        normalizePacketPaths(orphan.payload.expectedPaths),
+        (orphan.payload.evidencePaths ?? []).map(({ path }) => path),
+      );
+      const advanced = transition(run, "BUILD_PACKET_READY", { scopeManifest });
+      await options.runs.commit(run.version, advanced.state, advanced.record);
+      run = advanced.state;
+      await context.recordTask({ runId: run.runId });
+      return {
+        packetId: orphan.id,
+        identity: packetIdentity(item, orphan.id, run, checkpoint.investigation, baseSha),
+        expectedPaths: orphan.payload.expectedPaths,
+        semanticDependencies: item.dependencies,
+        baseSha,
+      };
+    }
+
     const prepared = await prepareBuildPacket({
       run,
-      intent,
-      investigation: investigationArtifact,
+      intent: checkpoint.intent,
+      investigation: checkpoint.investigation,
       cwd: options.checkoutRoot,
+      baseSha,
       scopeHints: { affectedFiles: item.affectedFiles ?? [], claims: item.claims, metadataRoots: STANDARD_SCOPE_METADATA_ROOTS },
       ...(options.verificationCatalog !== undefined ? { verificationCatalog: options.verificationCatalog } : {}),
       ...(options.provider !== undefined ? { provider: options.provider } : {}),
@@ -172,10 +237,11 @@ export function createInvestigationFirstWorkers(
     }, { runtime: options.runtime, artifacts: options.artifacts, runs: options.runs });
     await assertExactCheckout(options.checkoutRoot, baseSha);
     const observed = await options.getBranchHead(item.repository ?? options.repository, route.targetBranch);
-    if (observed !== baseSha) throw new Error(`Packet base drifted for ${item.id}: expected ${baseSha}, observed ${observed}`);
+    assertExactSha(`Packet ${item.id} base`, baseSha, observed);
     await context.recordTask({ runId: prepared.run.runId });
     return {
       packetId: prepared.packet.id,
+      identity: packetIdentity(item, prepared.packet.id, prepared.run, checkpoint.investigation, baseSha),
       expectedPaths: prepared.packet.payload.expectedPaths,
       semanticDependencies: item.dependencies,
       baseSha,
@@ -247,31 +313,47 @@ export function createInvestigationFirstWorkers(
     }
     let executionItems = items;
     let executionEdges: ClaimSerializationEdge[];
-    if (packets?.length) {
-      const packetById = new Map(packets.filter((packet) => packet.status === "completed").map((packet) => [packet.nodeId, packet]));
+    if (packets !== undefined) {
+      const packetById = new Map<string, typeof packets[number]>();
+      const packetIds = new Set<string>();
+      const packetNodeIds = new Set<string>();
+      for (const packet of packets) {
+        if (packetNodeIds.has(packet.nodeId)) throw new Error(`Duplicate durable packet identity for ${packet.nodeId}`);
+        packetNodeIds.add(packet.nodeId);
+        if (packet.packetId !== undefined) {
+          if (packetIds.has(packet.packetId)) throw new Error(`Duplicate packet identity ${packet.packetId}`);
+          packetIds.add(packet.packetId);
+        }
+        if (packet.status === "completed") packetById.set(packet.nodeId, packet);
+      }
       const confirmedPacketIds = new Set(items.map((item) => item.id));
       const packetInputs = items.map((item) => {
         const packet = packetById.get(item.id);
         if (!packet?.expectedPaths?.length || !packet.baseSha) throw new Error(`Packet barrier has no durable packet for ${item.id}`);
         if (packet.semanticDependencies === undefined) throw new Error(`Packet ${item.id} lacks authoritative semantic dependency evidence`);
-        const semanticDependencies = [...new Set(packet.semanticDependencies)];
+        const semanticDependencies = normalizeSemanticDependencies(packet.semanticDependencies);
         if (semanticDependencies.some((dependency) => !confirmedPacketIds.has(dependency))) {
           throw new Error(`Packet ${item.id} references unknown semantic dependency`);
         }
         return {
           id: item.id,
           issue: item.issue,
-          expectedPaths: packet.expectedPaths,
+          expectedPaths: normalizePacketPaths(packet.expectedPaths),
           baseRef: packet.baseSha,
           semanticDependencies,
           ...(item.memberIssues !== undefined ? { childIssues: item.memberIssues } : {}),
         };
       });
-      const baseRef = packetInputs[0]?.baseRef;
-      if (!baseRef || packetInputs.some((packet) => packet.baseRef !== baseRef)) throw new Error("Packet barrier contains multiple or missing exact bases");
-      const compiled = compileExecutionDag({ items, packets: packetInputs, baseRef });
-      executionItems = compiled.items;
-      executionEdges = compiled.edges;
+      if (!packetInputs.length) {
+        executionItems = [];
+        executionEdges = [];
+      } else {
+        const baseRef = packetInputs[0]!.baseRef;
+        if (packetInputs.some((packet) => packet.baseRef !== baseRef)) throw new Error("Packet barrier contains multiple or missing exact bases");
+        const compiled = compileExecutionDag({ items, packets: packetInputs, baseRef });
+        executionItems = compiled.items;
+        executionEdges = compiled.edges;
+      }
     } else {
       executionEdges = materializeClaimDependencies(items).edges;
     }
@@ -311,6 +393,209 @@ export function createInvestigationFirstWorkers(
   };
   return { investigationWorker, packetWorker, materializeExecution };
 }
+
+interface InvestigationCheckpoint {
+  subject: Subject;
+  run: RunState;
+  intent: DurableArtifact<"Intent">;
+  investigation: DurableArtifact<"Investigation">;
+  artifacts: readonly DurableArtifact[];
+}
+
+async function loadExactInvestigationCheckpoint(
+  options: InvestigationFirstFactoryOptions,
+  item: ScheduledWorkItem,
+  record: OrchestrationInvestigationRecord,
+): Promise<InvestigationCheckpoint> {
+  const subject = { repo: item.repository ?? options.repository, issue: item.issue };
+  if (record.nodeId !== item.id) {
+    throw new Error(`Packet ${item.id} investigation node ${record.nodeId} does not match scheduled node`);
+  }
+  if (record.issue !== item.issue) {
+    throw new Error(`Packet ${item.id} investigation issue ${record.issue} does not match scheduled issue ${item.issue}`);
+  }
+  const runId = record.runId?.trim();
+  if (!runId) throw new Error(`Packet ${item.id} has no durable investigation run`);
+  const investigationId = record.investigationArtifactId?.trim();
+  if (!investigationId) throw new Error(`Packet ${item.id} has no durable Investigation artifact identity`);
+
+  const run = await options.runs.load(runId);
+  if (!run) throw new Error(`Packet ${item.id} investigation run ${runId} is missing`);
+  if (run.workflow !== "work-on") throw new Error(`Packet ${item.id} investigation run ${runId} has workflow ${run.workflow}`);
+  if (run.runId !== runId) throw new Error(`Packet ${item.id} loaded the wrong durable run ${run.runId}`);
+  if (!sameSubject(run.subject, subject)) throw new Error(`Packet ${item.id} durable run subject does not match the scheduled issue`);
+
+  const artifacts = await options.artifacts.list(subject);
+  const intents = artifacts.filter((artifact): artifact is DurableArtifact<"Intent"> =>
+    artifact.kind === "Intent" && artifact.runId === runId && sameSubject(artifact.subject, subject));
+  if (intents.length !== 1) {
+    throw new Error(`Packet ${item.id} requires exactly one durable Intent for run ${runId}; found ${intents.length}`);
+  }
+  const intent = intents[0]!;
+  assertArtifact(intent);
+  const investigations = artifacts.filter((artifact): artifact is DurableArtifact<"Investigation"> =>
+    artifact.kind === "Investigation"
+      && artifact.id === investigationId
+      && artifact.runId === runId
+      && sameSubject(artifact.subject, subject));
+  if (investigations.length !== 1) {
+    throw new Error(`Packet ${item.id} requires exactly one durable Investigation ${investigationId} for run ${runId}; found ${investigations.length}`);
+  }
+  const investigation = investigations[0]!;
+  assertArtifact(investigation);
+  if (investigation.payload.outcome !== "confirmed") {
+    throw new Error(`Packet ${item.id} requires a confirmed durable Investigation, found ${investigation.payload.outcome}`);
+  }
+  if (record.outcome !== undefined && record.outcome !== "confirmed") {
+    throw new Error(`Packet ${item.id} investigation record is ${record.outcome}, not confirmed`);
+  }
+  assertOptionalIdentity(record.evidence?.runId, runId, `Packet ${item.id} investigation evidence run`);
+  assertOptionalIdentity(record.evidence?.investigationId, investigationId, `Packet ${item.id} investigation evidence artifact`);
+  return { subject, run, intent, investigation, artifacts };
+}
+
+async function resolveExactBaseSha(
+  options: InvestigationFirstFactoryOptions,
+  item: ScheduledWorkItem,
+  route: InvestigationFirstRoute,
+  investigationArtifact: DurableArtifact<"Investigation">,
+  record: OrchestrationInvestigationRecord,
+): Promise<string> {
+  const rawBaseSha = record.baseSha?.trim();
+  if (!rawBaseSha) throw new Error(`Packet ${item.id} has no durable investigation base SHA`);
+  const baseSha = rawBaseSha.toLowerCase();
+  assertExactSha(`Packet ${item.id} durable investigation base`, baseSha, rawBaseSha);
+  const evidenceBaseSha = typeof record.evidence?.baseSha === "string" ? record.evidence.baseSha : undefined;
+  if (evidenceBaseSha !== undefined) assertExactSha(`Packet ${item.id} investigation evidence base`, baseSha, evidenceBaseSha);
+  if (route.baseSha !== undefined) assertExactSha(`Packet ${item.id} route base`, baseSha, route.baseSha);
+  const observed = await options.getBranchHead(item.repository ?? options.repository, route.targetBranch);
+  assertExactSha(`Packet ${item.id} branch base`, baseSha, observed);
+  // The Investigation artifact has no base field in its schema. Its identity is
+  // nevertheless checked above through the orchestration record, which is the
+  // controller-owned exact-base checkpoint for this phase.
+  void investigationArtifact;
+  return baseSha;
+}
+
+function assertRouteMatchesCheckpoint(
+  route: InvestigationFirstRoute,
+  run: RunState,
+  record: OrchestrationInvestigationRecord,
+  itemId: string,
+): void {
+  if (run.targetBranch !== undefined && run.targetBranch !== route.targetBranch) {
+    throw new Error(`Packet ${itemId} durable run target ${run.targetBranch} does not match route ${route.targetBranch}`);
+  }
+  if (record.targetBranch !== undefined && record.targetBranch !== route.targetBranch) {
+    throw new Error(`Packet ${itemId} investigation target ${record.targetBranch} does not match route ${route.targetBranch}`);
+  }
+  if (run.lane !== undefined && run.lane !== route.lane) {
+    throw new Error(`Packet ${itemId} durable run lane ${run.lane} does not match route ${route.lane}`);
+  }
+  if (record.lane !== undefined && record.lane !== route.lane) {
+    throw new Error(`Packet ${itemId} investigation lane ${record.lane} does not match route ${route.lane}`);
+  }
+  if (run.promotionTarget !== undefined && run.promotionTarget !== route.promotionTarget) {
+    throw new Error(`Packet ${itemId} durable run promotion target does not match route`);
+  }
+}
+
+function reusableBuildPacket(
+  artifacts: readonly DurableArtifact[],
+  run: RunState,
+  subject: Subject,
+  baseSha: string,
+  itemId: string,
+  investigation: DurableArtifact<"Investigation">,
+): DurableArtifact<"BuildPacket"> {
+  const packet = findReusableBuildPacket(artifacts, run, subject, baseSha, itemId, investigation);
+  if (!packet) throw new Error(`Packet ${itemId} building recovery requires exactly one attached BuildPacket`);
+  return packet;
+}
+
+/** Find one exact attached packet, or one uncommitted artifact from the append/commit crash window. */
+function findReusableBuildPacket(
+  artifacts: readonly DurableArtifact[],
+  run: RunState,
+  subject: Subject,
+  baseSha: string,
+  itemId: string,
+  investigation: DurableArtifact<"Investigation">,
+): DurableArtifact<"BuildPacket"> | undefined {
+  const attachedIds = run.artifactIds.BuildPacket ?? [];
+  if (attachedIds.length > 1 || (attachedIds.length === 1 && !attachedIds[0])) {
+    throw new Error(`Packet ${itemId} has an ambiguous durable BuildPacket attachment`);
+  }
+  const candidates = artifacts.filter((artifact): artifact is DurableArtifact<"BuildPacket"> =>
+    artifact.kind === "BuildPacket" && artifact.runId === run.runId && sameSubject(artifact.subject, subject));
+  const selected = attachedIds.length === 1
+    ? candidates.filter((candidate) => candidate.id === attachedIds[0])
+    : candidates;
+  if (selected.length > 1) throw new Error(`Packet ${itemId} has ambiguous durable BuildPacket artifacts`);
+  if (!selected.length) {
+    if (attachedIds.length === 1) throw new Error(`Packet ${itemId} building recovery could not load exact BuildPacket ${attachedIds[0]}`);
+    return undefined;
+  }
+  const packet = selected[0]!;
+  assertArtifact(packet);
+  if (!packet.payload.expectedPaths.length) throw new Error(`Packet ${itemId} durable BuildPacket has no expected paths`);
+  normalizePacketPaths(packet.payload.expectedPaths);
+  for (const packetBaseSha of [
+    packet.payload.contextPackage?.baseSha,
+    packet.payload.relationGraph?.baseSha,
+    packet.payload.investigationScopeReceipt?.baseSha,
+  ]) {
+    if (packetBaseSha !== undefined) assertExactSha(`Packet ${itemId} BuildPacket base`, baseSha, packetBaseSha);
+  }
+  const investigationDigest = createHash("sha256").update(JSON.stringify(investigation.payload)).digest("hex");
+  const receipt = packet.payload.investigationScopeReceipt;
+  if (receipt) {
+    if (receipt.runId !== run.runId) throw new Error(`Packet ${itemId} BuildPacket scope receipt run identity drifted`);
+    if (!sameSubject(receipt.subject, subject)) throw new Error(`Packet ${itemId} BuildPacket scope receipt subject drifted`);
+    if (receipt.investigationId !== investigation.id) throw new Error(`Packet ${itemId} BuildPacket scope receipt investigation identity drifted`);
+    if (receipt.investigationDigest !== investigationDigest) throw new Error(`Packet ${itemId} BuildPacket investigation digest drifted`);
+  }
+  if (packet.payload.contextPackage?.investigationDigest !== undefined
+    && packet.payload.contextPackage.investigationDigest !== investigationDigest) {
+    throw new Error(`Packet ${itemId} BuildPacket context investigation digest drifted`);
+  }
+  return packet;
+}
+
+function packetIdentity(
+  item: ScheduledWorkItem,
+  packetId: string,
+  run: RunState,
+  investigation: DurableArtifact<"Investigation">,
+  baseSha: string,
+): OrchestrationPacketIdentity {
+  return {
+    nodeId: item.id,
+    packetId,
+    runId: run.runId,
+    investigationId: investigation.id,
+    subject: { repo: run.subject.repo, issue: item.issue },
+    baseSha,
+  };
+}
+
+function assertOptionalIdentity(value: unknown, expected: string, label: string): void {
+  if (value !== undefined && String(value) !== expected) throw new Error(`${label} does not match ${expected}`);
+}
+
+function assertExactSha(label: string, expected: string, observed: string): void {
+  if (!/^[0-9a-f]{7,64}$/i.test(expected)) throw new Error(`${label} is not an exact SHA: ${expected}`);
+  if (!/^[0-9a-f]{7,64}$/i.test(observed) || observed.toLowerCase() !== expected.toLowerCase()) {
+    throw new Error(`${label} drifted: expected ${expected}, observed ${observed}`);
+  }
+}
+
+function sameSubject(left: Subject, right: Subject): boolean {
+  return left.repo.trim().toLowerCase() === right.repo.trim().toLowerCase()
+    && left.issue === right.issue
+    && left.pr === right.pr;
+}
+
 
 async function assertExactCheckout(cwd: string, expectedSha: string): Promise<void> {
   let stdout: string;

@@ -37,6 +37,8 @@ class CompletionHost implements ForgeHost {
   async materializeDecomposition() { return []; }
   snapshot = { ...openPr };
   merges = 0;
+  mergeThenThrow = false;
+  failMergedReadOnce = false;
   mergeBase?: string;
   mergeOptions?: { requiredChecksMode?: "require" | "if-present" } | undefined;
   mergeGate: PullRequestMergeGate = {
@@ -47,8 +49,17 @@ class CompletionHost implements ForgeHost {
   };
   closes: number[] = [];
   async createPullRequest(): Promise<PullRequestSnapshot> { return this.snapshot; }
-  async getPullRequest(): Promise<PullRequestSnapshot> { return { ...this.snapshot }; }
-  async getPullRequestMergeGate(): Promise<PullRequestMergeGate> { return { ...this.mergeGate, requiredChecks: [...this.mergeGate.requiredChecks] }; }
+  async getPullRequest(): Promise<PullRequestSnapshot> {
+    if (this.snapshot.state === "MERGED" && this.failMergedReadOnce) {
+      this.failMergedReadOnce = false;
+      throw new Error("HTTP 503 merged confirmation unavailable");
+    }
+    return { ...this.snapshot };
+  }
+  async getPullRequestMergeGate(): Promise<PullRequestMergeGate> {
+    if (this.snapshot.state === "MERGED") throw new Error("merge gate is only available for OPEN pull requests");
+    return { ...this.mergeGate, requiredChecks: [...this.mergeGate.requiredChecks] };
+  }
   async getPullRequestDiff(): Promise<string> { return ""; }
   async publishPullRequestComment(): Promise<void> {}
   async materializeReviewFinding() { return { repo: "a/b", number: 99, title: "finding", body: "", url: "https://github.test/a/b/issues/99", state: "OPEN" as const }; }
@@ -57,6 +68,7 @@ class CompletionHost implements ForgeHost {
     this.mergeBase = base;
     this.mergeOptions = options;
     this.snapshot.state = "MERGED";
+    if (this.mergeThenThrow) throw new Error("HTTP 503 merge response unavailable");
   }
   async closeIssue(_repo: string, issue: number): Promise<void> {
     if (this.failClose) throw new Error("issue closure unavailable");
@@ -457,6 +469,27 @@ describe("merge and close authority", () => {
     assert.equal(host.merges, 0);
   });
 
+  it("preserves transient merge-gate transport errors as recoverable checkpoints", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    Object.defineProperty(host, "getPullRequestMergeGate", { value: async () => {
+      throw Object.assign(new Error("HTTP 503: GitHub merge-gate service unavailable"), { status: 503 });
+    } });
+    const artifacts = new InMemoryArtifactRepository();
+    let caught: unknown;
+    try {
+      await completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, { host, artifacts, runs });
+    } catch (error) {
+      caught = error;
+    }
+    assert.equal((caught as { recoverable?: boolean }).recoverable, true);
+    assert.equal((caught as { run?: RunState }).run?.state, "merging");
+    assert.equal((caught as { retryDisposition?: { retryable?: boolean } }).retryDisposition?.retryable, true);
+    assert.equal((await runs.load(run.runId))?.state, "merging");
+    assert.deepEqual(await artifacts.list(run.subject, "Outcome"), []);
+  });
+
   it("polls transient UNKNOWN mergeability until GitHub confirms mergeable", async () => {
     const runs = new InMemoryRunRepository();
     const run = await mergingRun(runs);
@@ -600,7 +633,7 @@ describe("merge and close authority", () => {
     assert.equal(host.merges, 0);
   });
 
-  it("accepts an exact concurrent merge after the authoritative gate query", async () => {
+  it("fails closed when an external merge races the authoritative gate query", async () => {
     const runs = new InMemoryRunRepository();
     const run = await mergingRun(runs);
     const artifacts = new InMemoryArtifactRepository();
@@ -610,10 +643,86 @@ describe("merge and close authority", () => {
       return { ...host.mergeGate, requiredChecks: [...host.mergeGate.requiredChecks] };
     };
 
-    const result = await completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, { host, artifacts, runs });
+    await assert.rejects(
+      completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, { host, artifacts, runs }),
+      /without a durable merge checkpoint.*refusing external merge/,
+    );
+    assert.equal((await runs.load(run.runId))?.state, "failed");
+    assert.equal(host.merges, 0);
+    assert.deepEqual(host.closes, []);
+    assert.deepEqual(await artifacts.list(run.subject, "Outcome"), []);
+  });
+
+  it("fails closed when an external merge races a failing authoritative gate query", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const artifacts = new InMemoryArtifactRepository();
+    const host = new CompletionHost();
+    host.mergeGate = { ...host.mergeGate, mergeable: false, mergeability: "conflicting" };
+    host.getPullRequestMergeGate = async () => {
+      host.snapshot.state = "MERGED";
+      return { ...host.mergeGate, requiredChecks: [...host.mergeGate.requiredChecks] };
+    };
+
+    await assert.rejects(
+      completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, { host, artifacts, runs }),
+      /became MERGED during merge-gate polling.*refusing external merge/,
+    );
+    assert.equal(host.merges, 0);
+    assert.deepEqual(await artifacts.list(run.subject, "Outcome"), []);
+  });
+
+  it("resumes a durable closing checkpoint without querying the merged PR gate", async () => {
+    const runs = new InMemoryRunRepository();
+    const merging = await mergingRun(runs);
+    const checkpoint = transition(merging, "MERGE_COMPLETED", { headSha: sha });
+    await runs.commit(merging.version, checkpoint.state, checkpoint.record);
+    const host = new CompletionHost();
+    host.snapshot = { ...host.snapshot, state: "MERGED" };
+    const artifacts = new InMemoryArtifactRepository();
+
+    const result = await completeWorkItem({
+      run: checkpoint.state,
+      pullRequest: openPr,
+      verdict: verdict(checkpoint.state),
+      autoMerge: true,
+    }, { host, artifacts, runs });
+
     assert.equal(result.run.state, "completed");
+    assert.equal(result.outcome?.payload.status, "merged");
     assert.equal(host.merges, 0);
     assert.deepEqual(host.closes, [2]);
+    assert.equal((await artifacts.list(checkpoint.state.subject, "Outcome")).length, 1);
+  });
+
+  it("validates a durable terminal Outcome before bypassing the merged PR gate", async () => {
+    const runId = `run_complete_durable_${crypto.randomUUID()}`;
+    const firstRuns = new InMemoryRunRepository();
+    const firstRun = await mergingRun(firstRuns, runId);
+    const host = new CompletionHost();
+    const artifacts = new InMemoryArtifactRepository();
+    const first = await completeWorkItem({
+      run: firstRun,
+      pullRequest: openPr,
+      verdict: verdict(firstRun),
+      autoMerge: true,
+    }, { host, artifacts, runs: firstRuns });
+    assert.equal(first.outcome?.payload.status, "merged");
+    assert.deepEqual(host.closes, [2]);
+
+    const retryRuns = new InMemoryRunRepository();
+    const retryRun = await mergingRun(retryRuns, runId);
+    const retried = await completeWorkItem({
+      run: retryRun,
+      pullRequest: openPr,
+      verdict: verdict(retryRun),
+      autoMerge: true,
+    }, { host, artifacts, runs: retryRuns });
+
+    assert.equal(retried.run.state, "completed");
+    assert.equal(retried.outcome?.id, first.outcome?.id);
+    assert.equal(host.merges, 1);
+    assert.deepEqual(host.closes, [2], "durable closure retry must not replay issue mutation");
   });
 
   it("auto-merges only the reviewed SHA then records Outcome and closes", async () => {
@@ -628,6 +737,38 @@ describe("merge and close authority", () => {
     assert.equal(host.merges, 1);
     assert.equal(host.mergeBase, "main");
     assert.deepEqual(host.closes, [2]);
+  });
+
+
+  it("adopts an exact merged PR after losing merge-command confirmation", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await mergingRun(runs);
+    const host = new CompletionHost();
+    host.mergeThenThrow = true;
+    host.failMergedReadOnce = true;
+    const artifacts = new InMemoryArtifactRepository();
+    let caught: any;
+    await assert.rejects(
+      completeWorkItem({ run, pullRequest: openPr, verdict: verdict(run), autoMerge: true }, { host, artifacts, runs }),
+      (error: unknown) => {
+        caught = error;
+        return true;
+      },
+    );
+    assert.equal(caught?.recoverable, true);
+    assert.equal(caught?.run?.state, "merging");
+    assert.equal(caught?.run?.mergeAttempt?.headSha, sha);
+    assert.equal(host.merges, 1);
+
+    host.mergeThenThrow = false;
+    const resumed = await completeWorkItem({
+      run: caught.run,
+      pullRequest: openPr,
+      verdict: verdict(caught.run),
+      autoMerge: true,
+    }, { host, artifacts, runs });
+    assert.equal(resumed.run.state, "completed");
+    assert.equal(host.merges, 1, "exact merged adoption must not issue a second merge command");
   });
 
   it("does not publish a terminal Outcome when trajectory publication fails after merge", async () => {

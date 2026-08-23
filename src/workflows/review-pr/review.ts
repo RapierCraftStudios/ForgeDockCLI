@@ -872,11 +872,18 @@ export async function reviewPullRequest(
     });
     // A prior ledger entry is not fresh evidence. Only roots linked to an
     // authoritative finding from this exact review can reopen or project.
+    // Omitted roots still retain closure authority, however: their durable
+    // state must block approval without copying the prior representative back
+    // into the current verdict as stale source/remediation evidence.
     const authoritativeFindingIds = new Set(authoritativeFindings.map((finding) => finding.id));
     const freshRoots = priorRootLedger
       ? roots.filter((root) => root.findingIds.some((id) => authoritativeFindingIds.has(id)))
       : roots;
     const openFindings = openLedgerFindings(freshRoots);
+    const priorOpenRootIds = new Set(openPriorRoots.map(({ rootId }) => rootId));
+    const unresolvedPriorRoots = roots.filter((root) => priorOpenRootIds.has(root.rootId)
+      && (root.state === "open" || root.state === "fix-attempted" || root.state === "regressed")
+      && !freshRoots.some((freshRoot) => freshRoot.rootId === root.rootId));
     const activeRootIds = new Set(openFindings.flatMap((finding) => finding.rootId ? [finding.rootId] : []));
     const activeFindingIds = new Set(roots.filter((root) => activeRootIds.has(root.rootId)).flatMap((root) => root.findingIds));
     const findings = [
@@ -900,11 +907,22 @@ export async function reviewPullRequest(
       },
     });
     const unverifiedSourceFindings = scopedFindings.some((finding) => sourceVerificationCandidates.has(finding.id) && isUnverifiedSourceFinding(finding));
-    // Missing/stale source proof is a review admission failure, not a
-    // remediation obligation: retain the finding as advisory but block closure.
-    const disposition = unverifiedSourceFindings
+    const sameHeadRootAuthorityMissing = input.allowSameHeadReassessment === true
+      && input.priorVerdict?.payload.headSha === frozen.headSha
+      && input.priorVerdict.payload.disposition === "request_changes"
+      && priorRootLedger === undefined;
+    // Missing/stale source proof and unresolved omitted roots are review
+    // admission failures, not remediation obligations. Do not copy a prior
+    // root representative into findings merely to manufacture current-head
+    // evidence; the ledger and blocked verdict retain the closure authority.
+    const unresolvedRootAuthority = unresolvedPriorRoots.length > 0 || sameHeadRootAuthorityMissing;
+    const disposition = unverifiedSourceFindings || unresolvedRootAuthority
       ? "blocked" as const
       : openFindings.some((finding) => finding.mustFix ?? finding.blocking) ? "request_changes" as const : "approve" as const;
+    // An omitted root is still open authority, but its prior representative is
+    // not current-head evidence. Do not let an empty current projection close
+    // the already-open GitHub issue while closure authority is missing.
+    const preservePriorRootProjections = unresolvedPriorRoots.length > 0 || sameHeadRootAuthorityMissing;
     const finalSnapshot = await dependencies.host.getPullRequest(frozen.repo, frozen.number);
     assertPullRequestRouteStable(frozen, finalSnapshot, "before verdict publication");
     // First gate prevents a known-stale approval from projecting/closing finding
@@ -1006,7 +1024,9 @@ export async function reviewPullRequest(
         publicationFence,
       }, dependencies.host);
     }
-    if (projectionEnabled && dependencies.host.reconcileReviewFindings) {
+    // A blocked closure-authority omission preserves prior projections. A
+    // normal empty verdict still reconciles stale issues through the host.
+    if (projectionEnabled && dependencies.host.reconcileReviewFindings && !preservePriorRootProjections) {
       if (!publicationFence) throw new Error("Review-finding reconciliation has no current publication fence");
       await dependencies.host.reconcileReviewFindings({
         repo: frozen.repo,
@@ -1125,7 +1145,29 @@ async function loadPriorRootLedger(input: {
   const highestEpoch = Math.max(...matching.map((ledger) => ledger.payload.epoch));
   const current = matching.filter((ledger) => ledger.payload.epoch === highestEpoch);
   if (current.length !== 1) throw new Error("Prior finding root ledger authority is ambiguous at the reviewed head");
-  return current[0];
+  const selected = current[0]!;
+  const planContext = input.priorVerdict.payload.reviewPlan?.context;
+  const plannedRootIds = new Set(planContext?.openRootIds ?? []);
+  const verdictRootIds = new Set(input.priorVerdict.payload.findings.flatMap(({ rootId }) => rootId ? [rootId] : []));
+  const linkedRootIds = new Set([...plannedRootIds, ...verdictRootIds]);
+  const rootsById = new Map(selected.payload.roots.map((root) => [root.rootId, root]));
+  if (rootsById.size !== selected.payload.roots.length) {
+    throw new Error("Prior finding root ledger authority is ambiguous because root IDs are duplicated");
+  }
+  const missingPlannedRoots = [...linkedRootIds].filter((rootId) => !rootsById.has(rootId));
+  const unlinkedOpenRoots = selected.payload.roots
+    .filter((root) => ["open", "fix-attempted", "regressed"].includes(root.state) && !linkedRootIds.has(root.rootId))
+    .map(({ rootId }) => rootId);
+  const unboundVerdictFindings = input.priorVerdict.payload.findings
+    .filter((finding) => {
+      if (finding.rootId === undefined) return false;
+      const root = rootsById.get(finding.rootId);
+      return root === undefined || !root.findingIds.includes(finding.id);
+    });
+  if (missingPlannedRoots.length || unlinkedOpenRoots.length || unboundVerdictFindings.length) {
+    throw new Error("Prior finding root ledger authority is foreign, orphaned, or not bound to the exact prior Review Verdict");
+  }
+  return selected;
 }
 
 async function assertPriorVerdictAuthority(
@@ -1470,7 +1512,9 @@ function collectRootAssessments(
     const observedRoles = new Set(entries.map(({ role }) => role));
     if ([...requiredRoles].some((role) => !observedRoles.has(role))) return [];
     const assessments = entries.map(({ assessment }) => assessment);
-    const status = assessments.some(({ status }) => status === "open") ? "open" as const
+    const status = assessments.some(({ status }) => status === "open")
+      || (assessments.some(({ status }) => status === "fixed") && assessments.some(({ status }) => status === "rejected"))
+      ? "open" as const
       : assessments.every(({ status }) => status === "rejected") ? "rejected" as const
         : "fixed" as const;
     return [{ rootId, status, evidence: assessments.map(({ evidence }) => evidence).join(" | ") }];
