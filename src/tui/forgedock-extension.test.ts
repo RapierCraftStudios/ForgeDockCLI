@@ -2729,18 +2729,27 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
   let releaseExpansionSave!: () => void;
   const expansionSaveRelease = new Promise<void>((resolve) => { releaseExpansionSave = resolve; });
   let failureMode = true;
+  let readPhase: "initial" | "resumed" = "initial";
   const branchReads: Array<{ repo: string; branch: string }> = [];
-  let startedReads = 0;
-  let childReadsStarted = 0;
-  let completedReads = 0;
-  let inFlight = 0;
-  let maxInFlight = 0;
+  const createReadTelemetry = () => ({
+    started: 0,
+    childStarted: 0,
+    completed: 0,
+    inFlight: 0,
+    maxInFlight: 0,
+  });
+  let readTelemetry = createReadTelemetry();
   let releaseFirstWave!: () => void;
   const firstWaveReleased = new Promise<void>((resolve) => { releaseFirstWave = resolve; });
   let firstWaveEntered!: () => void;
   const firstWaveReady = new Promise<void>((resolve) => { firstWaveEntered = resolve; });
-  let allReadsSettled!: () => void;
-  const readsSettled = new Promise<void>((resolve) => { allReadsSettled = resolve; });
+  let resumedChildReadsEntered = 0;
+  let releaseResumedChildReads!: () => void;
+  const resumedChildReadsReleased = new Promise<void>((resolve) => { releaseResumedChildReads = resolve; });
+  let resumedChildReadsReady!: () => void;
+  const resumedChildReadsReadyPromise = new Promise<void>((resolve) => { resumedChildReadsReady = resolve; });
+  let initialReadsSettled!: () => void;
+  const initialReadsSettledPromise = new Promise<void>((resolve) => { initialReadsSettled = resolve; });
 
   class RecordingOrchestrationRepository extends InMemoryOrchestrationRepository {
     override async saveOrchestration(record: OrchestrationRecord): Promise<void> {
@@ -2788,17 +2797,23 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
     },
     async getIssue(issue: number, repo: string) {
       issueReads.push({ repo, issue });
-      startedReads += 1;
-      inFlight += 1;
-      maxInFlight = Math.max(maxInFlight, inFlight);
+      readTelemetry.started += 1;
+      readTelemetry.inFlight += 1;
+      readTelemetry.maxInFlight = Math.max(readTelemetry.maxInFlight, readTelemetry.inFlight);
       try {
         if (issue !== 42) {
-          childReadsStarted += 1;
-          if (failureMode && childReadsStarted <= DEFAULT_REMOTE_READ_CONCURRENCY) {
-            if (childReadsStarted === DEFAULT_REMOTE_READ_CONCURRENCY) firstWaveEntered();
+          readTelemetry.childStarted += 1;
+          if (readPhase === "initial" && failureMode && readTelemetry.childStarted <= DEFAULT_REMOTE_READ_CONCURRENCY) {
+            if (readTelemetry.childStarted === DEFAULT_REMOTE_READ_CONCURRENCY) firstWaveEntered();
             await firstWaveReleased;
           }
+          if (readPhase === "resumed" && readTelemetry.childStarted <= 2) {
+            resumedChildReadsEntered += 1;
+            if (resumedChildReadsEntered === 2) resumedChildReadsReady();
+            await resumedChildReadsReleased;
+          }
         }
+        await Promise.resolve();
         if (failureMode && issue === failingIssue) throw new Error("child read failed");
         return {
           repo,
@@ -2810,9 +2825,11 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
           labels: [],
         };
       } finally {
-        inFlight -= 1;
-        completedReads += 1;
-        if (failureMode && completedReads === childIssues.length + 1) allReadsSettled();
+        readTelemetry.inFlight -= 1;
+        readTelemetry.completed += 1;
+        if (readPhase === "initial"
+          && readTelemetry.started === childIssues.length + 1
+          && readTelemetry.inFlight === 0) initialReadsSettled();
       }
     },
   } as any;
@@ -2917,12 +2934,13 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
   await firstWaveReady;
   releaseFirstWave();
   await failed;
-  await readsSettled;
+  await initialReadsSettledPromise;
+  const initialReads = readTelemetry;
 
-  assert.equal(maxInFlight, DEFAULT_REMOTE_READ_CONCURRENCY);
-  assert.equal(inFlight, 0);
-  assert.equal(startedReads, childIssues.length + 1, "the parent route read and every child read must settle");
-  assert.equal(completedReads, childIssues.length + 1);
+  assert.equal(initialReads.maxInFlight, DEFAULT_REMOTE_READ_CONCURRENCY);
+  assert.equal(initialReads.inFlight, 0);
+  assert.equal(initialReads.started, childIssues.length + 1, "the parent route read and every child read must settle");
+  assert.equal(initialReads.completed, childIssues.length + 1);
   assert.deepEqual(taskPreparations, [42], "the failed expansion only prepared the parent task");
   assert.deepEqual(workerDispatches, [42], "a resolver rejection must dispatch no replacement child worker");
   const failedRecord = await repository.loadOrchestration(initial.id);
@@ -2945,6 +2963,15 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
   });
 
   failureMode = false;
+  readPhase = "resumed";
+  readTelemetry = createReadTelemetry();
+  assert.deepEqual(readTelemetry, {
+    started: 0,
+    childStarted: 0,
+    completed: 0,
+    inFlight: 0,
+    maxInFlight: 0,
+  }, "resumed read telemetry must start independently of the failed run");
   const secondState = fakePi();
   const secondOriginalEmit = secondState.pi.events.emit.bind(secondState.pi.events);
   secondState.pi.events.emit = ((name: string, data: any) => {
@@ -2975,6 +3002,11 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
     }, false);
   });
   const resumedPromise = second.resume(initial.id);
+  await resumedChildReadsReadyPromise;
+  assert.equal(resumedChildReadsEntered, 2, "the resumed child-read gate requires two readers");
+  assert.ok(readTelemetry.maxInFlight >= 2, "resumed child reads must overlap");
+  assert.ok(readTelemetry.maxInFlight <= DEFAULT_REMOTE_READ_CONCURRENCY);
+  releaseResumedChildReads();
   await expansionSaveReady;
   const flushedExpansion = await repository.loadOrchestration(initial.id);
   assert.ok(flushedExpansion);
@@ -2987,6 +3019,11 @@ test("visible DAG start and fresh resume keep non-root decomposition fail-closed
   await Promise.all(pendingLaunchSnapshots);
   const completed = await repository.loadOrchestration(initial.id);
   assert.equal(completed?.status, "completed");
+  assert.equal(readTelemetry.inFlight, 0, "all resumed reads must settle");
+  assert.equal(readTelemetry.started, readTelemetry.completed, "resumed reads must drain");
+  assert.ok(readTelemetry.childStarted >= 2);
+  assert.ok(readTelemetry.maxInFlight >= 2);
+  assert.ok(readTelemetry.maxInFlight <= DEFAULT_REMOTE_READ_CONCURRENCY);
   assert.deepEqual(completed?.nodes.find((node) => node.id === "parent")?.decompositionChildren, childIssues);
   assert.equal(completed?.nodes.filter((node) => node.repository === "owner/work").length, childIssues.length + 1);
   assert.ok(completed?.nodes.filter((node) => childIssues.includes(node.issue)).every((node) =>
