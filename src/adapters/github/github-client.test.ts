@@ -520,6 +520,7 @@ describe("GitHub workflow label projection", () => {
     assert.equal(workflowLabelForLifecycleState("dependency-waiting"), "workflow:dependency-waiting");
     assert.equal(workflowLabelForLifecycleState("claim-waiting"), "workflow:claim-waiting");
     assert.equal(workflowLabelForLifecycleState("executing"), "workflow:executing");
+    assert.equal(workflowLabelForLifecycleState("failed"), "workflow:engine-error");
     assert.equal(workflowLabelForLifecycleState("cancelled"), "workflow:cancelled");
   });
 

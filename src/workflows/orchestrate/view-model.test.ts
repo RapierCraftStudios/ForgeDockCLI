@@ -21,6 +21,24 @@ describe("orchestration status presentation", () => {
     });
     assert.equal(snapshot.nodes[0]?.lifecycleState, "dependency-waiting");
     assert.equal(snapshot.nodes[1]?.lifecycleState, "claim-waiting");
+    const executingPhase = buildOrchestrationSnapshot({
+      orchestrationId: "orch-executing-waits",
+      phase: "executing",
+      items: [
+        { id: "dependency", issue: 1, priority: 1, dependencies: [], claims: [], lifecycleState: "executing" },
+        { id: "claim", issue: 2, priority: 1, dependencies: [], claims: [], lifecycleState: "executing" },
+      ],
+      result: {
+        status: new Map([["dependency", "queued"], ["claim", "queued"]]),
+        errors: new Map(),
+        waitReasons: new Map([
+          ["dependency", { kind: "dependency", predecessor: "owner" }],
+          ["claim", { kind: "claim-serialization", predecessor: "owner", claims: ["src/shared"] }],
+        ]),
+      },
+    });
+    assert.equal(executingPhase.nodes[0]?.lifecycleState, "dependency-waiting");
+    assert.equal(executingPhase.nodes[1]?.lifecycleState, "claim-waiting");
     assert.match(renderOrchestrationBoard(snapshot), /dependency-waiting/);
     assert.match(renderOrchestrationBoard(snapshot), /claim-waiting/);
   });

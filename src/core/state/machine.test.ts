@@ -16,6 +16,13 @@ describe("workflow state machine", () => {
     }
   });
 
+  it("does not turn legacy recovery, retry, blocked, or invalid states into investigation failure", () => {
+    assert.equal(canonicalLifecycleStateForRunState("target_recovery"), "claim-waiting");
+    assert.equal(canonicalLifecycleStateForRunState("retry_wait"), "claim-waiting");
+    assert.equal(canonicalLifecycleStateForRunState("blocked"), "failed");
+    assert.equal(canonicalLifecycleStateForRunState("invalid"), "failed");
+  });
+
   it("routes confirmed work through the controlled happy path", () => {
     let run = createRun({ workflow: "work-on", subject: { repo: "acme/widget", issue: 7 }, runId: "run_7", now: "2026-01-01T00:00:00.000Z" });
     for (const event of [

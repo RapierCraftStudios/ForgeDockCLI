@@ -479,13 +479,31 @@ export class OrchestrationController {
       const authoritative = await this.dependencies.repository.loadOrchestration(orchestrationId);
       if (!authoritative) throw new Error(`Unknown orchestration: ${orchestrationId}`);
       if (authoritative.status === "cancelled" || authoritative.status !== "running") return structuredClone(authoritative);
-      const cancelled = { ...authoritative, status: "cancelled" as const, executionClaimId: claim.claimId, updatedAt: this.now() };
+      const cancelledAt = this.now();
+      const cancelled = this.recordWithLifecycle({
+        ...authoritative,
+        status: "cancelled" as const,
+        executionClaimId: claim.claimId,
+        updatedAt: cancelledAt,
+      }, "cancelled", "operator-stop");
+      const cancelledWithNodes: OrchestrationRecord = {
+        ...cancelled,
+        nodes: cancelled.nodes.map((node) => withNodeLifecycle(
+          { ...node, status: node.status === "running" ? "queued" : node.status },
+          "cancelled",
+          Math.max(node.lifecycleAttempt ?? 1, cancelled.lifecycleAttempt ?? 1),
+          (node.lifecycleVersion ?? 0) + 1,
+          "operator-stop",
+          cancelledAt,
+          node.lifecycleState,
+        )),
+      };
       if (!claim.persist) {
         throw new Error(`Orchestration ${orchestrationId} stop requires an atomic fenced repository; durable cancellation refused`);
       }
-      await claim.persist(this.dependencies.repository, cancelled);
-      this.emitSnapshot(cancelled);
-      return structuredClone(cancelled);
+      await claim.persist(this.dependencies.repository, cancelledWithNodes);
+      this.emitSnapshot(cancelledWithNodes);
+      return structuredClone(cancelledWithNodes);
     } finally {
       await claim.release();
     }
@@ -646,7 +664,7 @@ export class OrchestrationController {
         this.emitSnapshot(state.record, state);
         try { await this.flush(state); } catch { /* retain original cancellation */ }
       } else if (state && state.error === undefined) {
-        this.replaceRecord(state, { ...state.record, status: "failed", updatedAt: this.now() });
+        this.replaceRecord(state, this.recordWithLifecycle({ ...state.record, status: "failed", updatedAt: this.now() }, "failed", "orchestration-error"));
         this.emitSnapshot(state.record, state);
         try {
           await this.flush(state);
@@ -870,10 +888,14 @@ export class OrchestrationController {
       await this.runInvestigationPhase(state);
       return;
     }
+    const priorNodes = state.record.nodes;
     this.replaceRecord(state, {
       ...this.recordWithLifecycle(state.record, "executing", "execution-dispatch-admitted"),
       phase: "executing",
-      nodes: nextItems.map((item) => withNodeLifecycle(nodeRecordFromItem(item), "executing", 1, 0, "execution-dispatch-admitted", this.now(), "ready-to-build")),
+      // Materialization admits a graph; it does not start every node. Keep
+      // queued nodes ready (or carry their prior evidence) until the
+      // scheduler reports a concrete running/waiting outcome.
+      nodes: nextItems.map((item) => materializedNodeFromItem(item, priorNodes, this.now())),
       serializationEdges: nextEdges.map((edge) => ({ predecessor: edge.predecessor, successor: edge.successor, overlappingClaims: [...edge.overlappingClaims] })),
       executionMaterializedAt: this.now(),
       shadowContractionProposals: [...(state.record.shadowContractionProposals ?? []), ...shadow],
@@ -2019,11 +2041,12 @@ export class OrchestrationController {
       || node.status === "retry_wait"
       || node.status === "running"
       || node.status === "queued");
-    this.replaceRecord(state, {
+    const terminalState = failed ? "failed" : "completed";
+    this.replaceRecord(state, this.recordWithLifecycle({
       ...state.record,
-      status: failed ? "failed" : "completed",
+      status: terminalState,
       updatedAt: this.now(),
-    });
+    }, terminalState, "orchestration-finalized"));
     this.emitSnapshot(state.record, state);
   }
 
@@ -2141,13 +2164,29 @@ export class OrchestrationController {
   }
 
   private advanceLifecycle(state: PersistenceState, lifecycleState: CanonicalLifecycleState, transition: string): void {
-    this.replaceRecord(state, this.recordWithLifecycle(state.record, lifecycleState, transition));
+    const record = this.recordWithLifecycle(state.record, lifecycleState, transition);
+    const now = this.now();
+    const nodes = lifecycleState === "investigation-retry" || lifecycleState === "investigation-failed"
+      ? record.nodes.map((node) => {
+          const investigation = record.investigations?.find((entry) => entry.nodeId === node.id);
+          if (!investigation || (lifecycleState === "investigation-retry" && investigation.status !== "queued") || (lifecycleState === "investigation-failed" && investigation.status !== "failed")) return node;
+          const attempt = Math.max(node.lifecycleAttempt ?? 0, investigation.attemptCount, record.lifecycleAttempt ?? 1, 1);
+          return withNodeLifecycle(node, lifecycleState, attempt, (node.lifecycleVersion ?? 0) + 1, transition, now, node.lifecycleState);
+        })
+      : record.nodes;
+    this.replaceRecord(state, { ...record, nodes });
   }
 
   private recordWithLifecycle(record: OrchestrationRecord, lifecycleState: CanonicalLifecycleState, transition: string): OrchestrationRecord {
     const previousState = record.lifecycleState;
     const version = (record.lifecycleVersion ?? 0) + 1;
-    const attempt = Math.max(record.lifecycleAttempt ?? 1, record.executionAttempt ?? 0, 1);
+    // A retry opens the next attempt. Exhausted failure closes that same
+    // attempt; advancing it again would make the retry and its failure look
+    // like two worker attempts rather than two lifecycle transitions.
+    const isInvestigationRetry = lifecycleState === "investigation-retry";
+    const attempt = isInvestigationRetry
+      ? Math.max((record.lifecycleAttempt ?? 0) + 1, record.executionAttempt ?? 0, 1)
+      : Math.max(record.lifecycleAttempt ?? 1, record.executionAttempt ?? 0, 1);
     return {
       ...record,
       lifecycleState,
@@ -2328,8 +2367,16 @@ export class OrchestrationController {
 }
 
 function normalizeLifecycleRecord(record: OrchestrationRecord, now: () => string): OrchestrationRecord {
-  const recordState = record.lifecycleState
-    ?? (record.status === "cancelled" ? "cancelled" : record.phase === "investigating" ? "investigating" : "ready-to-build");
+  // Durable terminal status is authoritative. Never preserve an active
+  // lifecycle state on a completed/failed/cancelled record during recovery.
+  const recordState = record.status === "cancelled"
+    ? "cancelled"
+    : record.status === "completed"
+      ? "completed"
+      : record.status === "failed"
+        ? "failed"
+        : record.lifecycleState
+          ?? (record.phase === "investigating" ? "investigating" : "ready-to-build");
   const nodes = record.nodes.map((node) => {
     if (record.status === "cancelled") {
       if (node.lifecycleState === "cancelled") return node;
@@ -2357,7 +2404,7 @@ function normalizeLifecycleRecord(record: OrchestrationRecord, now: () => string
           : derived;
     if (node.lifecycleState === lifecycleState && node.lifecycleTransition) return node;
     const version = (node.lifecycleVersion ?? 0) + 1;
-    const attempt = node.lifecycleAttempt ?? Math.max(1, investigation?.attemptCount ?? 1);
+    const attempt = Math.max(node.lifecycleAttempt ?? 0, investigation?.attemptCount ?? 1, record.lifecycleAttempt ?? 1);
     const retainTransitionEvidence = record.phase === "investigating"
       || lifecycleState === "cancelled"
       || lifecycleState === "decomposed"
@@ -2488,6 +2535,21 @@ function withNodeLifecycle(
     occurredAt,
   };
   return { ...node, lifecycleState: state, lifecycleAttempt: attempt, lifecycleVersion: version, lifecycleTransition: evidence };
+}
+
+function materializedNodeFromItem(
+  item: ScheduledWorkItem,
+  priorNodes: readonly OrchestrationNodeRecord[],
+  occurredAt: string,
+): OrchestrationNodeRecord {
+  const node = nodeRecordFromItem(item);
+  const prior = priorNodes.find((candidate) => candidate.id === item.id || candidate.issue === item.issue);
+  const state = item.lifecycleState === "executing" || item.lifecycleState === undefined
+    ? "ready-to-build"
+    : item.lifecycleState;
+  const attempt = Math.max(item.lifecycleAttempt ?? 0, prior?.lifecycleAttempt ?? 0, 1);
+  const version = Math.max(item.lifecycleVersion ?? 0, prior?.lifecycleVersion ?? 0) + 1;
+  return withNodeLifecycle(node, state, attempt, version, "materialization-complete", occurredAt, prior?.lifecycleState);
 }
 
 function cloneScheduledItem(item: ScheduledWorkItem): ScheduledWorkItem {

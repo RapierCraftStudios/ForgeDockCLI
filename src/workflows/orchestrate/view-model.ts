@@ -170,15 +170,18 @@ export function lifecycleStateForItem(
   waitReason: WaitReason | undefined,
   phase?: OrchestrationSnapshot["phase"],
 ): CanonicalLifecycleState {
-  if (item.lifecycleState !== undefined) return item.lifecycleState;
   if (status === "completed") return "completed";
   if (status === "skipped") return "decomposed";
   if (status === "invalid") return "investigation-failed";
   if (status === "failed") return "failed";
-  if (status === "running" || phase === "executing") return "executing";
+  // Wait reasons are more specific than the orchestration phase. In
+  // particular, a queued node must never be presented as executing merely
+  // because another node has already entered the execution phase.
   if (waitReason?.kind === "dependency" || waitReason?.kind === "suspended-predecessor") return "dependency-waiting";
   if (waitReason?.kind === "claim-serialization" || waitReason?.kind === "active-claim-conflict" || waitReason?.kind === "capacity") return "claim-waiting";
   if (waitReason?.kind === "retry") return phase === "investigating" ? "investigation-retry" : "claim-waiting";
+  if (item.lifecycleState !== undefined && !(item.lifecycleState === "executing" && status !== "running")) return item.lifecycleState;
+  if (status === "running") return "executing";
   if (phase === "investigating") return "investigating";
   return "ready-to-build";
 }

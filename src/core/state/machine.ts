@@ -62,13 +62,19 @@ export function canonicalLifecycleStateForRunState(state: RunStateName): Canonic
     case "failed": return "failed";
     case "completed": return "completed";
     case "queued": return "queued";
-    default: return "investigation-failed";
+    case "target_recovery":
+    case "retry_wait": return "claim-waiting";
+    case "blocked":
+    case "invalid": return "failed";
   }
+  const unreachable: never = state;
+  return unreachable;
 }
 
 export function canonicalLifecycleLabel(state: CanonicalLifecycleState): string | undefined {
   if (state === "queued") return "workflow:ready-to-build";
   if (state === "completed") return "workflow:merged";
+  if (state === "failed") return "workflow:engine-error";
   return `workflow:${state}`;
 }
 
