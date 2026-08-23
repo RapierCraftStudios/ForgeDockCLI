@@ -208,6 +208,8 @@ export interface OrchestrationInvocationScope extends OrchestrationInvocationReq
 }
 
 export interface OrchestrationScopeIssue {
+  /** Authoritative owner/repository identity returned with every issue read. */
+  repo?: string;
   number: number;
   state: "OPEN" | "CLOSED";
   labels?: readonly string[];
@@ -226,10 +228,37 @@ export interface OrchestrationScopeResolverHost {
 interface OrchestrationIssueReadCache {
   reads: Map<string, Promise<OrchestrationScopeIssue>>;
   maximum?: number;
+  requireIdentity: boolean;
 }
 
-function orchestrationIssueReadCache(maximum?: number): OrchestrationIssueReadCache {
-  return { reads: new Map(), ...(maximum !== undefined ? { maximum } : {}) };
+function orchestrationIssueReadCache(maximum?: number, requireIdentity = false): OrchestrationIssueReadCache {
+  return { reads: new Map(), ...(maximum !== undefined ? { maximum } : {}), requireIdentity };
+}
+
+async function readAuthoritativeOrchestrationIssue(
+  host: Pick<OrchestrationScopeResolverHost, "getIssue">,
+  number: number,
+  repo: string,
+  requireIdentity = true,
+): Promise<OrchestrationScopeIssue> {
+  let issue: OrchestrationScopeIssue;
+  try {
+    issue = await host.getIssue(number, repo);
+  } catch (error) {
+    const detail = error instanceof Error ? `: ${error.message}` : "";
+    throw new Error(`Unable to read authoritative issue #${number} in ${repo}${detail}; refusing orchestration discovery`, { cause: error });
+  }
+  if (!issue || issue.number !== number || !Number.isSafeInteger(issue.number)) {
+    throw new Error(`Authoritative issue identity is ambiguous or missing for requested #${number}; refusing orchestration discovery`);
+  }
+  if (requireIdentity && (typeof issue.repo !== "string" || !issue.repo.trim())) {
+    throw new Error(`Authoritative issue #${number} has no repository identity; refusing orchestration discovery`);
+  }
+  if (requireIdentity) assertRepository(issue.repo!, repo);
+  if (issue.state !== "OPEN" && issue.state !== "CLOSED") {
+    throw new Error(`Authoritative issue #${number} has an unreadable state; refusing orchestration discovery`);
+  }
+  return issue;
 }
 
 function requestLocalIssueHost<T extends OrchestrationScopeIssue>(
@@ -245,7 +274,7 @@ function requestLocalIssueHost<T extends OrchestrationScopeIssue>(
         if (cache.maximum !== undefined && cache.reads.size >= cache.maximum) {
           throw new Error(`Orchestration discovery detail reads exceed the bounded limit of ${cache.maximum}; narrow the exact scope`);
         }
-        read = host.getIssue(number, repo);
+        read = readAuthoritativeOrchestrationIssue(host, number, repo ?? defaultRepo, cache.requireIdentity) as Promise<T>;
         cache.reads.set(key, read);
       }
       return read as Promise<T>;
@@ -1019,7 +1048,13 @@ async function resolveEligibleIssueNumbers(
     if (processed.has(entry.number)) continue;
     processed.add(entry.number);
     const issue = await host.getIssue(entry.number, repo);
-    if (issue.state !== "OPEN") throw new Error(`Orchestration issue #${issue.number} is not open`);
+    if (issue.state !== "OPEN") {
+      // A directly requested/selected closed issue is an invalid request. A
+      // closed decomposition child is terminal evidence, however: retain the
+      // parent replacement proof while excluding that child from runnable work.
+      if (!entry.lineage.length) throw new Error(`Orchestration issue #${issue.number} is not open`);
+      continue;
+    }
     if (options.requireNoMilestone && issue.milestone) {
       throw new Error(`Selected issues must have no milestone, but #${issue.number} is assigned to '${issue.milestone.title}'`);
     }
@@ -1039,6 +1074,9 @@ async function resolveEligibleIssueNumbers(
         if (child === issue.number || entry.lineage.includes(child)) throw new Error(`Decomposition cycle detected through issue #${child}`);
         return child;
       });
+      if (new Set(children).size !== children.length) {
+        throw new Error(`Issue #${issue.number} decomposition has ambiguous duplicate child identities`);
+      }
       if (!children.length) throw new Error(`Issue #${issue.number} is decomposed but records no child issues`);
       recordDecompositionReplacement(replacements, issue.number, children);
       for (const child of children.sort((left, right) => left - right)) queue.push({ number: child, lineage: [...entry.lineage, issue.number] });
@@ -1082,7 +1120,10 @@ async function resolveEligibleMilestoneIssues(
     if (processed.has(entry.number)) continue;
     processed.add(entry.number);
     const issue = await host.getIssue(entry.number, repo);
-    if (issue.state !== "OPEN") throw new Error(`Milestone '${milestoneTitle}' contains non-open issue #${issue.number}`);
+    if (issue.state !== "OPEN") {
+      if (!entry.lineage.length) throw new Error(`Milestone '${milestoneTitle}' contains non-open issue #${issue.number}`);
+      continue;
+    }
     if (issue.milestone?.title !== milestoneTitle) {
       throw new Error(`Decomposition child #${issue.number} is not assigned to milestone '${milestoneTitle}'; repair its milestone before orchestration`);
     }
@@ -1110,6 +1151,9 @@ async function resolveEligibleMilestoneIssues(
         }
         return child;
       });
+      if (new Set(children).size !== children.length) {
+        throw new Error(`Issue #${issue.number} decomposition has ambiguous duplicate child identities`);
+      }
       if (!children.length) throw new Error(`Issue #${issue.number} is decomposed but records no child issues`);
       recordDecompositionReplacement(replacements, issue.number, children);
       for (const child of children.sort((left, right) => left - right)) {
@@ -1248,10 +1292,27 @@ export async function materializeVisibleDecomposition(input: {
       memberIssues: [issue],
     })),
   ];
-  const childSnapshots = await mapWithConcurrency(children, (issue) => input.github.getIssue(issue, effectiveParentRepository));
+  const childSnapshots = await mapWithConcurrency(children, async (issue) => {
+    let snapshot: Awaited<ReturnType<GitHubClient["getIssue"]>>;
+    try {
+      snapshot = await input.github.getIssue(issue, effectiveParentRepository);
+    } catch (error) {
+      const detail = error instanceof Error ? `: ${error.message}` : "";
+      throw new Error(`Unable to read authoritative decomposition child #${issue} in ${effectiveParentRepository}${detail}; refusing materialization`, { cause: error });
+    }
+    if (snapshot.number !== issue || typeof snapshot.repo !== "string" || snapshot.repo.toLowerCase() !== effectiveParentRepository.toLowerCase()) {
+      throw new Error(`Authoritative decomposition child identity is ambiguous or belongs to another repository: expected ${effectiveParentRepository}#${issue}`);
+    }
+    return snapshot;
+  });
   const childItems: VisibleOrchestrationItem[] = [];
   for (const issue of childSnapshots) {
-    if (issue.state !== "OPEN") throw new Error(`Decomposition child #${issue.number} is not open`);
+    // Closed children remain in childIssues as terminal decomposition proof,
+    // but are never admitted as runnable visible workers.
+    if (issue.state !== "OPEN" && issue.state !== "CLOSED") {
+      throw new Error(`Authoritative decomposition child #${issue.number} has an unreadable state; refusing materialization`);
+    }
+    if (issue.state !== "OPEN") continue;
     const lane = await resolveIssueLane(
       issue,
       authoritativeRepository.defaultBranch,
@@ -1285,6 +1346,9 @@ export async function materializeVisibleDecomposition(input: {
       riskClass: inferBatchRiskClass(issue.title, issue.body, issue.labels ?? []),
       memberIssues: [issue.number],
     });
+  }
+  if (!childItems.length) {
+    throw new Error(`Decomposition parent #${input.item.issue} has no runnable open children; all authoritative children are terminal`);
   }
   // Derive cross-node claim ordering against the frozen graph. Existing
   // parent edges are rewritten by the controller; only newly introduced edges
@@ -2092,7 +2156,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       const urlRepository = githubMilestoneUrl(rawArgs)?.repository ?? githubIssuesUrl(rawArgs)?.repository;
       if (params.repository?.trim() && urlRepository) assertRepository(params.repository.trim(), urlRepository);
       const repository = await github.getRepository(params.repository?.trim() || urlRepository);
-      const issueReads = orchestrationIssueReadCache(MAX_ORCHESTRATION_DISCOVERY_CANDIDATES);
+      const issueReads = orchestrationIssueReadCache(MAX_ORCHESTRATION_DISCOVERY_CANDIDATES, true);
       const issueHost = requestLocalIssueHost(github, repository.repo, issueReads);
       let members: number[];
       let routing: OrchestrationRouting;
@@ -2491,7 +2555,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
         let authoritativeBound = pending;
         if (pending.routing) {
           github = new GitHubClient(ctx.cwd, orchestrationRepository);
-          const issueReads = orchestrationIssueReadCache();
+          const issueReads = orchestrationIssueReadCache(undefined, true);
           if (pending.orderedSelection) {
             const orderedMembers = await github.listOpenIssueNumbersForSearch(
               pending.orderedSelection.query,

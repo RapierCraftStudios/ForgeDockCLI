@@ -383,7 +383,7 @@ test("typed discovery binds explicit issue IDs, counts, and remote repositories 
     },
     getIssue: async (number: number, repo?: string) => {
       issueRepos.push(repo);
-      return orchestrationDiscoveryIssue(number);
+      return orchestrationDiscoveryIssue(number, { repo: repo ?? "owner/remote" });
     },
   }, async () => {
     const discovery = explicit.tools.get("forgedock_discover_orchestration")!;
@@ -556,6 +556,60 @@ test("typed discovery rejects closed and wrong-lane issues and substitutes autho
     }, undefined, undefined, commandContext() as any) as any;
     assert.deepEqual(result.details.scope.issueNumbers, [8]);
     assert.deepEqual(result.details.scope.decomposedReplacements, [{ parent: 7, children: [8] }]);
+  });
+});
+
+
+test("decomposition discovery hydrates every child, excludes closed children, and fails closed on identity drift", async () => {
+  const outcome = createArtifact({
+    kind: "Outcome",
+    runId: "run_child_hydration",
+    subject: { repo: "a/b", issue: 7 },
+    producer: { role: "controller", runtime: "forgedock" },
+    payload: { status: "decomposed", reason: "Split", childIssues: ["#8 Closed", "#9 Open"] },
+  });
+  const state = fakePi();
+  bindOrchestrationInvocation(state.pi, { rawArgs: "Milestone One" });
+  const reads: number[] = [];
+  await withDiscoveryGitHub({
+    getRepository: async () => ({ repo: "a/b", defaultBranch: "main" }),
+    listOpenIssueNumbersForMilestone: async () => [7],
+    getIssue: async (number: number) => {
+      reads.push(number);
+      if (number === 7) return orchestrationDiscoveryIssue(7, {
+        labels: ["workflow:decomposed"],
+        milestone: { number: 1, title: "Milestone One" },
+        comments: [{ body: renderArtifactComment(outcome) }],
+      });
+      return orchestrationDiscoveryIssue(number, {
+        state: number === 8 ? "CLOSED" : "OPEN",
+        milestone: { number: 1, title: "Milestone One" },
+      });
+    },
+  }, async () => {
+    const result = await state.tools.get("forgedock_discover_orchestration")!.execute("closed-child", {
+      kind: "milestone", milestone: "Milestone One",
+    }, undefined, undefined, commandContext() as any) as any;
+    assert.deepEqual(result.details.scope.issueNumbers, [9]);
+    assert.deepEqual(result.details.scope.decomposedReplacements, [{ parent: 7, children: [8, 9] }]);
+    assert.deepEqual(reads.sort((left, right) => left - right), [7, 8, 9]);
+  });
+
+  const foreign = fakePi();
+  bindOrchestrationInvocation(foreign.pi, { rawArgs: "Milestone One" });
+  await withDiscoveryGitHub({
+    getRepository: async () => ({ repo: "a/b", defaultBranch: "main" }),
+    listOpenIssueNumbersForMilestone: async () => [7],
+    getIssue: async (number: number) => number === 7
+      ? orchestrationDiscoveryIssue(7, {
+        labels: ["workflow:decomposed"], milestone: { number: 1, title: "Milestone One" }, comments: [{ body: renderArtifactComment(outcome) }],
+      })
+      : { ...orchestrationDiscoveryIssue(number), repo: "other/repo" },
+  }, async () => {
+    await assert.rejects(
+      () => foreign.tools.get("forgedock_discover_orchestration")!.execute("foreign-child", { kind: "milestone", milestone: "Milestone One" }, undefined, undefined, commandContext() as any),
+      /belongs to another repository|conflicts with controller checkout/,
+    );
   });
 });
 

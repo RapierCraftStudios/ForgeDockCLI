@@ -92,10 +92,28 @@ export async function materializeCliDecomposition(input: {
   const scheduledRepositoryInfo = scheduledRepository === input.repository
     ? { defaultBranch: input.defaultBranch }
     : await input.github.getRepository(scheduledRepository);
-  const snapshots = await mapWithConcurrency(children, (issue) => input.github.getIssue(issue, scheduledRepository));
+  const snapshots = await mapWithConcurrency(children, async (issue) => {
+    let snapshot: Awaited<ReturnType<GitHubClient["getIssue"]>>;
+    try {
+      snapshot = await input.github.getIssue(issue, scheduledRepository);
+    } catch (error) {
+      const detail = error instanceof Error ? `: ${error.message}` : "";
+      throw new Error(`Unable to read authoritative decomposition child #${issue} in ${scheduledRepository}${detail}; refusing materialization`, { cause: error });
+    }
+    if (snapshot.number !== issue || typeof snapshot.repo !== "string" || snapshot.repo.toLowerCase() !== scheduledRepository.toLowerCase()) {
+      throw new Error(`Authoritative decomposition child identity is ambiguous or belongs to another repository: expected ${scheduledRepository}#${issue}`);
+    }
+    return snapshot;
+  });
   const childItems: ScheduledWorkItem[] = [];
   for (const issue of snapshots) {
-    if (issue.state !== "OPEN") throw new Error(`Decomposition child #${issue.number} is not open`);
+    // Closed authoritative children are terminal decomposition evidence, not
+    // runnable replacement work. Keep them in the returned proof list while
+    // hydrating and excluding them from the materialized DAG.
+    if (issue.state !== "OPEN" && issue.state !== "CLOSED") {
+      throw new Error(`Authoritative decomposition child #${issue.number} has an unreadable state; refusing materialization`);
+    }
+    if (issue.state !== "OPEN") continue;
     const lane = await resolveIssueLane(
       issue,
       scheduledRepositoryInfo.defaultBranch,
@@ -133,6 +151,9 @@ export async function materializeCliDecomposition(input: {
       ...(sourcePullRequest !== undefined ? { sourcePullRequest: Number(sourcePullRequest) } : {}),
       ...(defectClass !== undefined ? { defectClass } : {}),
     });
+  }
+  if (!childItems.length) {
+    throw new Error(`Decomposition parent #${input.item.issue} has no runnable open children; all authoritative children are terminal`);
   }
   const existingItems: ScheduledWorkItem[] = input.orchestration.nodes.map((candidate) => ({
     id: candidate.id,
