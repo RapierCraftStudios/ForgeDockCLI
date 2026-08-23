@@ -50,6 +50,28 @@ export interface OrchestrationPacketIdentity {
   baseSha: string;
 }
 
+export interface OrchestrationPacketCertification {
+  /** Exact packet proof projected by the controller; never model-authored. */
+  packetDigest?: string;
+  expectedPaths: string[];
+  symbols?: string[];
+  relationPaths?: string[];
+  generatedPaths?: string[];
+  sourcePaths?: string[];
+  testPaths?: string[];
+  configPaths?: string[];
+  relationDigest?: string;
+  verificationPolicyVersion?: string;
+  verificationCapabilityIds?: string[];
+  verificationCommandIdentities?: Array<{
+    id: string;
+    identityDigest: string;
+    targets: string[];
+  }>;
+  riskPolicyDigest?: string;
+  claimDigest?: string;
+}
+
 export interface OrchestrationPacketRecord {
   nodeId: string;
   wave: number;
@@ -61,6 +83,8 @@ export interface OrchestrationPacketRecord {
   expectedPaths?: string[];
   semanticDependencies?: string[];
   baseSha?: string;
+  /** Complete, immutable proof used by the execution-set certifier. */
+  certification?: OrchestrationPacketCertification;
   startedAt?: string;
   completedAt?: string;
   error?: string;
@@ -291,6 +315,46 @@ export interface OrchestrationSerializationEdgeRecord {
   overlappingClaims: string[];
 }
 
+export interface OrchestrationBuilderFrontierEntry {
+  nodeId: string;
+  issue: number;
+  repository: string;
+  targetRouteClaim: string;
+  dependencies: string[];
+  claims: string[];
+}
+
+export interface OrchestrationBatchCandidate {
+  id: string;
+  kind: "same-file" | "source-pr" | "defect-class" | "leaf-directory";
+  key: string;
+  riskClass: "routine" | "security" | "auth" | "billing";
+  memberNodeIds: string[];
+  memberIssues: number[];
+  repository: string;
+  targetBranch: string;
+  claims: string[];
+  affectedFiles: string[];
+}
+
+/** Immutable controller-owned execution projection. The digest covers every field except itself. */
+export interface OrchestrationExecutionPlan {
+  version: "forgedock.execution-plan/v1";
+  settledSetDigest: string;
+  baseSha: string;
+  packetDigest: string;
+  relationDigest: string;
+  verificationDigest: string;
+  riskDigest: string;
+  claimDigest: string;
+  nodes: OrchestrationItemRecord[];
+  serializationEdges: OrchestrationSerializationEdgeRecord[];
+  builderFrontier: OrchestrationBuilderFrontierEntry[];
+  batchCandidates: OrchestrationBatchCandidate[];
+  limits: { maxNodes: number; maxEdges: number; maxFrontier: number; maxBatchCandidates: number };
+  digest: string;
+}
+
 export interface OrchestrationRecord {
   schema: "forgedock.orchestration/v1";
   orchestrationId: string;
@@ -329,6 +393,11 @@ export interface OrchestrationRecord {
   packetWave?: number;
   packetBarrier?: { expected: number; completed: number; startedAt: string; completedAt?: string };
   executionMaterializedAt?: string;
+  /** Frozen execution projection; absent only on legacy/non-investigation records. */
+  executionPlan?: OrchestrationExecutionPlan;
+  executionPlanDigest?: string;
+  builderFrontier?: OrchestrationBuilderFrontierEntry[];
+  batchCandidates?: OrchestrationBatchCandidate[];
   metrics?: OrchestrationMetrics;
   shadowContractionProposals?: OrchestrationShadowContractionProposal[];
 }

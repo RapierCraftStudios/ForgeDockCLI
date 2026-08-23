@@ -31,6 +31,7 @@ import type {
   OrchestrationInvestigationRecord,
   OrchestrationPacketIdentity,
   OrchestrationPacketRecord,
+  OrchestrationPacketCertification,
   OrchestrationShadowContractionProposal,
 } from "../../core/ports/orchestration.js";
 import {
@@ -56,6 +57,7 @@ import {
 } from "./scheduler.js";
 import { buildOrchestrationSnapshot } from "./view-model.js";
 import { compileExecutionDag, normalizePacketPaths, normalizeSemanticDependencies } from "./packet-wave.js";
+import { assertExecutionPlanIntegrity, executionPacketEvidenceDigest, executionSettledEvidenceDigest } from "../../core/packet/execution-materializer.js";
 
 export interface CreateOrchestrationInput {
   orchestrationId?: string;
@@ -100,6 +102,8 @@ export interface OrchestrationPacketResult {
   expectedPaths: readonly string[];
   semanticDependencies: readonly string[];
   baseSha: string;
+  /** Controller-projected packet proof used by immutable execution certification. */
+  certification?: OrchestrationPacketCertification;
 }
 
 export interface OrchestrationPacketWorkerContext extends OrchestrationWorkerContext {
@@ -138,6 +142,11 @@ export interface OrchestrationExecutionMaterialization {
     childIssues: readonly number[];
     childNodeIds: readonly string[];
   }[];
+  /** Complete immutable execution projections, when the materializer owns certification. */
+  executionPlan?: import("../../core/ports/orchestration.js").OrchestrationExecutionPlan;
+  executionPlanDigest?: string;
+  builderFrontier?: import("../../core/ports/orchestration.js").OrchestrationBuilderFrontierEntry[];
+  batchCandidates?: import("../../core/ports/orchestration.js").OrchestrationBatchCandidate[];
 }
 
 export type OrchestrationExecutionMaterializer = (
@@ -618,6 +627,7 @@ export class OrchestrationController {
         await this.runInvestigationPhase(state);
       }
 
+      this.assertPersistedExecutionPlan(state);
       const prepared = resume
         ? await this.prepareResume(state)
         : await this.prepareInitial(state);
@@ -958,6 +968,10 @@ export class OrchestrationController {
       phase: "executing",
       nodes: nextItems.map((item) => nodeRecordFromItem(item)),
       serializationEdges: nextEdges.map((edge) => ({ predecessor: edge.predecessor, successor: edge.successor, overlappingClaims: [...edge.overlappingClaims] })),
+      ...(materialized.executionPlan !== undefined ? { executionPlan: structuredClone(materialized.executionPlan) } : {}),
+      ...(materialized.executionPlanDigest !== undefined ? { executionPlanDigest: materialized.executionPlanDigest } : {}),
+      ...(materialized.builderFrontier !== undefined ? { builderFrontier: structuredClone(materialized.builderFrontier) } : {}),
+      ...(materialized.batchCandidates !== undefined ? { batchCandidates: structuredClone(materialized.batchCandidates) } : {}),
       executionMaterializedAt: this.now(),
       shadowContractionProposals: [...(state.record.shadowContractionProposals ?? []), ...shadow],
       metrics: { ...priorMetrics, barrierWaits: priorMetrics.barrierWaits + 1, barrierDurationMs: [...priorMetrics.barrierDurationMs, Date.now() - startedAt], shadowContractionProposals: priorMetrics.shadowContractionProposals + shadow.length },
@@ -1069,6 +1083,7 @@ export class OrchestrationController {
           expectedPaths: _previousExpectedPaths,
           semanticDependencies: _previousSemanticDependencies,
           baseSha: _previousBaseSha,
+          certification: _previousCertification,
           ...previousWithoutTerminal
         } = previous ?? { nodeId: item.id, wave, status: "queued" as const, attemptCount: 0 };
         const packet: OrchestrationPacketRecord = {
@@ -1113,6 +1128,7 @@ export class OrchestrationController {
             ...(packetId !== undefined ? { packetId } : {}),
             ...(identity !== undefined ? { identity } : {}),
             expectedPaths: paths, semanticDependencies, baseSha: result.baseSha,
+            ...(result.certification !== undefined ? { certification: structuredClone(result.certification) } : {}),
             completedAt: this.now(),
           };
           byNode.set(item.id, completed);
@@ -1188,6 +1204,38 @@ export class OrchestrationController {
   ): void {
     const investigations = (state.record.investigations ?? []).map((entry) => entry.nodeId === nodeId ? update(entry) : entry);
     this.replaceRecord(state, { ...state.record, investigations, updatedAt: this.now() });
+  }
+
+  /** Recheck the frozen plan at the last read boundary before dispatch/resume. */
+  private assertPersistedExecutionPlan(state: PersistenceState): void {
+    const plan = state.record.executionPlan;
+    if (!plan) return;
+    assertExecutionPlanIntegrity(plan);
+    if (state.record.executionPlanDigest !== undefined && state.record.executionPlanDigest !== plan.digest) {
+      throw new Error("Persisted execution plan identity drifted");
+    }
+    if (state.record.packets !== undefined) {
+      const planNodeIds = new Set(plan.nodes.map((node) => node.id));
+      const packetEvidence = state.record.packets.filter((packet) => planNodeIds.has(packet.nodeId));
+      if (executionPacketEvidenceDigest(packetEvidence) !== plan.packetDigest) {
+        throw new Error("Persisted execution plan packet evidence drifted");
+      }
+      if (executionSettledEvidenceDigest(state.record, plan.nodes, packetEvidence, state.record.investigations ?? [], plan.baseSha) !== plan.settledSetDigest) {
+        throw new Error("Persisted execution plan settled evidence drifted");
+      }
+    }
+    const current = state.record.nodes.map((node) => itemFromNodeRecord(node));
+    const frozen = plan.nodes.map((node) => itemFromNodeRecord({ ...node, status: "queued", childRunIds: [] }));
+    const projection = (item: ScheduledWorkItem) => JSON.stringify({
+      id: item.id, issue: item.issue, repository: item.repository, targetBranch: item.targetBranch,
+      targetRouteClaim: item.targetRouteClaim, lane: item.lane, promotionTarget: item.promotionTarget, productionTarget: item.productionTarget,
+      dependencies: item.dependencies, claims: item.claims,
+      affectedFiles: item.affectedFiles, memberIssues: item.memberIssues, plan: item.plan,
+    });
+    if (current.length !== frozen.length || current.some((item) => {
+      const match = frozen.find((candidate) => candidate.id === item.id);
+      return !match || projection(match) !== projection(item);
+    })) throw new Error("Persisted execution plan settled evidence drifted");
   }
 
   private async prepareInitial(state: PersistenceState): Promise<PreparedExecution> {

@@ -19,6 +19,7 @@ import { attachArtifact, transition, type RunState } from "../../core/state/mach
 import type { ThinkingLevel } from "../../core/config/forgedock-config.js";
 import { materializeClaimDependencies } from "./scheduler.js";
 import { compileExecutionDag, normalizePacketPaths, normalizeSemanticDependencies } from "./packet-wave.js";
+import { materializeExecutionPlan } from "../../core/packet/execution-materializer.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -196,6 +197,7 @@ export function createInvestigationFirstWorkers(
         expectedPaths: packet.payload.expectedPaths,
         semanticDependencies: item.dependencies,
         baseSha,
+        certification: packetCertification(packet.payload),
       };
     }
 
@@ -218,6 +220,7 @@ export function createInvestigationFirstWorkers(
         expectedPaths: orphan.payload.expectedPaths,
         semanticDependencies: item.dependencies,
         baseSha,
+        certification: packetCertification(orphan.payload),
       };
     }
 
@@ -245,6 +248,7 @@ export function createInvestigationFirstWorkers(
       expectedPaths: prepared.packet.payload.expectedPaths,
       semanticDependencies: item.dependencies,
       baseSha,
+      certification: packetCertification(prepared.packet.payload),
     };
   };
 
@@ -384,14 +388,62 @@ export function createInvestigationFirstWorkers(
         });
       }
     }
+    const executionPlan = packets !== undefined && itemsForExecution.length && !nextInvestigationItems.length
+      ? materializeExecutionPlan({
+        orchestration,
+        items: itemsForExecution,
+        packets: packets.filter((packet) => packet.status === "completed"),
+        investigations: allInvestigations,
+        baseSha: packets.find((packet) => packet.status === "completed" && packet.baseSha)?.baseSha ?? "",
+        serializationEdges: executionEdges,
+        requireCompleteEvidence: packets.some((packet) => packet.certification !== undefined),
+      })
+      : undefined;
     return {
       items: itemsForExecution,
       serializationEdges: executionEdges,
+      ...(executionPlan ? {
+        executionPlan: executionPlan.plan,
+        executionPlanDigest: executionPlan.plan.digest,
+        builderFrontier: executionPlan.builderFrontier,
+        batchCandidates: executionPlan.batchCandidates,
+      } : {}),
       ...(nextInvestigationItems.length ? { nextInvestigationItems } : {}),
       ...(decompositionReplacements.length ? { decompositionReplacements } : {}),
     };
   };
   return { investigationWorker, packetWorker, materializeExecution };
+}
+
+function packetCertification(payload: import("../../core/artifacts/schema.js").BuildPacketPayload): import("../../core/ports/orchestration.js").OrchestrationPacketCertification {
+  const relation = payload.relationGraph;
+  const relationPaths = relation ? [...new Set([...relation.writablePaths, ...relation.evidencePaths])] : [...payload.expectedPaths];
+  const symbols = relation
+    ? relation.invariantIds.length ? [...relation.invariantIds] : ["packet-scope"]
+    : ["packet-scope"];
+  return {
+    expectedPaths: [...payload.expectedPaths],
+    symbols,
+    relationPaths,
+    generatedPaths: relationPaths.filter((path) => /generated/i.test(path)),
+    sourcePaths: relationPaths.filter((path) => !/(?:test|spec|generated)/i.test(path)),
+    testPaths: relationPaths.filter((path) => /(?:test|spec)/i.test(path)),
+    configPaths: relationPaths.filter((path) => /(?:^|\/)(?:config|\.env)/i.test(path)),
+    ...(relation?.graphDigest !== undefined ? { relationDigest: relation.graphDigest } : {}),
+    ...(payload.verificationPolicyVersion !== undefined ? { verificationPolicyVersion: payload.verificationPolicyVersion } : {}),
+    ...(payload.verificationRequirements !== undefined ? {
+      verificationCapabilityIds: payload.verificationRequirements.filter((requirement) => requirement.kind === "command").map((requirement) => requirement.id),
+    } : {}),
+    ...(payload.verificationCommandIdentities !== undefined ? {
+      verificationCommandIdentities: payload.verificationCommandIdentities.map((command) => ({
+        id: command.id,
+        identityDigest: command.identityDigest,
+        targets: payload.verificationCommandTargets?.find((target) => target.id === command.id)?.targets ?? [],
+      })),
+    } : {}),
+    ...(payload.risks.length ? { riskPolicyDigest: createHash("sha256").update(JSON.stringify(payload.risks)).digest("hex") } : {}),
+    claimDigest: createHash("sha256").update(JSON.stringify([...payload.expectedPaths].sort())).digest("hex"),
+  };
 }
 
 interface InvestigationCheckpoint {
