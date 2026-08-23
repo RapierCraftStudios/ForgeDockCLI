@@ -9,6 +9,7 @@ export type SubjectAdmissionDecision =
   | { action: "start" }
   | { action: "resume"; runId: string; state: "investigating" | "preparing" | "building" | "blocked" | "publishing" | "target_recovery" | "retry_wait" | "failed" | "remediating" | "merging" | "invalid"; checkpoint: "investigation" | "preparation" | "build" | "verification" | "remediation" | "publication" | "target-advance" | "retry" | "completion" | "conflict-recovery" | "invalid-closure"; artifacts: DurableArtifact[] }
   | { action: "skip"; runId: string; state: RunStateName }
+  | { action: "blocked"; runId: string; state: "blocked"; reason: string; artifacts: DurableArtifact[] }
   | { action: "block"; runId: string; state: RunStateName; reason: string };
 
 export interface DurableLaneMismatch {
@@ -192,6 +193,40 @@ export function decideSubjectAdmission(
   const hasPacket = packet !== undefined;
   const build = latestArtifactOfKind(latest.artifacts, "BuildResult");
   const verdict = latestArtifactOfKind(latest.artifacts, "ReviewVerdict");
+  if (verdict?.payload.disposition === "blocked" && reconciled.state !== "blocked") {
+    return {
+      action: "block",
+      runId: latest.runId,
+      state: reconciled.state,
+      reason: `Contradictory durable ReviewVerdict disposition=blocked with run state ${reconciled.state}; refusing recovery mutation`,
+    };
+  }
+  if (verdict?.payload.disposition === "blocked" && reconciled.state === "blocked") {
+    const warningReason = verdict.payload.warnings
+      ?.map((warning) => warning.trim())
+      .filter((warning) => warning.length > 0)
+      .join("; ");
+    const findingReason = verdict.payload.findings
+      .filter((finding) => finding.blocking || finding.mustFix)
+      .map((finding) => `${finding.title}: ${finding.evidence}`.trim())
+      .find((reason) => reason.length > 0);
+    const rootLedger = latestArtifactOfKind(latest.artifacts, "FindingRootLedger");
+    const openRootIds = rootLedger?.payload.roots
+      .filter((root) => root.state === "open" || root.state === "fix-attempted" || root.state === "regressed")
+      .map((root) => root.rootId);
+    const rootAuthorityReason = openRootIds?.length
+      ? `Review root authority remains unresolved for ${openRootIds.join(", ")}`
+      : undefined;
+    const outcomeReason = latestOutcome?.payload.reason?.trim();
+    return {
+      action: "blocked",
+      runId: latest.runId,
+      state: "blocked",
+      reason: warningReason || outcomeReason || findingReason || rootAuthorityReason
+        || `ReviewVerdict ${verdict.id} is durably blocked; preserved review admission evidence requires reassessment`,
+      artifacts: latest.artifacts,
+    };
+  }
   const outcome = latestArtifactOfKind(latest.artifacts, "Outcome");
   const terminalTargetRecoveryOutcome = outcome?.payload.targetRecovery?.checkpointId !== undefined
     && (outcome.payload.status === "failed" || outcome.payload.status === "blocked");
