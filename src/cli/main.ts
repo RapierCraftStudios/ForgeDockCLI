@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createArtifact, type ArtifactKind, type DurableArtifact } from "../core/artifacts/schema.js";
 import { findArtifacts, renderArtifactMarkdown } from "../core/artifacts/codec.js";
 import { CachedArtifactRepository, ProjectedRunRepository, type ArtifactRepository, type RunProgressRecord, type RunRepository } from "../core/ports/repositories.js";
-import type { OrchestrationNodeRecord, OrchestrationRecord } from "../core/ports/orchestration.js";
+import { orchestrationRepositoriesEqual, type OrchestrationNodeRecord, type OrchestrationRecord } from "../core/ports/orchestration.js";
 import { LeaseContinuityError } from "../core/ports/lease.js";
 import { createObservationProducer, type ObservationIdentity, type ObservationSink } from "../observability/contracts.js";
 import { retryableExternalDisposition } from "../core/retry.js";
@@ -463,7 +463,7 @@ async function workOn(
   let github = new GitHubClient(process.cwd(), undefined, undefined, signal);
   const issue = await github.getIssue(Number(issueArg), option(argv, "--repo"));
   const localRepository = await github.getRepository();
-  if (localRepository.repo !== issue.repo) throw new Error(`Current checkout is ${localRepository.repo}, but the issue belongs to ${issue.repo}`);
+  if (!orchestrationRepositoriesEqual(localRepository.repo, issue.repo)) throw new Error(`Current checkout is ${localRepository.repo}, but the issue belongs to ${issue.repo}`);
   const lane = await resolveIssueLane(issue, localRepository.defaultBranch, github, effectiveOrchestration.fastLaneTarget, effectiveOrchestration.featurePromotionTarget, effectiveOrchestration.productionTarget);
   const runId = `run_${crypto.randomUUID()}`;
   const subject = { repo: issue.repo, issue: issue.number };
@@ -1849,7 +1849,7 @@ async function reviewPr(argv: string[], signal?: AbortSignal): Promise<void> {
   let github = new GitHubClient(process.cwd(), undefined, undefined, signal);
   const localRepository = await github.getRepository();
   const repo = option(argv, "--repo") ?? localRepository.repo;
-  if (repo !== localRepository.repo) throw new Error(`Current checkout is ${localRepository.repo}; review workspace for ${repo} is unavailable here`);
+  if (!orchestrationRepositoriesEqual(repo, localRepository.repo)) throw new Error(`Current checkout is ${localRepository.repo}; review workspace for ${repo} is unavailable here`);
   const issueValue = option(argv, "--issue");
   if (issueValue && !/^\d+$/.test(issueValue)) throw new Error("--issue must be a positive integer");
   const provider = option(argv, "--provider");
@@ -2936,7 +2936,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
       }),
       revalidateRoute: async ({ item }) => {
         const itemRepository = repositoryForScheduledItem(item, record.repository);
-        const itemRepositoryInfo = itemRepository === record.repository ? checkedCheckout : await github.getRepository(itemRepository);
+        const itemRepositoryInfo = orchestrationRepositoriesEqual(itemRepository, record.repository) ? checkedCheckout : await github.getRepository(itemRepository);
         const issue = await github.getIssue(item.issue, itemRepository);
         const lane = await resolveIssueLane(
           issue,

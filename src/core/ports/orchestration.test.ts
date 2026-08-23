@@ -8,10 +8,18 @@ import {
   OrchestrationIssueOwnershipConflictError,
   orchestrationRecordIssueIdentities,
   orchestrationRecordIssueNumbers,
+  normalizeOrchestrationRepository,
+  orchestrationRepositoriesEqual,
   type OrchestrationNodeRecord,
   type OrchestrationRecord,
 } from "./orchestration.js";
 import { InMemoryOrchestrationRepository } from "./repositories.js";
+
+test("repository identity comparison accepts GitHub case variants but rejects different repositories", () => {
+  assert.equal(normalizeOrchestrationRepository("RapierCraftStudios/ForgeDockCLI"), "rapiercraftstudios/forgedockcli");
+  assert.equal(orchestrationRepositoriesEqual("RapierCraftStudios/ForgeDockCLI", "rapiercraftstudios/forgedockcli"), true);
+  assert.equal(orchestrationRepositoriesEqual("RapierCraftStudios/ForgeDockCLI", "other/forgedockcli"), false);
+});
 
 function node(overrides: Partial<OrchestrationNodeRecord> = {}): OrchestrationNodeRecord {
   return {

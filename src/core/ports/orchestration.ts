@@ -300,6 +300,11 @@ export function normalizeOrchestrationRepository(repository: string): string {
   return repository.trim().toLowerCase();
 }
 
+/** Compare repository identities case-insensitively while preserving caller spelling elsewhere. */
+export function orchestrationRepositoriesEqual(left: string, right: string): boolean {
+  return normalizeOrchestrationRepository(left) === normalizeOrchestrationRepository(right);
+}
+
 /** Stable key for one repository-qualified issue identity. */
 export function orchestrationIssueIdentityKey(identity: OrchestrationIssueIdentity): string {
   return JSON.stringify([normalizeOrchestrationRepository(identity.repository), identity.issue]);

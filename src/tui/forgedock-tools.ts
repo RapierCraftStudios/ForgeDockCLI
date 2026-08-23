@@ -25,6 +25,7 @@ import type {
   OrchestrationWorkerAttemptRecord,
 } from "../core/ports/orchestration.js";
 import {
+  orchestrationRepositoriesEqual,
   findDurableOrchestrationIssueConflicts,
   normalizeOrchestrationRepository,
   orchestrationNodeRepository,
@@ -1701,7 +1702,7 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       let resolvedRepo = params.repo;
       if (issueWorker) {
         const checkout = await new GitHubClient(ctx.cwd).getRepository();
-        if (resolvedRepo && resolvedRepo !== checkout.repo) {
+        if (resolvedRepo && !orchestrationRepositoriesEqual(resolvedRepo, checkout.repo)) {
           throw new Error(`Issue worker target repo ${resolvedRepo} conflicts with controller checkout ${checkout.repo}`);
         }
         resolvedRepo = checkout.repo;
