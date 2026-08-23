@@ -308,6 +308,30 @@ export interface OrchestrationControllerResult {
   record: OrchestrationRecord;
 }
 
+/**
+ * The controller has durably accepted an operator stop. This is deliberately
+ * distinct from the abort error that caused execution to unwind: the TUI may
+ * consume this exact outcome, while every other rejection remains a failure.
+ */
+export class AcceptedOrchestrationStopError extends Error {
+  readonly orchestrationId: string;
+
+  constructor(orchestrationId: string) {
+    super(`Orchestration ${orchestrationId} stopped by operator`);
+    this.name = "AcceptedOrchestrationStopError";
+    this.orchestrationId = orchestrationId;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
+export function isAcceptedOrchestrationStop(
+  error: unknown,
+  orchestrationId: string,
+): error is AcceptedOrchestrationStopError {
+  return error instanceof AcceptedOrchestrationStopError
+    && error.orchestrationId === orchestrationId;
+}
+
 interface ExecutionControl {
   abort: AbortController;
   stopRequested: boolean;
@@ -685,7 +709,11 @@ export class OrchestrationController {
       if (state && isExpectedCancellation(error, signal, control)) {
         this.cancelState(state, "operator stop");
         this.emitSnapshot(state.record, state);
-        try { await this.flush(state); } catch { /* retain original cancellation */ }
+        // Do not turn a best-effort cancellation checkpoint into an accepted
+        // stop. The typed outcome is emitted only after the fenced durable
+        // write has completed successfully.
+        await this.flush(state);
+        throw new AcceptedOrchestrationStopError(orchestrationId);
       } else if (state && state.error === undefined) {
         this.replaceRecord(state, { ...state.record, status: "failed", updatedAt: this.now() });
         this.emitSnapshot(state.record, state);
@@ -3238,8 +3266,11 @@ function combineAbortSignals(left: AbortSignal | undefined, right: AbortSignal):
   return combined.signal;
 }
 
-function isExpectedCancellation(_error: unknown, _signal: AbortSignal, control: ExecutionControl): boolean {
-  return control.stopRequested;
+function isExpectedCancellation(error: unknown, signal: AbortSignal, control: ExecutionControl): boolean {
+  if (!control.stopRequested || !control.abort.signal.aborted || !signal.aborted) return false;
+  // The controller-owned abort reason is the narrow identity for an operator
+  // stop. A concurrent external/lease/persistence error must stay visible.
+  return error === control.abort.signal.reason;
 }
 
 /** Orchestration records are JSON-safe; preserve key order from the record. */

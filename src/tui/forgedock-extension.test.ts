@@ -3585,7 +3585,7 @@ test("explicit orchestration resume routes directly to the durable resume tool",
   assert.doesNotThrow(() => bindOrchestrationInvocation(state.pi, { rawArgs: "another fresh request" }));
 });
 
-test("explicit orchestration stop routes to forgedock_orchestrate and invokes durable stop", async () => {
+test("invariant:matrix-adapter-lifecycle-3ccabac4828b invariant:matrix-terminal-metadata-335bb861725e explicit orchestration stop routes to forgedock_orchestrate and invokes durable stop", async () => {
   const orchestrationId = "dag_cd83f20b-7670-4be3-984c-63f20a77a72f";
   const repository = new InMemoryOrchestrationRepository();
   await repository.createOrchestration({
@@ -3626,10 +3626,70 @@ test("explicit orchestration stop routes to forgedock_orchestrate and invokes du
     commandContext() as any,
   );
   assert.match((result.content?.[0] as any)?.text ?? "", new RegExp(`${orchestrationId} cancelled`));
+  const stopDetails = (result.details as any).delegation;
+  assert.deepEqual(stopDetails, {
+    orchestrationId,
+    status: "cancelled",
+    disposition: "accepted",
+    queuedNodes: "unattempted",
+    workerDrain: "completed",
+  });
   assert.equal((await repository.loadOrchestration(orchestrationId))?.status, "cancelled");
 });
 
-test("restarted TUI semantic stop cancels persisted native task without RPC fallback", async () => {
+test("invariant:matrix-terminal-metadata-5f04904df9b2 invariant:matrix-adapter-lifecycle-ff235e2ad81d invariant:matrix-terminal-metadata-fc851d4120e5 invariant:matrix-terminal-metadata-edbfb67893c0 active stop keeps one TUI session usable across build review and remediation workers", async () => {
+  const modes = ["build", "review", "remediation"] as const;
+  for (const mode of modes) {
+    const state = fakePi(["read"]);
+    const repository = new InMemoryOrchestrationRepository();
+    const { stopRequests } = installImmediateSubagentRpc(state, `active-stop-${mode}`);
+    const failures: unknown[] = [];
+    const taskKinds: string[] = [];
+    const delegator = witnessedDagDelegator(state.pi, repository);
+    const run = await delegator.start({
+      repository: "a/b",
+      items: [
+        { id: `${mode}-active`, issue: 1, title: `${mode} active`, summary: `${mode} worker`, priority: 1, dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [1] },
+        { id: `${mode}-queued`, issue: 2, title: `${mode} queued`, summary: `${mode} successor`, priority: 2, dependencies: [`${mode}-active`], claims: [], labels: [], affectedFiles: [], memberIssues: [2] },
+      ],
+      maxParallel: 1,
+      taskFor: (item) => {
+        taskKinds.push(`${mode}:${item.id}`);
+        return { agent: "forgedock-issue-worker", task: `Run ${mode} worker for #${item.issue}`, cwd: process.cwd() };
+      },
+      assertCompleted: async () => undefined,
+      onComplete: () => undefined,
+      onFailure: (error) => failures.push(error),
+    });
+
+    const stopped = await delegator.stop(run.id, true);
+    await run.completion;
+    assert.equal(stopped.orchestrationId, run.id);
+    assert.equal(stopped.status, "cancelled");
+    assert.equal(failures.length, 0, `${mode} accepted stop must not invoke failure presentation`);
+    assert.deepEqual(taskKinds, [`${mode}:${mode}-active`]);
+    assert.equal(stopped.nodes.find((node) => node.id === `${mode}-queued`)?.status, "queued");
+    assert.equal(stopped.nodes.find((node) => node.id === `${mode}-queued`)?.attempts?.length ?? 0, 0);
+    assert.equal(stopRequests.length, 1);
+
+    // A replacement TUI reads the same authoritative cancelled snapshot; it
+    // does not own or re-cancel the prior worker transport.
+    const replacement = witnessedDagDelegator(state.pi, repository);
+    const replacementSnapshot = await replacement.stop(run.id, true);
+    assert.deepEqual(replacementSnapshot, await repository.loadOrchestration(run.id));
+
+    // The same fake TUI remains alive after the accepted completion and can
+    // immediately execute an unrelated command in this process.
+    await state.commands.get("forgedock-tasks")?.("list", commandContext());
+    const repeated = await delegator.stop(run.id, true);
+    assert.equal(repeated.status, "cancelled");
+    assert.equal(stopRequests.length, 1, "idempotent stop must not re-cancel the worker");
+    await replacement.shutdown();
+    await delegator.shutdown();
+  }
+});
+
+test("invariant:matrix-identity-isolation-e59f873e6002 unresolved restarted TUI native stop remains a visible drain failure without RPC fallback", async () => {
   const orchestrationId = "dag_restart_stop_native";
   const nativeTaskId = "task_native_restarted";
   const repository = new InMemoryOrchestrationRepository();
@@ -3718,7 +3778,7 @@ test("shared persisted native records consume capacity in a second TUI", async (
   await assert.rejects(run, /shutdown|cancelled/i);
 });
 
-test("fresh TUI stop initializes durable context and reports terminal status truthfully", async () => {
+test("invariant:matrix-adapter-lifecycle-ff235e2ad81d invariant:matrix-terminal-metadata-fc851d4120e5 fresh TUI stop initializes durable context and reports terminal status truthfully", async () => {
   const repository = new InMemoryOrchestrationRepository();
   const admission = new LeaseBackedOrchestrationExecutionAdmission(new InMemoryLeaseRepository());
   const record = (orchestrationId: string, status: OrchestrationRecord["status"]): OrchestrationRecord => ({
@@ -3753,12 +3813,16 @@ test("fresh TUI stop initializes durable context and reports terminal status tru
   );
   const stopped = await execute("dag_fresh_stop");
   assert.match((stopped.content?.[0] as any)?.text ?? "", /dag_fresh_stop cancelled/);
+  assert.equal((stopped.details as any).delegation.disposition, "accepted");
+  const stoppedAgain = await execute("dag_fresh_stop");
+  assert.match((stoppedAgain.content?.[0] as any)?.text ?? "", /dag_fresh_stop was already cancelled/);
+  assert.equal((stoppedAgain.details as any).delegation.disposition, "already-terminal");
   const completed = await execute("dag_completed_stop");
   assert.match((completed.content?.[0] as any)?.text ?? "", /already completed/);
   const failed = await execute("dag_failed_stop");
   assert.match((failed.content?.[0] as any)?.text ?? "", /already failed/);
   const cancelled = await execute("dag_cancelled_stop");
-  assert.match((cancelled.content?.[0] as any)?.text ?? "", /dag_cancelled_stop cancelled/);
+  assert.match((cancelled.content?.[0] as any)?.text ?? "", /dag_cancelled_stop was already cancelled/);
 });
 
 test("typed orchestration derives bounded authoritative plan metadata", () => {

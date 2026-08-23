@@ -7,6 +7,7 @@ import type {
 } from "../../core/ports/orchestration.js";
 import { InMemoryArtifactRepository, InMemoryOrchestrationRepository } from "../../core/ports/repositories.js";
 import {
+  AcceptedOrchestrationStopError,
   OrchestrationController,
   type OrchestrationControllerDependencies,
   type OrchestrationWorkerContext,
@@ -182,7 +183,7 @@ describe("OrchestrationController", () => {
     assert.equal(admission.hasClaim("dag-test"), false);
   });
 
-  it("operator stop raises a barrier, preserves queued provenance, and is idempotent", async () => {
+  it("invariant:matrix-adapter-lifecycle-9340c7628ba4 invariant:matrix-terminal-metadata-881390357d19 invariant:matrix-adapter-lifecycle-ff235e2ad81d operator stop raises a barrier, preserves queued provenance, and is idempotent", async () => {
     const repository = new RecordingOrchestrationRepository();
     const started: string[] = [];
     const service = controller(repository, async (scheduled, context) => {
@@ -197,7 +198,11 @@ describe("OrchestrationController", () => {
       maxParallel: 2,
       items: [item("one", 1), item("two", 2), item("successor", 3, ["one"])],
     });
-    const runningFailure = assert.rejects(running, /stopped by operator/);
+    const runningFailure = assert.rejects(running, (error: unknown) => {
+      assert.ok(error instanceof AcceptedOrchestrationStopError);
+      assert.equal(error.orchestrationId, "dag-test");
+      return true;
+    });
     await waitUntil(() => started.length === 2, "expected two admitted workers");
     const stopped = await service.stop("dag-test", true);
     assert.equal(stopped.status, "cancelled");
@@ -207,7 +212,7 @@ describe("OrchestrationController", () => {
     assert.equal((await service.stop("dag-test", true)).status, "cancelled");
   });
 
-  it("preserves a queued successor when an admitted worker resolves after cancellation", async () => {
+  it("invariant:matrix-terminal-metadata-881390357d19 preserves a queued successor when an admitted worker resolves after cancellation", async () => {
     const repository = new RecordingOrchestrationRepository();
     const admission = new TestExecutionAdmission();
     const started = deferred<void>();
@@ -226,7 +231,11 @@ describe("OrchestrationController", () => {
       maxParallel: 1,
       items: [item("investigator", 1), item("successor", 2, ["investigator"])],
     });
-    const runningFailure = assert.rejects(running, /stopped by operator/);
+    const runningFailure = assert.rejects(running, (error: unknown) => {
+      assert.ok(error instanceof AcceptedOrchestrationStopError);
+      assert.equal(error.orchestrationId, "dag-test");
+      return true;
+    });
     await started.promise;
     await service.stop("dag-test", true);
     await runningFailure;
