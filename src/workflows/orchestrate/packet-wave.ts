@@ -11,7 +11,7 @@ export interface PacketWaveItem {
   /** Exact base used while reading and authoring the packet. */
   baseRef: string;
   /** Confirmed semantic edges from investigation/issue evidence. */
-  semanticDependencies?: readonly string[];
+  semanticDependencies: readonly string[];
   /** Invalid and decomposed issues never enter the mutation DAG. */
   outcome?: "confirmed" | "invalid" | "decomposed";
   /** Optional children retained when a decomposition is expanded. */
@@ -72,9 +72,8 @@ export function compileExecutionDag(input: PacketDagInput): CompiledPacketDag {
     if (!paths.length) {
       if (input.fallback !== "preview-claims") throw new Error(`Packet ${item.id} has no bounded expected paths`);
     }
-    const dependencies = packet.semanticDependencies === undefined
-      ? [...item.dependencies]
-      : unique(packet.semanticDependencies);
+    if (packet.semanticDependencies === undefined) throw new Error(`Packet ${item.id} lacks authoritative semantic dependency evidence`);
+    const dependencies = unique(packet.semanticDependencies);
     for (const dependency of dependencies) {
       if (!byId.has(dependency)) throw new Error(`Packet ${item.id} references unknown semantic dependency ${dependency}`);
     }
@@ -92,7 +91,14 @@ export function compileExecutionDag(input: PacketDagInput): CompiledPacketDag {
       } satisfies DependencyProvenance,
     };
     const claims = paths.length ? paths : normalizePaths(item.claims);
-    compiled.push({ ...item, dependencies, claims, plan: provenance });
+    const memberIssues = [...new Set([...(item.memberIssues ?? []), ...(packet.childIssues ?? [])])];
+    compiled.push({
+      ...item,
+      dependencies,
+      claims,
+      plan: provenance,
+      ...(memberIssues.length ? { memberIssues } : {}),
+    });
   }
   const graph = materializeClaimDependencies(compiled);
   const activeIds = new Set(graph.items.map((item) => item.id));

@@ -10,7 +10,7 @@ function item(id: string, issue: number, claims = ["component:repository"]): Sch
 }
 
 function packet(id: string, path: string, baseRef = "origin/staging"): PacketWaveItem {
-  return { id, issue: Number(id.slice(1)), expectedPaths: [path], baseRef };
+  return { id, issue: Number(id.slice(1)), expectedPaths: [path], baseRef, semanticDependencies: [] };
 }
 
 describe("packet DAG compilation", () => {
