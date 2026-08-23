@@ -2040,6 +2040,27 @@ it("backpressures a packet wave at zero capacity and resumes after recovery", as
   assert.equal(result.record.status, "completed");
 });
 
+it("materializes a mixed route/base wave without a global base barrier", async () => {
+  const repository = new RecordingOrchestrationRepository();
+  const service = controller(repository, async () => undefined, {
+    investigationWorker: async (scheduled) => ({
+      outcome: "confirmed",
+      baseSha: scheduled.id === "route-a" ? "base-a" : "base-b",
+      evidence: { runId: `run-${scheduled.id}`, investigationId: `investigation-${scheduled.id}` },
+    }),
+    packetWorker: async (scheduled) => ({
+      packetId: `packet-${scheduled.id}`,
+      expectedPaths: [`src/${scheduled.id}.ts`],
+      semanticDependencies: [],
+      baseSha: scheduled.id === "route-a" ? "base-a" : "base-b",
+    }),
+    materializeExecution: async () => ({ items: [item("route-a", 1), item("route-b", 2)] }),
+  });
+  const result = await service.createAndRun({ repository: "owner/repo", maxParallel: 2, investigationFirst: true, items: [item("route-a", 1), item("route-b", 2)] });
+  assert.equal(result.record.phase, "executing");
+  assert.deepEqual(result.record.nodes.map((node) => (node.plan?.claimProvenance as { baseRef?: string } | undefined)?.baseRef).sort(), ["base-a", "base-b"]);
+});
+
 it("fails closed when a packet omits semantic dependency evidence", async () => {
   const repository = new RecordingOrchestrationRepository();
   const service = controller(repository, async () => undefined, {

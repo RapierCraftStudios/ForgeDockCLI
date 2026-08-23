@@ -7,7 +7,7 @@ import { chmod, lstat, mkdir, readFile, readdir, rename, rm, stat, utimes, write
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { AdvertisedRemoteHeadMismatchError, type GitWorkspace, type GitWorkspaceManager, type ManagedWorktreeResetLifecycle, type PullRequestRepairWorkspaceManager, type ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
+import { AdvertisedRemoteHeadMismatchError, type GitWorkspace, type GitWorkspaceManager, type InvestigationSnapshot, type InvestigationSnapshotIdentity, type InvestigationSnapshotManager, type ManagedWorktreeResetLifecycle, type PullRequestRepairWorkspaceManager, type ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { verificationEnvironment } from "../../runtime/controller-environment.js";
 import { withExternalOperationRetry } from "../../core/external-operation-retry.js";
 
@@ -1276,6 +1276,102 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
       throw new Error(`git ${args[0] ?? ""} failed in ${basename(cwd)}: ${detail.stderr?.trim() || detail.message}`, { cause: error });
     }
   }
+}
+
+/** Detached investigation snapshots never use the operator checkout as a cwd. */
+export class GitInvestigationSnapshotManager implements InvestigationSnapshotManager {
+  readonly #root: string;
+  static readonly #locks = new Map<string, Promise<void>>();
+
+  constructor(root: string, snapshotRoot = join(dirname(resolve(root)), ".forgedock-worktrees", `${basename(resolve(root))}-investigation`)) {
+    this.#root = resolve(snapshotRoot);
+  }
+
+  async acquire(input: { repository: string; repositoryRoot: string; targetBranch: string; baseSha: string; signal?: AbortSignal }): Promise<InvestigationSnapshot> {
+    if (input.signal?.aborted) throw input.signal.reason ?? new Error("Investigation snapshot acquisition cancelled");
+    const repositoryRoot = canonicalExistingPath(input.repositoryRoot, `repository ${input.repository}`);
+    assertSha(input.baseSha, `Investigation snapshot base for ${input.repository} ${input.targetBranch}`);
+    if (!input.targetBranch.trim()) throw new Error(`Investigation snapshot route is missing for ${input.repository}`);
+    const snapshotId = createHash("sha256").update(JSON.stringify({ repository: input.repository.trim().toLowerCase(), repositoryRoot, targetBranch: input.targetBranch, baseSha: input.baseSha.toLowerCase() })).digest("hex");
+    const snapshotPath = resolve(this.#root, snapshotId);
+    assertInside(this.#root, snapshotPath);
+    const identity: InvestigationSnapshotIdentity = { schema: "forgedock.investigation-snapshot/v1", repository: input.repository.trim().toLowerCase(), repositoryRoot, targetBranch: input.targetBranch, baseSha: input.baseSha.toLowerCase(), snapshotId, snapshotPath };
+    // Serialize Git worktree metadata updates per repository while allowing
+    // distinct repositories to acquire snapshots concurrently.
+    const key = repositoryRoot;
+    const previous = GitInvestigationSnapshotManager.#locks.get(key);
+    if (previous) await previous;
+    let releaseLock!: () => void;
+    const lock = new Promise<void>((resolveLock) => { releaseLock = resolveLock; });
+    GitInvestigationSnapshotManager.#locks.set(key, lock);
+    try {
+      await mkdir(this.#root, { recursive: true });
+      if (existsSync(snapshotPath)) {
+        await this.validate({ identity, path: snapshotPath });
+        return { identity, path: snapshotPath };
+      }
+      try {
+        // `worktree add` records only the controller-owned detached path; it
+        // never changes HEAD, index, branch, or files in repositoryRoot.
+        await this.git(["worktree", "add", "--detach", snapshotPath, identity.baseSha], repositoryRoot);
+      } catch (error) {
+        if (!existsSync(snapshotPath)) throw new Error(`Unable to acquire investigation snapshot for ${input.repository} route ${input.targetBranch} base ${identity.baseSha}`, { cause: error });
+      }
+      const snapshot = { identity, path: snapshotPath };
+      await this.validate(snapshot);
+      return snapshot;
+    } finally {
+      releaseLock();
+      if (GitInvestigationSnapshotManager.#locks.get(key) === lock) GitInvestigationSnapshotManager.#locks.delete(key);
+    }
+  }
+
+  async validate(snapshot: InvestigationSnapshot): Promise<void> {
+    const expected = snapshot.identity;
+    assertInside(this.#root, expected.snapshotPath);
+    if (!expected.repository.trim() || !expected.targetBranch.trim() || !isSha(expected.baseSha)) throw snapshotError(expected, "snapshot identity is incomplete");
+    const derivedId = createHash("sha256").update(JSON.stringify({ repository: expected.repository.trim().toLowerCase(), repositoryRoot: expected.repositoryRoot, targetBranch: expected.targetBranch, baseSha: expected.baseSha.toLowerCase() })).digest("hex");
+    if (derivedId !== expected.snapshotId) throw snapshotError(expected, "snapshot identity digest mismatch");
+    if (snapshot.path !== expected.snapshotPath || resolve(snapshot.path) !== expected.snapshotPath) {
+      throw snapshotError(expected, `path mismatch (expected ${expected.snapshotPath}, observed ${snapshot.path})`);
+    }
+    let metadata;
+    try { metadata = await lstat(snapshot.path); } catch (error) { throw snapshotError(expected, "snapshot is missing", error); }
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw snapshotError(expected, "snapshot path is not a regular directory");
+    const observedRoot = canonicalExistingPath(snapshot.path, `snapshot for ${expected.repository}`);
+    if (observedRoot !== expected.snapshotPath) throw snapshotError(expected, `canonical path mismatch (observed ${observedRoot})`);
+    const top = (await this.git(["rev-parse", "--show-toplevel"], snapshot.path)).trim();
+    if (!sameFilesystemPath(top, expected.snapshotPath)) throw snapshotError(expected, `git top-level mismatch (observed ${top})`);
+    const branch = (await this.git(["branch", "--show-current"], snapshot.path)).trim();
+    if (branch) throw snapshotError(expected, `snapshot is attached to branch ${branch}`);
+    const head = (await this.git(["rev-parse", "HEAD"], snapshot.path)).trim().toLowerCase();
+    if (head !== expected.baseSha.toLowerCase()) throw snapshotError(expected, `HEAD mismatch (observed ${head})`);
+    const source = (await this.git(["rev-parse", "--git-common-dir"], snapshot.path)).trim();
+    const sourceRoot = resolve(snapshot.path, source).replace(/[/\\]\.git$/, "");
+    if (!sameFilesystemPath(sourceRoot, expected.repositoryRoot)) throw snapshotError(expected, `repository root mismatch (observed ${sourceRoot})`);
+  }
+
+  async release(snapshot: InvestigationSnapshot): Promise<void> {
+    await this.validate(snapshot);
+    await this.git(["worktree", "remove", "--force", snapshot.identity.snapshotPath], snapshot.identity.repositoryRoot);
+  }
+
+  private async git(args: string[], cwd: string): Promise<string> {
+    try {
+      const { stdout } = await execFileAsync("git", args, { cwd, encoding: "utf8", windowsHide: true, maxBuffer: 10 * 1024 * 1024 });
+      return stdout;
+    } catch (error) {
+      const detail = error as Error & { stderr?: string };
+      throw new Error(`git ${args[0] ?? ""} failed in ${basename(cwd)}: ${detail.stderr?.trim() || detail.message}`, { cause: error });
+    }
+  }
+}
+
+function canonicalExistingPath(path: string, label: string): string {
+  try { return realpathSync.native(path); } catch (error) { throw new Error(`Cannot resolve canonical ${label} root ${path}`, { cause: error }); }
+}
+function snapshotError(identity: InvestigationSnapshotIdentity, detail: string, cause?: unknown): Error {
+  return new Error(`Invalid investigation snapshot for repository ${identity.repository}, route ${identity.targetBranch}, base ${identity.baseSha}: ${detail}`, cause === undefined ? undefined : { cause });
 }
 
 type DependencyOwnerStatus = "alive" | "dead" | "unknown";
