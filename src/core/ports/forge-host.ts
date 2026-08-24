@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import type { RetainedRevisionRoute } from "../artifacts/schema.js";
+
 export interface IssueMilestone {
   number: number;
   title: string;
@@ -400,6 +402,8 @@ export interface ForgeHost {
     reviewedHeadSha: string;
     reviewerRoles: readonly string[];
     publicationFence: ReviewFindingPublicationFence;
+    /** Verified retained-delivery identity for PR-only finding projection. */
+    route?: RetainedRevisionRoute;
     finding: ReviewFindingInput;
   }): Promise<IssueSnapshot>;
   /** Close review-finding projections superseded by the latest authoritative verdict. */
@@ -409,6 +413,7 @@ export interface ForgeHost {
     runId: string;
     publicationFence: ReviewFindingPublicationFence;
     activeFindings: readonly ReviewFindingInput[];
+    routes?: readonly RetainedRevisionRoute[];
   }): Promise<readonly number[]>;
   mergePullRequest(repo: string, number: number, expectedHeadSha: string, expectedBaseBranch: string, options?: { requiredChecksMode?: "require" | "if-present" }): Promise<void>;
   /** Request closure; the controller independently re-reads getIssue before terminal publication. */

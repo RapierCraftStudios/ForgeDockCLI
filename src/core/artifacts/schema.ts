@@ -577,8 +577,40 @@ export const ReviewPlanSchema = Type.Object({
   })),
 });
 
+export const RetainedRevisionRouteSchema = Type.Object({
+  kind: Type.Literal("retained-revision"),
+  repository: NonEmptyString,
+  pullRequest: Type.Integer({ minimum: 1 }),
+  reviewedHeadSha: Sha,
+  headBranch: NonEmptyString,
+  baseBranch: NonEmptyString,
+  verifiedBaseSha: Sha,
+  deliveryIssue: Type.Integer({ minimum: 1 }),
+  deliveryRun: NonEmptyString,
+  findingId: NonEmptyString,
+  findingRoot: NonEmptyString,
+  matchedAcceptanceCriterion: NonEmptyString,
+  matchedAcceptanceCriteria: Type.Array(NonEmptyString, { minItems: 1 }),
+  sourceSnapshot: Type.Object({
+    reviewedHeadSha: Sha,
+    path: NonEmptyString,
+    excerpt: Type.Optional(Type.String({ minLength: 1, maxLength: 4000 })),
+    digest: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$", minLength: 64, maxLength: 64 })),
+    symbol: Type.Optional(NonEmptyString),
+  }),
+  lineage: Type.Object({
+    kind: Type.Literal("retained-delivery"),
+    sourceRunId: NonEmptyString,
+    sourceIssue: Type.Integer({ minimum: 1 }),
+    sourceBranch: NonEmptyString,
+    targetBranch: NonEmptyString,
+  }),
+});
+export type RetainedRevisionRoute = Static<typeof RetainedRevisionRouteSchema>;
+
 const ReviewFindingProjectionEntrySchema = Type.Object({
   findingId: NonEmptyString,
+  route: Type.Optional(RetainedRevisionRouteSchema),
   status: Type.Union([
     Type.Literal("pending"),
     Type.Literal("materialized"),
@@ -646,6 +678,10 @@ export const ReviewFindingProjectionPayloadSchema = Type.Object({
       reason: NonEmptyString,
     })),
   }),
+  /** Retained route for the common single-finding projection. */
+  route: Type.Optional(RetainedRevisionRouteSchema),
+  /** Per-finding retained delivery routes; optional for legacy/deployment checkpoints. */
+  routes: Type.Optional(Type.Array(RetainedRevisionRouteSchema)),
   projections: Type.Array(ReviewFindingProjectionEntrySchema),
   supersedes: Type.Optional(NonEmptyString),
 });

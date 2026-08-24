@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { Type, type Static } from "typebox";
-import { createArtifact, FindingSchema, type DurableArtifact, type ReviewFindingProjectionPayload } from "../../core/artifacts/schema.js";
+import { createArtifact, FindingSchema, type DurableArtifact, type RetainedRevisionRoute, type ReviewFindingProjectionPayload } from "../../core/artifacts/schema.js";
 import { loadForgeGuidance } from "../../core/config/project-memory.js";
 import type { ForgeHost, PullRequestSnapshot, ReviewFindingPublicationFence } from "../../core/ports/forge-host.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
@@ -973,6 +973,18 @@ export async function reviewPullRequest(
     let projectionEntries: ReviewFindingProjectionPayload["projections"] = [];
     let projectionPlan: DurableArtifact<"ReviewFindingProjection"> | undefined;
     let publicationFence: ReviewFindingPublicationFence | undefined;
+    const retainedRoutes = projectionEnabled && input.buildResult && expectedDeliveryRunId !== run.runId
+      ? activeProjectionFindings.map((finding) => deriveRetainedRevisionRoute({
+        run,
+        pullRequest: frozen,
+        buildResult: input.buildResult!,
+        packet: input.packet,
+        expectedDeliveryRunId,
+        changedPaths,
+        finding,
+      }))
+      : [];
+    const retainedRouteByFindingId = new Map(retainedRoutes.map((route) => [route.findingId, route]));
     if (projectionEnabled) {
       if (!dependencies.host.beginReviewFindingPublication || !dependencies.host.assertReviewFindingPublication) {
         throw new Error("Review-finding projection requires durable monotonic host publication fencing");
@@ -1001,6 +1013,8 @@ export async function reviewPullRequest(
         materializedFindingIds: activeProjectionFindings.map((finding) => finding.id),
         suppressed: suppressedProjectionFindings,
       },
+      ...(retainedRoutes.length === 1 ? { route: retainedRoutes[0]! } : {}),
+      ...(retainedRoutes.length ? { routes: retainedRoutes } : {}),
       ...(adjudication ? {
         scopeAdjudication: { sessionRef: adjudication.sessionRef, decisions: adjudication.output.decisions },
       } : {}),
@@ -1016,7 +1030,11 @@ export async function reviewPullRequest(
         payload: {
           ...projectionPayloadBase,
           status: "planned",
-          projections: activeProjectionFindings.map((finding) => ({ findingId: finding.id, status: "pending" as const })),
+          projections: activeProjectionFindings.map((finding) => ({
+            findingId: finding.id,
+            status: "pending" as const,
+            ...(retainedRouteByFindingId.has(finding.id) ? { route: retainedRouteByFindingId.get(finding.id)! } : {}),
+          })),
         },
       }, { id: reviewFindingProjectionPlanId(run.runId, frozen.headSha, publicationFence!.generation) });
       await dependencies.artifacts.append(projectionPlan);
@@ -1026,13 +1044,17 @@ export async function reviewPullRequest(
     // are complete before any GitHub issue lookup or creation occurs.
     if (projectionEnabled) {
       if (!publicationFence) throw new Error("Review-finding publication fence was not allocated");
-      projectionEntries = await materializeReviewFindings({
+      projectionEntries = (await materializeReviewFindings({
         run,
         pullRequest: frozen,
         findings: activeProjectionFindings,
         policy: projectionMode,
         publicationFence,
-      }, dependencies.host);
+        ...(retainedRoutes.length ? { routeForFinding: (finding: DurableArtifact<"ReviewVerdict">["payload"]["findings"][number]) => retainedRouteByFindingId.get(finding.id) } : {}),
+      }, dependencies.host)).map((entry) => ({
+        ...entry,
+        ...(retainedRouteByFindingId.has(entry.findingId) ? { route: retainedRouteByFindingId.get(entry.findingId)! } : {}),
+      }));
     }
     // A blocked closure-authority omission preserves prior projections. A
     // normal empty verdict still reconciles stale issues through the host.
@@ -1044,6 +1066,7 @@ export async function reviewPullRequest(
         runId: run.runId,
         publicationFence,
         activeFindings: activeProjectionFindings,
+        ...(retainedRoutes.length ? { routes: retainedRoutes } : {}),
       });
     }
     if (projectionPlan) {
@@ -1927,6 +1950,101 @@ function safeInline(value: string, maximum: number): string {
   return safeText(value, maximum).replaceAll("`", "'").replace(/[\r\n]+/g, " ");
 }
 
+export function deriveRetainedRevisionRoute(input: {
+  run: RunState;
+  pullRequest: PullRequestSnapshot;
+  buildResult: DurableArtifact<"BuildResult">;
+  packet: DurableArtifact<"BuildPacket">;
+  expectedDeliveryRunId: string;
+  changedPaths: readonly string[];
+  finding: DurableArtifact<"ReviewVerdict">["payload"]["findings"][number];
+}): RetainedRevisionRoute {
+  const { run, pullRequest, buildResult, packet, finding } = input;
+  const baseSha = buildResult.payload.baseSha;
+  if (!baseSha) throw new Error(`Cannot project finding ${finding.id}: retained delivery is missing its verified base SHA`);
+  if (buildResult.runId !== input.expectedDeliveryRunId
+    || buildResult.subject.repo !== pullRequest.repo
+    || buildResult.subject.issue !== run.subject.issue
+    || buildResult.payload.headSha.toLowerCase() !== pullRequest.headSha.toLowerCase()
+    || buildResult.payload.branch !== pullRequest.headBranch
+    || buildResult.payload.targetBranch !== pullRequest.baseBranch) {
+    throw new Error(`Cannot project finding ${finding.id}: retained delivery route evidence is stale or foreign`);
+  }
+  const sourceSnapshot = finding.sourceSnapshot;
+  if (!sourceSnapshot || sourceSnapshot.reviewedHeadSha.toLowerCase() !== pullRequest.headSha.toLowerCase()) {
+    throw new Error(`Cannot project finding ${finding.id}: sourceSnapshot does not match the reviewed PR head`);
+  }
+  if (!sourceSnapshot.excerpt && !sourceSnapshot.digest) {
+    throw new Error(`Cannot project finding ${finding.id}: sourceSnapshot has no exact excerpt or digest evidence`);
+  }
+  const sourcePath = retainedRoutePath(sourceSnapshot.path);
+  if (!sourcePath || !input.changedPaths.some((path) => retainedRoutePath(path) === sourcePath)) {
+    throw new Error(`Cannot project finding ${finding.id}: source location is outside the reviewed PR change`);
+  }
+  const criteria = (finding.matchedAcceptanceCriteria ?? []).filter((criterion) => packet.payload.acceptanceCriteria.includes(criterion));
+  if (!criteria.length) throw new Error(`Cannot project finding ${finding.id}: no exact matched acceptance criterion identity`);
+  const findingRoot = finding.rootId ?? finding.normalizedRoot ?? finding.causalRoot;
+  if (!findingRoot) throw new Error(`Cannot project finding ${finding.id}: finding root identity is missing`);
+  if (run.subject.issue === undefined) throw new Error(`Cannot project finding ${finding.id}: retained delivery issue is missing`);
+  return {
+    kind: "retained-revision",
+    repository: pullRequest.repo,
+    pullRequest: pullRequest.number,
+    reviewedHeadSha: pullRequest.headSha,
+    headBranch: pullRequest.headBranch,
+    baseBranch: pullRequest.baseBranch,
+    verifiedBaseSha: baseSha,
+    deliveryIssue: run.subject.issue,
+    deliveryRun: input.expectedDeliveryRunId,
+    findingId: finding.id,
+    findingRoot,
+    matchedAcceptanceCriterion: criteria[0]!,
+    matchedAcceptanceCriteria: criteria,
+    sourceSnapshot: { ...sourceSnapshot, path: sourcePath },
+    lineage: {
+      kind: "retained-delivery",
+      sourceRunId: input.expectedDeliveryRunId,
+      sourceIssue: run.subject.issue,
+      sourceBranch: buildResult.payload.branch,
+      targetBranch: pullRequest.baseBranch,
+    },
+  };
+}
+
+function retainedRoutePath(path: string): string {
+  return path.replaceAll("\\", "/").replace(/^\.\//, "").trim();
+}
+
+function assertMaterializationRoute(
+  route: RetainedRevisionRoute,
+  finding: DurableArtifact<"ReviewVerdict">["payload"]["findings"][number],
+  pullRequest: PullRequestSnapshot,
+  run: RunState,
+): void {
+  if (route.repository.toLowerCase() !== pullRequest.repo.toLowerCase()
+    || route.pullRequest !== pullRequest.number
+    || route.reviewedHeadSha.toLowerCase() !== pullRequest.headSha.toLowerCase()
+    || route.headBranch !== pullRequest.headBranch
+    || route.baseBranch !== pullRequest.baseBranch
+    || route.sourceSnapshot.reviewedHeadSha.toLowerCase() !== pullRequest.headSha.toLowerCase()
+    || !finding.sourceSnapshot
+    || route.sourceSnapshot.path !== retainedRoutePath(finding.sourceSnapshot.path)
+    || route.sourceSnapshot.excerpt !== finding.sourceSnapshot.excerpt
+    || route.sourceSnapshot.digest !== finding.sourceSnapshot.digest
+    || route.sourceSnapshot.symbol !== finding.sourceSnapshot.symbol
+    || route.deliveryRun !== route.lineage.sourceRunId
+    || route.lineage.sourceBranch !== route.headBranch
+    || route.lineage.targetBranch !== route.baseBranch
+    || !route.verifiedBaseSha
+    || route.deliveryIssue !== route.lineage.sourceIssue
+    || (run.subject.issue !== undefined && route.deliveryIssue !== run.subject.issue)
+    || route.findingId !== finding.id
+    || route.findingRoot !== (finding.rootId ?? finding.normalizedRoot ?? finding.causalRoot)
+    || !route.matchedAcceptanceCriteria.some((criterion) => finding.matchedAcceptanceCriteria?.includes(criterion))) {
+    throw new Error(`Cannot materialize finding ${finding.id}: retained route is stale or foreign`);
+  }
+}
+
 export async function materializeReviewFindings(
   input: {
     run: RunState;
@@ -1935,6 +2053,7 @@ export async function materializeReviewFindings(
     fallbackReviewerRoles?: readonly string[];
     policy?: FindingProjectionMode;
     publicationFence?: ReviewFindingPublicationFence;
+    routeForFinding?: (finding: DurableArtifact<"ReviewVerdict">["payload"]["findings"][number]) => RetainedRevisionRoute | undefined;
   },
   host: ForgeHost,
 ): Promise<ReviewFindingProjectionPayload["projections"]> {
@@ -1946,6 +2065,8 @@ export async function materializeReviewFindings(
   if (!publicationFence) throw new Error("Review-finding materialization requires a durable publication fence");
   const projections: ReviewFindingProjectionPayload["projections"] = [];
   for (const finding of terminalReviewFindings(input.findings, input.policy ?? "all")) {
+    const route = input.routeForFinding?.(finding);
+    if (route) assertMaterializationRoute(route, finding, input.pullRequest, input.run);
     const issue = await host.materializeReviewFinding({
       repo: input.pullRequest.repo,
       ...(input.run.subject.issue ? { sourceIssue: input.run.subject.issue } : {}),
@@ -1954,10 +2075,12 @@ export async function materializeReviewFindings(
       reviewedHeadSha: input.pullRequest.headSha,
       reviewerRoles: finding.reviewerRoles ?? input.fallbackReviewerRoles ?? ["correctness"],
       publicationFence,
+      ...(route ? { route } : {}),
       finding,
     });
     projections.push({
       findingId: finding.id,
+      ...(route ? { route } : {}),
       status: issue.projection?.status ?? "materialized",
       ...(issue.projection?.marker ? { marker: issue.projection.marker } : {}),
       issueNumber: issue.number,
@@ -1997,6 +2120,7 @@ export async function resumeReviewFindingProjection(
     || payload.baseBranch !== input.pullRequest.baseBranch) {
     throw new Error("Finding-publication checkpoint does not match the authoritative pull request route or head");
   }
+  assertRetainedProjectionRoutes(payload, input.pullRequest, input.run);
   if (!dependencies.host.beginReviewFindingPublication || !dependencies.host.assertReviewFindingPublication) {
     throw new Error("Finding-publication resume requires durable monotonic host publication fencing");
   }
@@ -2021,6 +2145,8 @@ export async function resumeReviewFindingProjection(
   if (payload.status === "planned") {
     const activeIds = new Set(payload.findingProjection.materializedFindingIds);
     const activeFindings = payload.findings.filter((finding) => activeIds.has(finding.id));
+    const routesByFindingId = new Map((payload.routes ?? (payload.route ? [payload.route] : payload.projections.flatMap((projection) => projection.route ? [projection.route] : [])))
+      .map((route) => [route.findingId, route]));
     projections = await materializeReviewFindings({
       run: input.run,
       pullRequest: input.pullRequest,
@@ -2028,6 +2154,7 @@ export async function resumeReviewFindingProjection(
       fallbackReviewerRoles: payload.reviewerRoles,
       policy: "all",
       publicationFence,
+      ...(routesByFindingId.size ? { routeForFinding: (finding) => routesByFindingId.get(finding.id) } : {}),
     }, dependencies.host);
     if (dependencies.host.reconcileReviewFindings) {
       await dependencies.host.reconcileReviewFindings({
@@ -2036,6 +2163,7 @@ export async function resumeReviewFindingProjection(
         runId: input.run.runId,
         publicationFence,
         activeFindings,
+        ...(payload.routes?.length ? { routes: payload.routes } : {}),
       });
     }
     const projectionReceipt = createArtifact({
@@ -2083,6 +2211,42 @@ export async function resumeReviewFindingProjection(
   const advanced = transition(run, payload.disposition === "approve" ? "REVIEW_APPROVED" : payload.disposition === "blocked" ? "REVIEW_BLOCKED" : "REVIEW_CHANGES_REQUESTED", { headSha: payload.headSha });
   await dependencies.runs.commit(run.version, advanced.state, advanced.record);
   return { run: advanced.state, verdict, reviewPlan };
+}
+
+function assertRetainedProjectionRoutes(
+  payload: ReviewFindingProjectionPayload,
+  pullRequest: PullRequestSnapshot,
+  run: RunState,
+): void {
+  const routes = payload.routes ?? (payload.route ? [payload.route] : payload.projections.flatMap((projection) => projection.route ? [projection.route] : []));
+  for (const route of routes) {
+    const finding = payload.findings.find((candidate) => candidate.id === route.findingId);
+    if (!finding
+      || route.repository.toLowerCase() !== pullRequest.repo.toLowerCase()
+      || route.pullRequest !== pullRequest.number
+      || route.reviewedHeadSha.toLowerCase() !== pullRequest.headSha.toLowerCase()
+      || route.headBranch !== pullRequest.headBranch
+      || route.baseBranch !== pullRequest.baseBranch
+      || route.sourceSnapshot.reviewedHeadSha.toLowerCase() !== pullRequest.headSha.toLowerCase()
+      || !finding.sourceSnapshot
+      || route.sourceSnapshot.path !== retainedRoutePath(finding.sourceSnapshot.path)
+      || route.sourceSnapshot.excerpt !== finding.sourceSnapshot.excerpt
+      || route.sourceSnapshot.digest !== finding.sourceSnapshot.digest
+      || route.sourceSnapshot.symbol !== finding.sourceSnapshot.symbol
+      || route.verifiedBaseSha.length === 0
+      || route.deliveryRun !== route.lineage.sourceRunId
+      || route.lineage.sourceBranch !== route.headBranch
+      || route.lineage.targetBranch !== route.baseBranch
+      || route.deliveryIssue !== route.lineage.sourceIssue
+      || (run.subject.issue !== undefined && route.deliveryIssue !== run.subject.issue)
+      || route.findingRoot !== (finding.rootId ?? finding.normalizedRoot ?? finding.causalRoot)
+      || !route.matchedAcceptanceCriteria.some((criterion) => finding.matchedAcceptanceCriteria?.includes(criterion))) {
+      throw new Error(`Finding-publication checkpoint contains stale or foreign retained route for finding ${route.findingId}`);
+    }
+  }
+  if (routes.length > 0 && payload.findingProjection.materializedFindingIds.some((findingId) => !routes.some((route) => route.findingId === findingId))) {
+    throw new Error("Finding-publication checkpoint is missing retained route identity for a materialized finding");
+  }
 }
 
 export function terminalReviewFindings(

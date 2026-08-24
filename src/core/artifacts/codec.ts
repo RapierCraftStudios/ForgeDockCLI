@@ -173,6 +173,7 @@ export function renderArtifactMarkdown(artifact: DurableArtifact): string {
       const payload = artifact.payload as ReviewFindingProjectionPayload;
       return [heading, meta, "",
         `**Checkpoint:** \`${payload.checkpoint}\` Â· **Status:** \`${payload.status}\` Â· **PR:** #${payload.pullRequest} Â· **Reviewed SHA:** \`${payload.headSha}\``,
+        ...((payload.routes?.length || payload.route) ? [`**Retained routes:** ${(payload.routes ?? [payload.route!]).map((route) => `\`${route.deliveryRun}\` · ${route.headBranch} → ${route.baseBranch} · base \`${route.verifiedBaseSha}\` · finding \`${route.findingId}\``).join("; ")}`] : []),
         `**Disposition:** \`${payload.disposition}\` Â· **Policy:** \`${payload.findingProjection.policy}\``,
         `**Projection entries:** ${payload.projections.length}/${payload.findingProjection.materializedFindingIds.length}`,
         payload.projections.length
