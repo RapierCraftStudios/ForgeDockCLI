@@ -1878,7 +1878,7 @@ describe("OrchestrationController", () => {
 });
 
 
-it("runs a durable packet barrier before mutation workers", async () => {
+it("runs a durable packet barrier before mutation workers (invariant:matrix-adapter-lifecycle-6f3c9409d7a7, invariant:matrix-identity-isolation-daad1d69a663, invariant:matrix-terminal-metadata-d673a977a956)", async () => {
   const repository = new RecordingOrchestrationRepository();
   const packetStarted: string[] = [];
   let materialized = false;
@@ -1908,6 +1908,8 @@ it("runs a durable packet barrier before mutation workers", async () => {
   assert.deepEqual(executedClaims.sort((a, b) => a[0]!.localeCompare(b[0]!)), [["src/one.ts"], ["src/two.ts"]]);
   assert.equal(result.record.packetBarrier?.completed, 2);
   assert.equal(result.record.phase, "executing");
+  assert.equal(result.record.executionPlanDigest?.length, 64);
+  assert.deepEqual(result.record.executionPlanCertificate?.builderFrontier, ["one", "two"]);
 });
 
 it("normalizes packet scheduler dependencies to confirmed investigations before the barrier", async () => {
@@ -2061,6 +2063,21 @@ it("materializes a mixed route/base wave without a global base barrier", async (
   const result = await service.createAndRun({ repository: "owner/repo", maxParallel: 2, investigationFirst: true, items: [item("route-a", 1), item("route-b", 2)] });
   assert.equal(result.record.phase, "executing");
   assert.deepEqual(result.record.nodes.map((node) => (node.plan?.claimProvenance as { baseRef?: string } | undefined)?.baseRef).sort(), ["base-a", "base-b"]);
+});
+
+it("rejects a tampered plan before executing persistence (invariant:matrix-identity-isolation-830bd0018316)", async () => {
+  const repository = new RecordingOrchestrationRepository();
+  let workers = 0;
+  const service = controller(repository, async () => { workers++; }, {
+    investigationWorker: async () => ({ outcome: "confirmed", baseSha: "base-1", evidence: { runId: "run-1", investigationId: "artifact-1" } }),
+    materializeExecution: async () => ({ items: [item("tampered", 999)] }),
+  });
+  await assert.rejects(
+    service.createAndRun({ repository: "owner/repo", maxParallel: 1, investigationFirst: true, items: [item("tampered", 1)] }),
+    /issue identity drifted/,
+  );
+  assert.equal(workers, 0);
+  assert.equal(repository.saves.some((record) => record.phase === "executing"), false);
 });
 
 it("fails closed when a packet omits semantic dependency evidence", async () => {

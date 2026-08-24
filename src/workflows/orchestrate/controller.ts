@@ -34,6 +34,9 @@ import type {
   OrchestrationPacketIdentity,
   OrchestrationPacketRecord,
   OrchestrationShadowContractionProposal,
+  OrchestrationExecutionPlanCandidate,
+  OrchestrationExecutionPlanCertificate,
+  OrchestrationExecutionPlanNodeProjection,
 } from "../../core/ports/orchestration.js";
 import {
   orchestrationEventFromSchedule,
@@ -57,7 +60,7 @@ import {
   rateLimitWindowKey,
 } from "./scheduler.js";
 import { buildOrchestrationSnapshot } from "./view-model.js";
-import { compileExecutionDag, normalizePacketPaths, normalizeSemanticDependencies } from "./packet-wave.js";
+import { buildExecutionPlanCertificate, compileExecutionDag, normalizePacketPaths, normalizeSemanticDependencies } from "./packet-wave.js";
 
 export interface CreateOrchestrationInput {
   orchestrationId?: string;
@@ -624,10 +627,23 @@ export class OrchestrationController {
       if (state.record.phase === "investigating" || state.record.phase === "packetizing") {
         await this.runInvestigationPhase(state);
       }
+      // A resumed executing record is untrusted durable input. Rebuild the
+      // certificate from its immutable projections before any route refresh,
+      // reconciliation, scheduler admission, or mutation dispatch.
+      if (state.record.phase === "executing") {
+        state.claim.assertValid();
+        this.assertPersistedExecutionPlan(state);
+        state.claim.assertValid();
+      }
 
       const prepared = resume
         ? await this.prepareResume(state)
         : await this.prepareInitial(state);
+      if (state.record.phase === "executing") {
+        state.claim.assertValid();
+        this.assertPersistedExecutionPlan(state);
+        state.claim.assertValid();
+      }
       await this.flush(state);
 
       if (!prepared.items.length) {
@@ -963,11 +979,21 @@ export class OrchestrationController {
       await this.runInvestigationPhase(state);
       return;
     }
+    // The certificate is deliberately computed before constructing an
+    // executing record. No observer, queued persistence, or mutation worker
+    // can observe the executing phase until this claim-fenced check succeeds.
+    state.claim.assertValid();
+    const certificate = this.assertMaterializedExecutionPlan(state, nextItems, nextEdges, wave);
+    state.claim.assertValid();
     this.replaceRecord(state, {
       ...state.record,
       phase: "executing",
       nodes: nextItems.map((item) => nodeRecordFromItem(item)),
       serializationEdges: nextEdges.map((edge) => ({ predecessor: edge.predecessor, successor: edge.successor, overlappingClaims: [...edge.overlappingClaims] })),
+      executionPlanDigest: certificate.digest,
+      executionPlanCertificate: structuredClone(certificate),
+      builderFrontier: [...certificate.builderFrontier],
+      batchCandidates: structuredClone(certificate.batchCandidates),
       executionMaterializedAt: this.now(),
       shadowContractionProposals: [...(state.record.shadowContractionProposals ?? []), ...shadow],
       metrics: { ...priorMetrics, barrierWaits: priorMetrics.barrierWaits + 1, barrierDurationMs: [...priorMetrics.barrierDurationMs, Date.now() - startedAt], shadowContractionProposals: priorMetrics.shadowContractionProposals + shadow.length },
@@ -976,6 +1002,163 @@ export class OrchestrationController {
     });
     this.emitSnapshot(state.record, state);
     await this.flush(state);
+  }
+
+  /** Certify all materializer projections against the durable settled union. */
+  private assertMaterializedExecutionPlan(
+    state: PersistenceState,
+    items: readonly ScheduledWorkItem[],
+    edges: readonly ClaimSerializationEdge[],
+    wave: number,
+  ): OrchestrationExecutionPlanCertificate {
+    state.claim.assertValid();
+    if (state.signal?.aborted) throw state.signal.reason ?? new Error("Execution plan certification cancelled");
+    const investigations = state.record.investigations ?? [];
+    const confirmed = investigations.filter((entry) => entry.status === "completed" && entry.outcome === "confirmed");
+    const confirmedIds = new Set(confirmed.map((entry) => entry.nodeId));
+    const sourceNodes = new Map(state.record.nodes.map((node) => [node.id, node] as const));
+    const packetByNode = new Map<string, OrchestrationPacketRecord>();
+    for (const packet of state.record.packets ?? []) {
+      if (packetByNode.has(packet.nodeId)) throw new Error(`Execution plan has duplicate packet identity ${packet.nodeId}`);
+      packetByNode.set(packet.nodeId, packet);
+    }
+    const seen = new Set<string>();
+    const projections: OrchestrationExecutionPlanNodeProjection[] = [];
+    const candidates: OrchestrationExecutionPlanCandidate[] = [];
+    for (const item of items) {
+      if (seen.has(item.id)) throw new Error(`Execution plan has duplicate node identity ${item.id}`);
+      seen.add(item.id);
+      if (!confirmedIds.has(item.id)) throw new Error(`Execution plan node ${item.id} lacks settled confirmed investigation evidence`);
+      const source = sourceNodes.get(item.id);
+      const investigation = investigations.find((entry) => entry.nodeId === item.id && entry.status === "completed" && entry.outcome === "confirmed");
+      if (!source || !investigation) throw new Error(`Execution plan node ${item.id} lacks durable source identity`);
+      if (item.issue !== source.issue) throw new Error(`Execution plan issue identity drifted for ${item.id}`);
+      if (normalizeOrchestrationRepository(item.repository ?? state.record.repository) !== orchestrationNodeRepository(state.record, source)) {
+        throw new Error(`Execution plan repository identity drifted for ${item.id}`);
+      }
+      if (item.targetBranch !== source.targetBranch) throw new Error(`Execution plan target route drifted for ${item.id}`);
+      if (item.targetRouteClaim !== undefined && item.targetRouteClaim !== source.targetRouteClaim) throw new Error(`Execution plan route claim drifted for ${item.id}`);
+      const expectedDependencies = source.dependencies.filter((dependency) => confirmedIds.has(dependency)).sort();
+      const actualDependencies = [...item.dependencies].sort();
+      // Empty arrays are the legacy materializer's omission marker. Once a
+      // dependency is supplied, however, it must exactly match the settled DAG.
+      if (actualDependencies.length && !sameJson(actualDependencies, expectedDependencies)) {
+        throw new Error(`Execution plan dependency projection drifted for ${item.id}`);
+      }
+      const packet = packetByNode.get(item.id);
+      const completedPacket = packet?.status === "completed" ? packet : undefined;
+      if (completedPacket) {
+        if (!completedPacket.baseSha || !completedPacket.expectedPaths?.length || completedPacket.semanticDependencies === undefined) {
+          throw new Error(`Execution plan packet evidence is incomplete for ${item.id}`);
+        }
+        const packetPaths = normalizePacketPaths(completedPacket.expectedPaths);
+        const packetDependencies = normalizeSemanticDependencies(completedPacket.semanticDependencies);
+        const packetIdentity = completedPacket.identity;
+        const completedPacketSnapshot = packetIdentity?.snapshot ?? completedPacket.snapshot;
+        if (!sameSnapshotIdentity(completedPacketSnapshot, investigation.snapshot)
+          || (packetIdentity && (packetIdentity.nodeId !== item.id
+            || packetIdentity.subject.issue !== item.issue
+            || normalizeOrchestrationRepository(packetIdentity.subject.repo) !== normalizeOrchestrationRepository(item.repository ?? state.record.repository)
+            || (investigation.runId !== undefined && packetIdentity.runId !== investigation.runId)
+            || (investigation.investigationArtifactId !== undefined && packetIdentity.investigationId !== investigation.investigationArtifactId)
+            || packetIdentity.baseSha !== completedPacket.baseSha
+            || (investigation.targetBranch !== undefined && packetIdentity.targetBranch !== investigation.targetBranch)))) {
+          throw new Error(`Execution plan packet identity drifted for ${item.id}`);
+        }
+        if (item.claims.length && !sameJson([...item.claims].sort(), packetPaths)) throw new Error(`Execution plan claim projection drifted for ${item.id}`);
+        if (actualDependencies.length && !sameJson(actualDependencies, packetDependencies.sort())) throw new Error(`Execution plan semantic dependency drifted for ${item.id}`);
+        const provenance = item.plan?.claimProvenance as { packetId?: string; expectedPaths?: string[]; baseRef?: string; repository?: string; targetBranch?: string; snapshotId?: string } | undefined;
+        if (provenance && (provenance.packetId !== completedPacket.packetId
+          || !sameJson(provenance.expectedPaths ?? [], packetPaths)
+          || provenance.baseRef !== completedPacket.baseSha
+          || (provenance.repository !== undefined && normalizeOrchestrationRepository(provenance.repository) !== normalizeOrchestrationRepository(item.repository ?? state.record.repository))
+          || (provenance.targetBranch !== undefined && provenance.targetBranch !== (item.targetBranch ?? investigation.targetBranch))
+          || (provenance.snapshotId !== undefined && provenance.snapshotId !== completedPacket.snapshot?.snapshotId))) {
+          throw new Error(`Execution plan packet provenance drifted for ${item.id}`);
+        }
+        if (item.plan !== undefined) {
+          const { claimProvenance: _claimProvenance, dependencyProvenance: _dependencyProvenance, ...materializerEvidence } = item.plan;
+          const { claimProvenance: _sourceClaimProvenance, dependencyProvenance: _sourceDependencyProvenance, ...sourceEvidence } = source.plan ?? {};
+          if (!sameJson(materializerEvidence, sourceEvidence)) throw new Error(`Execution plan evidence drifted for ${item.id}`);
+        }
+      } else if (this.dependencies.packetWorker && state.record.packets?.length && confirmedIds.has(item.id)) {
+        throw new Error(`Execution plan node ${item.id} lacks a completed packet certificate`);
+      } else if (item.plan !== undefined && !sameJson(item.plan, source.plan)) {
+        throw new Error(`Execution plan evidence drifted for ${item.id}`);
+      }
+      const expectedPaths = completedPacket?.expectedPaths ? normalizePacketPaths(completedPacket.expectedPaths) : normalizePlanPaths(item.plan);
+      const semanticDependencies = completedPacket?.semanticDependencies !== undefined
+        ? normalizeSemanticDependencies(completedPacket.semanticDependencies)
+        : expectedDependencies;
+      const baseSha = completedPacket?.baseSha ?? investigation.baseSha;
+      const projection: OrchestrationExecutionPlanNodeProjection = {
+        nodeId: item.id,
+        issue: item.issue,
+        repository: item.repository ?? source.repository ?? state.record.repository,
+        ...(item.targetBranch ?? investigation.targetBranch ?? source.targetBranch ? { targetBranch: item.targetBranch ?? investigation.targetBranch ?? source.targetBranch } : {}),
+        ...(item.targetRouteClaim ?? source.targetRouteClaim ? { targetRouteClaim: item.targetRouteClaim ?? source.targetRouteClaim } : {}),
+        dependencies: actualDependencies,
+        claims: [...item.claims],
+        expectedPaths,
+        semanticDependencies,
+        investigation: {
+          wave: investigation.wave,
+          ...(investigation.runId !== undefined ? { runId: investigation.runId } : {}),
+          ...(investigation.investigationArtifactId !== undefined ? { artifactId: investigation.investigationArtifactId } : {}),
+          outcome: "confirmed",
+          ...(investigation.baseSha !== undefined ? { baseSha: investigation.baseSha } : {}),
+          ...(investigation.snapshot !== undefined ? { snapshot: structuredClone(investigation.snapshot) } : {}),
+        },
+        ...(completedPacket ? { packet: {
+          wave: completedPacket.wave,
+          ...(completedPacket.packetId !== undefined ? { packetId: completedPacket.packetId } : {}),
+          ...(completedPacket.identity?.runId !== undefined ? { runId: completedPacket.identity.runId } : {}),
+          ...(completedPacket.identity?.investigationId !== undefined ? { investigationId: completedPacket.identity.investigationId } : {}),
+          ...(completedPacket.identity?.subject !== undefined ? { subject: structuredClone(completedPacket.identity.subject) } : {}),
+          ...(baseSha !== undefined ? { baseSha } : {}),
+          ...(completedPacket.identity?.targetBranch !== undefined ? { targetBranch: completedPacket.identity.targetBranch } : {}),
+          ...(completedPacketSnapshot !== undefined ? { snapshot: structuredClone(completedPacketSnapshot) } : {})
+        } } : {}),
+        ...(item.plan !== undefined ? { plan: structuredClone(item.plan) } : source.plan !== undefined ? { plan: structuredClone(source.plan) } : {}),
+      };
+      projections.push(projection);
+      candidates.push({ nodeId: item.id, issue: item.issue, repository: projection.repository, ...(projection.targetBranch !== undefined ? { targetBranch: projection.targetBranch } : {}), ...(baseSha !== undefined ? { baseSha } : {}), expectedPaths, dependencies: projection.dependencies, claims: projection.claims });
+    }
+    if (seen.size !== confirmedIds.size || [...confirmedIds].some((id) => !seen.has(id))) {
+      throw new Error("Execution plan does not cover the complete settled investigation union");
+    }
+    const derivedEdges = materializeClaimDependencies(items).edges.map((edge) => ({ predecessor: edge.predecessor, successor: edge.successor, overlappingClaims: [...edge.overlappingClaims] }));
+    const suppliedEdges = edges.map((edge) => ({ predecessor: edge.predecessor, successor: edge.successor, overlappingClaims: [...edge.overlappingClaims] }));
+    if (!sameJson(canonicalEdgeList(suppliedEdges), canonicalEdgeList(derivedEdges))) throw new Error("Execution plan serialization edge projection drifted");
+    const barrier = {
+      investigationWave: wave,
+      investigationNodeIds: confirmed.map((entry) => entry.nodeId).sort(),
+      packetNodeIds: [...packetByNode.keys()].filter((id) => confirmedIds.has(id)).sort(),
+      investigationExpected: state.record.investigationBarrier?.expected ?? confirmed.length,
+      investigationCompleted: state.record.investigationBarrier?.completed ?? confirmed.length,
+      ...(state.record.packetBarrier ? { packetExpected: state.record.packetBarrier.expected, packetCompleted: state.record.packetBarrier.completed } : {}),
+    };
+    return buildExecutionPlanCertificate({
+      nodes: projections,
+      serializationEdges: suppliedEdges,
+      builderFrontier: items.filter((item) => item.dependencies.length === 0).map((item) => item.id),
+      batchCandidates: candidates,
+      barrier,
+    });
+  }
+
+  private assertPersistedExecutionPlan(state: PersistenceState): void {
+    state.claim.assertValid();
+    if (state.signal?.aborted) throw state.signal.reason ?? new Error("Execution plan revalidation cancelled");
+    const certificate = state.record.executionPlanCertificate;
+    if (!certificate || !state.record.executionPlanDigest || certificate.digest !== state.record.executionPlanDigest) {
+      throw new Error("Executing orchestration has no immutable execution-plan certificate");
+    }
+    const items = state.record.nodes.map(itemFromNodeRecord);
+    const edges = (state.record.serializationEdges ?? []).map(cloneSerializationEdge);
+    const rebuilt = this.assertMaterializedExecutionPlan(state, items, edges, certificate.barrier.investigationWave);
+    if (rebuilt.digest !== certificate.digest || !sameJson(rebuilt, certificate)) throw new Error("Persisted execution-plan certificate drifted on resume");
+    state.claim.assertValid();
   }
 
   private async runPacketPhase(
@@ -2511,6 +2694,7 @@ export class OrchestrationController {
     state.pending = state.pending.then(async () => {
       if (state.error !== undefined) return;
       try {
+        if (state.signal?.aborted) throw state.signal.reason ?? new Error("Orchestration persistence cancelled");
         state.claim.assertValid();
         await persistOrchestrationWithClaim(state.claim, this.dependencies.repository, snapshot);
       } catch (error) {
@@ -3269,6 +3453,21 @@ function assertProtectedProductionRoute(item: ScheduledWorkItem, productionTarge
       `Scheduled route for ${item.id} directly targets protected production branch ${protectedTarget}; ordinary orchestration delivery must target an integration branch`,
     );
   }
+}
+
+function normalizePlanPaths(plan: OrchestrationPlanMetadata | undefined): string[] {
+  if (!plan) return [];
+  const provenance = plan.claimProvenance;
+  if (!provenance || typeof provenance !== "object" || !Array.isArray((provenance as { expectedPaths?: unknown }).expectedPaths)) return [];
+  return normalizePacketPaths((provenance as { expectedPaths: readonly string[] }).expectedPaths);
+}
+
+function canonicalEdgeList(edges: readonly { predecessor: string; successor: string; overlappingClaims: readonly string[] }[]): Array<{ predecessor: string; successor: string; overlappingClaims: string[] }> {
+  return edges.map((edge) => ({
+    predecessor: edge.predecessor,
+    successor: edge.successor,
+    overlappingClaims: [...new Set(edge.overlappingClaims)].sort(),
+  })).sort((left, right) => left.predecessor.localeCompare(right.predecessor) || left.successor.localeCompare(right.successor));
 }
 
 function assertPositiveInteger(value: number, name: string): void {
