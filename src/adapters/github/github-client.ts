@@ -23,7 +23,7 @@ import type {
   ReviewFindingInput,
   ReviewFindingPublicationFence,
 } from "../../core/ports/forge-host.js";
-import { InMemoryRemediationAdmissionRepository, type ArtifactRepository, type RemediationAdmissionKey, type RemediationAdmissionRepository, type ReviewFindingPublicationFenceRepository } from "../../core/ports/repositories.js";
+import { InMemoryRemediationAdmissionRepository, type ArtifactRepository, type RemediationAdmissionKey, type RemediationAdmissionRepository, type ReviewFindingPublicationFenceRepository, type ReviewFindingPublicationMutationGuard } from "../../core/ports/repositories.js";
 import { repositoryFromRemote as parseRepositoryFromRemote, resolveCheckoutContext, type CheckoutContext } from "../git/repository-context.js";
 import { parseBatchContract } from "../../workflows/orchestrate/batching.js";
 import type { OrchestrationNodeProjectionInput } from "../../workflows/orchestrate/controller.js";
@@ -838,10 +838,38 @@ export class GitHubClient implements ForgeHost {
       || fence.pullRequest !== live.number
       || fence.headSha.toLowerCase() !== live.headSha.toLowerCase()
       || fence.headBranch !== live.headBranch
-      || fence.baseBranch !== live.baseBranch) {
+      || fence.baseBranch !== live.baseBranch
+      || live.state !== "OPEN") {
       throw new Error(`Review-finding publication fence generation ${fence.generation} does not match the exact live PR route`);
     }
     await this.remediationAdmissions.assertReviewFindingPublication(fence);
+  }
+
+  private async acquireReviewFindingPublicationGuard(
+    fence: ReviewFindingPublicationFence,
+  ): Promise<ReviewFindingPublicationMutationGuard> {
+    const repository = this.remediationAdmissions as Partial<ReviewFindingPublicationFenceRepository>;
+    if (!repository.acquireReviewFindingPublicationGuard || !repository.releaseReviewFindingPublicationGuard
+      || typeof (this.remediationAdmissions as Partial<RemediationAdmissionRepository>).completeReviewFindingAdmission !== "function") {
+      throw new Error("Durable review-finding mutation guarding is unavailable");
+    }
+    return repository.acquireReviewFindingPublicationGuard(fence);
+  }
+
+  private async releaseReviewFindingPublicationGuard(guard: ReviewFindingPublicationMutationGuard): Promise<void> {
+    const repository = this.remediationAdmissions as Partial<ReviewFindingPublicationFenceRepository>;
+    await repository.releaseReviewFindingPublicationGuard?.(guard);
+  }
+
+  private async completeReviewFindingAdmission(
+    key: RemediationAdmissionKey,
+    snapshot: IssueSnapshot,
+    fence: ReviewFindingPublicationFence,
+    guard: ReviewFindingPublicationMutationGuard,
+  ): Promise<void> {
+    const repository = this.remediationAdmissions as Partial<RemediationAdmissionRepository>;
+    if (!repository.completeReviewFindingAdmission) throw new Error("Durable review-finding admission completion is unavailable");
+    await repository.completeReviewFindingAdmission(key, snapshot, fence, guard);
   }
 
   async materializeReviewFinding(input: ReviewFindingMaterializationInput): Promise<IssueSnapshot> {
@@ -851,6 +879,9 @@ export class GitHubClient implements ForgeHost {
       runId: input.runId,
     });
     await this.assertReviewFindingPublicationBoundary(input.publicationFence, input.pullRequest);
+    if (input.reviewedHeadSha.toLowerCase() !== input.publicationFence.headSha.toLowerCase()) {
+      throw new RemediationMaterializationPendingError(`reviewed-sha:${input.reviewedHeadSha}`);
+    }
     await this.ensureReviewFindingLabels(input.repo);
     const marker = reviewFindingMarker(input.repo, input.pullRequest.number, input.finding);
     const semanticMarker = reviewFindingSemanticMarker(input.repo, input.pullRequest.number, input.finding);
@@ -875,27 +906,45 @@ export class GitHubClient implements ForgeHost {
       if (!isAuthoritativeProjection(authoritative)) {
         throw new Error(`Cached review-finding issue #${authoritative.number} lost its canonical identity markers`);
       }
-      const refreshed = await this.refreshReviewFindingProjection(input, authoritative, marker, laneMarker);
-      await this.remediationAdmissions.complete(admissionKey, refreshed);
-      return refreshed;
+      const guard = await this.acquireReviewFindingPublicationGuard(input.publicationFence);
+      try {
+        const refreshed = await this.refreshReviewFindingProjection(input, authoritative, marker, laneMarker, guard);
+        await this.assertReviewFindingPublicationBoundary(input.publicationFence, input.pullRequest);
+        await this.completeReviewFindingAdmission(admissionKey, refreshed, input.publicationFence, guard);
+        return refreshed;
+      } finally {
+        await this.releaseReviewFindingPublicationGuard(guard);
+      }
     }
     const existingIssues = await this.listAllIssues(input.repo);
     const existing = existingIssues.find((issue) => isAuthoritativeProjection(issue));
     if (existing) {
       const authoritative = await this.authoritativeIssueSnapshot(existing);
       if (!isAuthoritativeProjection(authoritative)) throw new Error(`Review-finding issue #${existing.number} changed during adoption`);
-      const refreshed = await this.refreshReviewFindingProjection(input, authoritative, marker, laneMarker, "adopted");
-      await this.remediationAdmissions.complete(admissionKey, refreshed);
-      return refreshed;
+      const guard = await this.acquireReviewFindingPublicationGuard(input.publicationFence);
+      try {
+        const refreshed = await this.refreshReviewFindingProjection(input, authoritative, marker, laneMarker, guard, "adopted");
+        await this.assertReviewFindingPublicationBoundary(input.publicationFence, input.pullRequest);
+        await this.completeReviewFindingAdmission(admissionKey, refreshed, input.publicationFence, guard);
+        return refreshed;
+      } finally {
+        await this.releaseReviewFindingPublicationGuard(guard);
+      }
     }
     if (claim.status !== "claimed") {
       const visible = await this.reconcileReviewFindingMarker(input.repo, [marker, semanticMarker]);
       if (visible) {
         const authoritative = await this.authoritativeIssueSnapshot(visible);
         if (!isAuthoritativeProjection(authoritative)) throw new Error(`Review-finding issue #${visible.number} changed during reconciliation`);
-        const refreshed = await this.refreshReviewFindingProjection(input, authoritative, marker, laneMarker, "adopted");
-        await this.remediationAdmissions.complete(admissionKey, refreshed);
-        return refreshed;
+        const guard = await this.acquireReviewFindingPublicationGuard(input.publicationFence);
+        try {
+          const refreshed = await this.refreshReviewFindingProjection(input, authoritative, marker, laneMarker, guard, "adopted");
+          await this.assertReviewFindingPublicationBoundary(input.publicationFence, input.pullRequest);
+          await this.completeReviewFindingAdmission(admissionKey, refreshed, input.publicationFence, guard);
+          return refreshed;
+        } finally {
+          await this.releaseReviewFindingPublicationGuard(guard);
+        }
       }
       throw new RemediationMaterializationPendingError(marker);
     }
@@ -913,23 +962,43 @@ export class GitHubClient implements ForgeHost {
       "--label", "review-finding", "--label", "needs-validation", "--label", priority,
     ];
     if (milestoneTitle) args.push("--milestone", milestoneTitle);
-    await this.assertReviewFindingPublicationBoundary(input.publicationFence, input.pullRequest);
-    const url = (await this.gh(args, body)).trim();
-    const number = Number(url.split("/").at(-1));
-    if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a review-finding issue number");
-    const authoritative = await this.authoritativeIssueSnapshot({ repo: input.repo, number, title, body, url, state: "OPEN" });
-    const projectionMismatches = reviewFindingProjectionMismatches(authoritative, { title, body, marker, semanticMarker, priority, milestoneTitle });
-    const semanticMismatches = semanticReviewFindingProjectionMismatches(projectionMismatches);
-    if (semanticMismatches.length) {
-      throw new Error(`Created review-finding issue #${number} failed authoritative identity validation: ${semanticMismatches.join(", ")}`);
+    const guard = await this.acquireReviewFindingPublicationGuard(input.publicationFence);
+    try {
+      await this.assertReviewFindingPublicationBoundary(input.publicationFence, input.pullRequest);
+      let url: string;
+      try {
+        url = (await this.gh(args, body)).trim();
+      } catch (error) {
+        if (!isTransientGitHubMutationFailure(error)) throw error;
+        // The create may have committed even when transport failed. Keep the
+        // admission pending; the next current-fence attempt must locate the
+        // marker rather than blindly issuing a second create.
+        throw new RemediationMaterializationPendingError(marker);
+      }
+      const number = Number(url.split("/").at(-1));
+      if (!url || !Number.isSafeInteger(number) || number < 1) throw new RemediationMaterializationPendingError(marker);
+      const authoritative = await this.authoritativeIssueSnapshot({ repo: input.repo, number, title, body, url, state: "OPEN" });
+      if (authoritative.repo.trim().toLowerCase() !== input.repo.trim().toLowerCase() || authoritative.number !== number || authoritative.state !== "OPEN") {
+        throw new Error(`Created review-finding issue #${number} failed authoritative repository/identity/state validation`);
+      }
+      const projectionMismatches = reviewFindingProjectionMismatches(authoritative, { title, body, marker, semanticMarker, priority, milestoneTitle });
+      const semanticMismatches = semanticReviewFindingProjectionMismatches(projectionMismatches);
+      if (semanticMismatches.length) {
+        throw new Error(`Created review-finding issue #${number} failed authoritative identity validation: ${semanticMismatches.join(", ")}`);
+      }
+      // This is deliberately after authoritative issue readback: a head or
+      // generation transition during gh issue create cannot complete the old admission.
+      await this.assertReviewFindingPublicationBoundary(input.publicationFence, input.pullRequest);
+      const result = withReviewFindingProjection(authoritative, {
+        status: projectionMismatches.length ? "projection-drift" : "materialized",
+        marker,
+        ...(projectionMismatches.length ? { mismatches: projectionMismatches } : {}),
+      });
+      await this.completeReviewFindingAdmission(admissionKey, result, input.publicationFence, guard);
+      return result;
+    } finally {
+      await this.releaseReviewFindingPublicationGuard(guard);
     }
-    const result = withReviewFindingProjection(authoritative, {
-      status: projectionMismatches.length ? "projection-drift" : "materialized",
-      marker,
-      ...(projectionMismatches.length ? { mismatches: projectionMismatches } : {}),
-    });
-    await this.remediationAdmissions.complete(admissionKey, result);
-    return result;
   }
 
   private async refreshReviewFindingProjection(
@@ -937,6 +1006,7 @@ export class GitHubClient implements ForgeHost {
     issue: IssueSnapshot,
     marker: string,
     laneMarker: string,
+    guard: ReviewFindingPublicationMutationGuard,
     adoptionStatus: "materialized" | "adopted" = "materialized",
   ): Promise<IssueSnapshot> {
     const publicationFence = input.publicationFence;
@@ -960,14 +1030,30 @@ export class GitHubClient implements ForgeHost {
       if (milestoneTitle) args.push("--milestone", milestoneTitle);
       else if (issue.milestone) args.push("--remove-milestone");
       await this.assertReviewFindingPublicationBoundary(publicationFence, input.pullRequest);
-      await this.gh(args, body);
+      try {
+        await this.gh(args, body);
+      } catch (error) {
+        if (isTransientGitHubMutationFailure(error)) throw new RemediationMaterializationPendingError(marker);
+        throw error;
+      }
       authoritative = await this.authoritativeIssueSnapshot(issue);
+      if (authoritative.repo.trim().toLowerCase() !== input.repo.trim().toLowerCase() || authoritative.number !== issue.number || authoritative.state !== "OPEN") {
+        throw new Error(`Review-finding issue #${issue.number} failed authoritative repository/identity/state validation after refresh`);
+      }
+      // Re-read the exact PR route after every issue edit, while the guard is
+      // still held, before the caller can complete the admission.
+      await this.assertReviewFindingPublicationBoundary(publicationFence, input.pullRequest);
     }
 
     const projectionMismatches = reviewFindingProjectionMismatches(authoritative, expected);
     const semanticMismatches = semanticReviewFindingProjectionMismatches(projectionMismatches);
     if (semanticMismatches.length) {
       throw new Error(`Review-finding issue #${issue.number} failed authoritative identity validation after refresh: ${semanticMismatches.join(", ")}`);
+    }
+    // Keep the parameter explicit so callers cannot accidentally complete a
+    // refresh without first owning the exact-fence mutation guard.
+    if (guard.fence.generation !== publicationFence.generation) {
+      throw new Error("Review-finding refresh guard does not match publication fence");
     }
     return withReviewFindingProjection(authoritative, {
       status: projectionMismatches.length ? "projection-drift" : adoptionStatus,
@@ -1001,6 +1087,7 @@ export class GitHubClient implements ForgeHost {
         recurrenceMarker,
       ].join("\n"),
     });
+    await this.assertReviewFindingPublicationBoundary(input.publicationFence, input.pullRequest);
   }
 
   private async resolveReviewFindingMilestone(input: {

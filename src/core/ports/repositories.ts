@@ -18,10 +18,24 @@ export type RemediationAdmissionClaim =
   | { status: "pending" }
   | { status: "materialized"; snapshot: IssueSnapshot };
 
+/** A short-lived, durable capability held across one remote review mutation. */
+export interface ReviewFindingPublicationMutationGuard {
+  token: string;
+  fence: ReviewFindingPublicationFence;
+  expiresAt: number;
+}
+
 /** Durable, fail-closed admission for one deterministic remediation marker. */
 export interface RemediationAdmissionRepository {
   claim(key: RemediationAdmissionKey): Promise<RemediationAdmissionClaim>;
   complete(key: RemediationAdmissionKey, snapshot: IssueSnapshot): Promise<void>;
+  /** Complete only when the exact publication fence and owned mutation guard still hold. */
+  completeReviewFindingAdmission(
+    key: RemediationAdmissionKey,
+    snapshot: IssueSnapshot,
+    fence: ReviewFindingPublicationFence,
+    guard: ReviewFindingPublicationMutationGuard,
+  ): Promise<void>;
   /** Atomically discard one stale materialized projection without releasing a live pending claim. */
   invalidateMaterialized(key: RemediationAdmissionKey, expectedIssueNumber: number): Promise<boolean>;
 }
@@ -31,6 +45,13 @@ export interface ReviewFindingPublicationFenceRepository {
   beginReviewFindingPublication(input: Omit<ReviewFindingPublicationFence, "generation">): Promise<ReviewFindingPublicationFence>;
   /** Fails unless the supplied generation is still the exact current fence. */
   assertReviewFindingPublication(fence: ReviewFindingPublicationFence): Promise<void>;
+  /** Claim the per-PR mutation slot for this exact fence. */
+  acquireReviewFindingPublicationGuard(
+    fence: ReviewFindingPublicationFence,
+    options?: { ttlMs?: number },
+  ): Promise<ReviewFindingPublicationMutationGuard>;
+  /** Idempotently release only this guard; expired or superseded guards are harmless. */
+  releaseReviewFindingPublicationGuard(guard: ReviewFindingPublicationMutationGuard): Promise<void>;
 }
 
 export interface ArtifactRepository {
@@ -112,12 +133,16 @@ export class ProjectedRunRepository implements RunRepository {
 export class InMemoryRemediationAdmissionRepository implements RemediationAdmissionRepository, ReviewFindingPublicationFenceRepository {
   readonly records = new Map<string, { status: "pending" | "materialized"; snapshot?: IssueSnapshot }>();
   readonly reviewPublicationFences = new Map<string, ReviewFindingPublicationFence>();
+  readonly reviewPublicationGuards = new Map<string, ReviewFindingPublicationMutationGuard>();
+  #guardSequence = 0;
 
   async beginReviewFindingPublication(input: Omit<ReviewFindingPublicationFence, "generation">): Promise<ReviewFindingPublicationFence> {
     const key = reviewFindingPublicationFenceKey(input.repo, input.pullRequest);
     const current = this.reviewPublicationFences.get(key);
     const fence = { ...structuredClone(input), generation: (current?.generation ?? 0) + 1 };
     this.reviewPublicationFences.set(key, fence);
+    // A newer generation immediately invalidates any older in-flight mutation.
+    this.reviewPublicationGuards.delete(key);
     return structuredClone(fence);
   }
 
@@ -126,6 +151,32 @@ export class InMemoryRemediationAdmissionRepository implements RemediationAdmiss
     if (!current || !sameReviewFindingPublicationFence(current, fence)) {
       throw new Error(`Review-finding publication fence is stale for ${fence.repo}#${fence.pullRequest} generation ${fence.generation}`);
     }
+  }
+
+  async acquireReviewFindingPublicationGuard(
+    fence: ReviewFindingPublicationFence,
+    options: { ttlMs?: number } = {},
+  ): Promise<ReviewFindingPublicationMutationGuard> {
+    await this.assertReviewFindingPublication(fence);
+    const key = reviewFindingPublicationFenceKey(fence.repo, fence.pullRequest);
+    const current = this.reviewPublicationGuards.get(key);
+    const now = Date.now();
+    if (current && current.expiresAt > now) {
+      throw new Error(`Review-finding publication mutation is already guarded for ${fence.repo}#${fence.pullRequest}`);
+    }
+    const guard: ReviewFindingPublicationMutationGuard = {
+      token: `review-publication-guard-${++this.#guardSequence}`,
+      fence: structuredClone(fence),
+      expiresAt: now + Math.max(1, options.ttlMs ?? 60_000),
+    };
+    this.reviewPublicationGuards.set(key, guard);
+    return structuredClone(guard);
+  }
+
+  async releaseReviewFindingPublicationGuard(guard: ReviewFindingPublicationMutationGuard): Promise<void> {
+    const key = reviewFindingPublicationFenceKey(guard.fence.repo, guard.fence.pullRequest);
+    const current = this.reviewPublicationGuards.get(key);
+    if (current?.token === guard.token) this.reviewPublicationGuards.delete(key);
   }
 
   async claim(key: RemediationAdmissionKey): Promise<RemediationAdmissionClaim> {
@@ -142,6 +193,33 @@ export class InMemoryRemediationAdmissionRepository implements RemediationAdmiss
   async complete(key: RemediationAdmissionKey, snapshot: IssueSnapshot): Promise<void> {
     const admissionKey = remediationAdmissionKey(key);
     if (!this.records.has(admissionKey)) throw new Error(`Unknown remediation admission: ${admissionKey}`);
+    this.records.set(admissionKey, { status: "materialized", snapshot: structuredClone(snapshot) });
+  }
+
+  async completeReviewFindingAdmission(
+    key: RemediationAdmissionKey,
+    snapshot: IssueSnapshot,
+    fence: ReviewFindingPublicationFence,
+    guard: ReviewFindingPublicationMutationGuard,
+  ): Promise<void> {
+    const fenceKey = reviewFindingPublicationFenceKey(fence.repo, fence.pullRequest);
+    if (key.repo.trim().toLowerCase() !== fence.repo.trim().toLowerCase()
+      || key.parentPullRequest !== fence.pullRequest
+      || key.headSha.trim().toLowerCase() !== fence.headSha.trim().toLowerCase()) {
+      throw new Error(`Review-finding admission identity does not match publication fence for ${fence.repo}#${fence.pullRequest}`);
+    }
+    const currentFence = this.reviewPublicationFences.get(fenceKey);
+    const currentGuard = this.reviewPublicationGuards.get(fenceKey);
+    if (!currentFence || !sameReviewFindingPublicationFence(currentFence, fence)
+      || !currentGuard || currentGuard.token !== guard.token
+      || guard.expiresAt <= Date.now() || currentGuard.expiresAt <= Date.now()) {
+      throw new Error(`Review-finding publication guard is stale for ${fence.repo}#${fence.pullRequest} generation ${fence.generation}`);
+    }
+    const admissionKey = remediationAdmissionKey(key);
+    const existing = this.records.get(admissionKey);
+    if (!existing || existing.status !== "pending") {
+      throw new Error(`Review-finding admission is not pending: ${admissionKey}`);
+    }
     this.records.set(admissionKey, { status: "materialized", snapshot: structuredClone(snapshot) });
   }
 

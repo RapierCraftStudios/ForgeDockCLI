@@ -1958,6 +1958,9 @@ export async function materializeReviewFindings(
       publicationFence,
       finding,
     });
+    if (issue.state !== "OPEN") {
+      throw new Error(`Review-finding projection for ${finding.id} is not OPEN; retaining the publication checkpoint pending reconciliation`);
+    }
     projections.push({
       findingId: finding.id,
       status: issue.projection?.status ?? "materialized",
@@ -1967,6 +1970,9 @@ export async function materializeReviewFindings(
       ...(issue.projection?.mismatches?.length ? { mismatches: [...issue.projection.mismatches] } : {}),
     });
   }
+  // A host may complete each issue mutation successfully and still observe a
+  // newer route before the caller writes the completed projection receipt.
+  await host.assertReviewFindingPublication?.(publicationFence);
   return projections;
 }
 
