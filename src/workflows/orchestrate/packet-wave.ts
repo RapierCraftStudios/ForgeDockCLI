@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { createHash } from "node:crypto";
 import type { InvestigationSnapshotIdentity } from "../../core/ports/git-workspace.js";
-import type { OrchestrationPlanMetadata } from "../../core/ports/orchestration.js";
+import type {
+  OrchestrationExecutionPlanCandidate,
+  OrchestrationExecutionPlanCertificate,
+  OrchestrationExecutionPlanNodeProjection,
+  OrchestrationPlanMetadata,
+  OrchestrationSerializationEdgeRecord,
+} from "../../core/ports/orchestration.js";
 import { materializeClaimDependencies, validateGraph, type ClaimSerializationEdge, type ScheduledWorkItem } from "./scheduler.js";
 
 /** Exact source identity which makes a completed packet safe to reuse. */
@@ -69,6 +76,78 @@ export interface CompiledPacketDag {
     semanticFrontier: number;
     claimEdgeCount: number;
     claimComponents: number;
+  };
+}
+
+/**
+ * Build the only digest used for execution admission. Arrays which represent
+ * sets are normalized here, while node and edge order is canonicalized by
+ * identity. This makes replay order irrelevant but keeps semantic changes
+ * observable.
+ */
+export function buildExecutionPlanCertificate(input: {
+  nodes: readonly OrchestrationExecutionPlanNodeProjection[];
+  serializationEdges: readonly OrchestrationSerializationEdgeRecord[];
+  builderFrontier: readonly string[];
+  batchCandidates: readonly OrchestrationExecutionPlanCandidate[];
+  barrier: OrchestrationExecutionPlanCertificate["barrier"];
+}): OrchestrationExecutionPlanCertificate {
+  const nodes = [...input.nodes].map((node) => canonicalPlanNode(node)).sort((left, right) => left.nodeId.localeCompare(right.nodeId));
+  const serializationEdges = [...input.serializationEdges].map((edge) => ({
+    predecessor: edge.predecessor,
+    successor: edge.successor,
+    overlappingClaims: [...new Set(edge.overlappingClaims)].sort(),
+  })).sort((left, right) => left.predecessor.localeCompare(right.predecessor) || left.successor.localeCompare(right.successor));
+  const builderFrontier = [...new Set(input.builderFrontier)].sort();
+  const batchCandidates = [...input.batchCandidates].map((candidate) => ({
+    ...candidate,
+    repository: candidate.repository.trim().toLowerCase(),
+    ...(candidate.targetBranch !== undefined ? { targetBranch: candidate.targetBranch.trim() } : {}),
+    expectedPaths: [...new Set(candidate.expectedPaths)].sort(),
+    dependencies: [...new Set(candidate.dependencies)].sort(),
+    claims: [...new Set(candidate.claims)].sort(),
+  })).sort((left, right) => left.nodeId.localeCompare(right.nodeId));
+  const unsigned = {
+    schema: "forgedock.execution-plan/v1" as const,
+    nodes,
+    serializationEdges,
+    builderFrontier,
+    batchCandidates,
+    barrier: canonicalJsonValue({
+      ...input.barrier,
+      investigationNodeIds: [...input.barrier.investigationNodeIds].sort(),
+      packetNodeIds: [...input.barrier.packetNodeIds].sort(),
+    }),
+  };
+  const digest = createHash("sha256").update(canonicalJson(unsigned), "utf8").digest("hex");
+  return { ...unsigned, digest };
+}
+
+/** JCS-compatible enough for the JSON-safe orchestration domain: sorted keys. */
+export function canonicalJson(value: unknown): string {
+  return JSON.stringify(canonicalJsonValue(value)) ?? "";
+}
+
+function canonicalJsonValue(value: unknown): any {
+  if (Array.isArray(value)) return value.map(canonicalJsonValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => [key, canonicalJsonValue(entry)]));
+  }
+  return value;
+}
+
+function canonicalPlanNode(node: OrchestrationExecutionPlanNodeProjection): OrchestrationExecutionPlanNodeProjection {
+  return {
+    ...node,
+    repository: node.repository.trim().toLowerCase(),
+    ...(node.targetBranch !== undefined ? { targetBranch: node.targetBranch.trim() } : {}),
+    dependencies: [...new Set(node.dependencies)].sort(),
+    claims: [...new Set(node.claims)].sort(),
+    expectedPaths: [...new Set(node.expectedPaths)].sort(),
+    semanticDependencies: [...new Set(node.semanticDependencies)].sort(),
   };
 }
 

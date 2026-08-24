@@ -2,7 +2,8 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { compileExecutionDag, runPacketWave, type PacketWaveIdentity, type PacketWaveState, type PacketWaveItem, type PacketWaveStore } from "./packet-wave.js";
+import { buildExecutionPlanCertificate, compileExecutionDag, runPacketWave, type PacketWaveIdentity, type PacketWaveState, type PacketWaveItem, type PacketWaveStore } from "./packet-wave.js";
+import type { OrchestrationExecutionPlanNodeProjection } from "../../core/ports/orchestration.js";
 import type { ScheduledWorkItem } from "./scheduler.js";
 
 function item(id: string, issue: number, claims = ["component:repository"]): ScheduledWorkItem {
@@ -35,6 +36,32 @@ function identityFor(candidate: ScheduledWorkItem, baseRef = "origin/staging"): 
 }
 
 describe("packet DAG compilation", () => {
+  it("retains a canonical identity-isolated certificate (invariant:matrix-identity-isolation-60b0a854ec54)", () => {
+    const node: OrchestrationExecutionPlanNodeProjection = {
+      nodeId: "i1", issue: 1, repository: "Acme/Repository", dependencies: ["i0"], claims: ["src/a.ts"],
+      expectedPaths: ["src/a.ts"], semanticDependencies: ["i0"],
+      investigation: { wave: 1, runId: "run-1", artifactId: "artifact-1", outcome: "confirmed", baseSha: "base" },
+    };
+    const base = buildExecutionPlanCertificate({
+      nodes: [node], serializationEdges: [], builderFrontier: [],
+      batchCandidates: [{ nodeId: "i1", issue: 1, repository: "Acme/Repository", expectedPaths: ["src/a.ts"], dependencies: ["i0"], claims: ["src/a.ts"] }],
+      barrier: { investigationWave: 1, investigationNodeIds: ["i1"], packetNodeIds: [], investigationExpected: 1, investigationCompleted: 1 },
+    });
+    const altered = buildExecutionPlanCertificate({
+      nodes: [{ ...node, issue: 2 }], serializationEdges: [], builderFrontier: [],
+      batchCandidates: [{ nodeId: "i1", issue: 2, repository: "Acme/Repository", expectedPaths: ["src/a.ts"], dependencies: ["i0"], claims: ["src/a.ts"] }],
+      barrier: base.barrier,
+    });
+    assert.notEqual(base.digest, altered.digest);
+    assert.equal(base.digest.length, 64);
+    const reordered = buildExecutionPlanCertificate({
+      nodes: [{ ...node, dependencies: ["i0"] }], serializationEdges: [], builderFrontier: [],
+      batchCandidates: [{ nodeId: "i1", issue: 1, repository: "acme/repository", expectedPaths: ["src/a.ts"], dependencies: ["i0"], claims: ["src/a.ts"] }],
+      barrier: { ...base.barrier, investigationNodeIds: ["i1"] },
+    });
+    assert.equal(base.digest, reordered.digest);
+  });
+
   it("replaces preview component claims with exact packet paths", () => {
     const result = compileExecutionDag({
       items: [item("i1", 1), item("i2", 2)],

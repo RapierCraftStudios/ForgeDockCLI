@@ -119,6 +119,68 @@ export interface OrchestrationMetrics {
   shadowContractionProposals: number;
 }
 
+/** One canonical, immutable source projection used to admit execution. */
+export interface OrchestrationExecutionPlanNodeProjection {
+  nodeId: string;
+  issue: number;
+  repository: string;
+  targetBranch?: string;
+  targetRouteClaim?: string;
+  dependencies: string[];
+  claims: string[];
+  expectedPaths: string[];
+  semanticDependencies: string[];
+  investigation: {
+    wave: number;
+    runId?: string;
+    artifactId?: string;
+    outcome: OrchestrationInvestigationOutcome;
+    baseSha?: string;
+    snapshot?: InvestigationSnapshotIdentity;
+  };
+  packet?: {
+    wave: number;
+    packetId?: string;
+    runId?: string;
+    investigationId?: string;
+    subject?: { repo: string; issue: number };
+    baseSha?: string;
+    targetBranch?: string;
+    snapshot?: InvestigationSnapshotIdentity;
+  };
+  plan?: OrchestrationPlanMetadata;
+}
+
+export interface OrchestrationExecutionPlanCandidate {
+  nodeId: string;
+  issue: number;
+  repository: string;
+  targetBranch?: string;
+  baseSha?: string;
+  expectedPaths: string[];
+  dependencies: string[];
+  claims: string[];
+}
+
+/** Durable certificate for the exact materializer-to-executor handoff. */
+export interface OrchestrationExecutionPlanCertificate {
+  schema: "forgedock.execution-plan/v1";
+  digest: string;
+  nodes: OrchestrationExecutionPlanNodeProjection[];
+  serializationEdges: OrchestrationSerializationEdgeRecord[];
+  builderFrontier: string[];
+  batchCandidates: OrchestrationExecutionPlanCandidate[];
+  barrier: {
+    investigationWave: number;
+    investigationNodeIds: string[];
+    packetNodeIds: string[];
+    investigationExpected: number;
+    investigationCompleted: number;
+    packetExpected?: number;
+    packetCompleted?: number;
+  };
+}
+
 export type OrchestrationWorkerAttemptStatus =
   | "launching"
   | "running"
@@ -338,6 +400,11 @@ export interface OrchestrationRecord {
   packets?: OrchestrationPacketRecord[];
   packetWave?: number;
   packetBarrier?: { expected: number; completed: number; startedAt: string; completedAt?: string };
+  /** Immutable execution handoff evidence; absent only on legacy non-investigation records. */
+  executionPlanDigest?: string;
+  executionPlanCertificate?: OrchestrationExecutionPlanCertificate;
+  builderFrontier?: string[];
+  batchCandidates?: OrchestrationExecutionPlanCandidate[];
   executionMaterializedAt?: string;
   metrics?: OrchestrationMetrics;
   shadowContractionProposals?: OrchestrationShadowContractionProposal[];
