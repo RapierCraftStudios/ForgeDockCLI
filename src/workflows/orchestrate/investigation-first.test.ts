@@ -96,19 +96,28 @@ interface FactoryFixture {
   runtimeCwds: () => readonly string[];
 }
 
-async function createFactoryFixture(): Promise<FactoryFixture> {
+async function createFactoryFixture(route: {
+  lane: "fast" | "feature";
+  targetBranch: string;
+  milestone?: { number: number; title: string };
+} = { lane: "fast", targetBranch: "staging" }): Promise<FactoryFixture> {
   // Keep this factory hermetic: the adapter-level tests own real Git common-dir
   // and detached-worktree behavior. These worker tests only need an exact,
   // controller-admitted snapshot identity.
   const baseSha = "f".repeat(40);
-  const workItem = item("integration", 101);
+  const workItem: ScheduledWorkItem = {
+    ...item("integration", 101),
+    targetBranch: route.targetBranch,
+    lane: route.lane,
+    ...(route.milestone !== undefined ? { milestoneIdentity: structuredClone(route.milestone) } : {}),
+  };
   const subject = { repo: "owner/repo", issue: workItem.issue };
   const repositoryRoot = process.cwd();
   const snapshotIdentity: InvestigationSnapshotIdentity = {
     schema: "forgedock.investigation-snapshot/v1",
     repository: subject.repo,
     repositoryRoot,
-    targetBranch: "staging",
+    targetBranch: route.targetBranch,
     baseSha,
     snapshotId: "fixture-investigation-snapshot",
     snapshotPath: join(repositoryRoot, ".forgedock-test-investigation-snapshot"),
@@ -183,8 +192,9 @@ async function createFactoryFixture(): Promise<FactoryFixture> {
     runs,
     resolveRoute: async () => ({
       issue: { title: "Integration issue", body: "Preserve the contract.", url: "https://example.test/issues/101" },
-      targetBranch: "staging",
-      lane: "fast",
+      targetBranch: route.targetBranch,
+      lane: route.lane,
+      ...(route.milestone !== undefined ? { milestone: structuredClone(route.milestone) } : {}),
       baseSha,
     }),
     getBranchHead: async () => baseSha,
@@ -224,8 +234,9 @@ async function createFactoryFixture(): Promise<FactoryFixture> {
     wave: 1,
     baseSha,
     ...(investigated.snapshot !== undefined ? { snapshot: investigated.snapshot } : {}),
-    targetBranch: "staging",
-    lane: "fast",
+    targetBranch: route.targetBranch,
+    ...(route.milestone !== undefined ? { milestoneIdentity: structuredClone(route.milestone) } : {}),
+    lane: route.lane,
     status: "completed",
     outcome: "confirmed",
     evidence,
@@ -250,6 +261,17 @@ describe("investigation-first factory recovery", () => {
     assert.equal(fixture.investigation.evidence?.snapshotId, fixture.investigation.snapshot?.snapshotId);
     assert.ok(fixture.runtimeCwds().length >= 2);
     assert.ok(fixture.runtimeCwds().every((cwd) => cwd === fixture.investigation.snapshot?.snapshotPath));
+  });
+
+  it("preserves authoritative feature milestone identity into the investigating run", async () => {
+    const fixture = await createFactoryFixture({
+      lane: "feature",
+      targetBranch: "milestone/feature-lane",
+      milestone: { number: 42, title: "Feature Lane" },
+    });
+    const run = await fixture.runs.load(fixture.runId);
+    assert.deepEqual(run?.milestone, { number: 42, title: "Feature Lane" });
+    assert.deepEqual(fixture.investigation.milestoneIdentity, { number: 42, title: "Feature Lane" });
   });
 
   it("preserves invariant:matrix-adapter-lifecycle-0ba2e567ffc0 through detached snapshot admission", async () => {

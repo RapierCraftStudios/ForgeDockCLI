@@ -11,6 +11,7 @@
 - Fresh native orchestrations now support an investigation-first phase: exact issue/route/base evidence is persisted, read-only investigations run concurrently without claim serialization, a durable barrier precedes execution-DAG materialization, and observer snapshots distinguish the investigating set from the executing DAG. Legacy durable execution DAGs remain resumable.
 - TUI orchestration now shares the CLI's typed investigation/materialization workers, so fresh native launches cannot dispatch legacy full `work-on` workers before the investigation barrier; durable phase and wave identity is rebuilt on restart.
 - Investigation-first orchestration now uses immutable, route-specific detached snapshots, carries exact base and snapshot provenance through packets, and keeps mixed route/base groups distinct.
+- Feature-lane milestone identity now survives orchestration scheduling, investigation handoff, and durable restart/revalidation.
 - Post-review continuation now passes through one centralized identity/state guard, preserving and surfacing a durable blocked reason when continuation is not admissible.
 - Reviewer findings now normalize eligible `sourceSnapshot` evidence deterministically against exact reviewed-head blobs while retaining fail-closed handling for unverified or out-of-scope claims.
 - Reviewer plans now freeze a three-attempt budget per execution group, with aggregate reviewer and model-call ceilings derived from that budget.

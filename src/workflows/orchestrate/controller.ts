@@ -14,6 +14,7 @@ import {
   MAX_ORCHESTRATION_PARALLEL,
 } from "../../core/ports/orchestration.js";
 import type { InvestigationSnapshotIdentity } from "../../core/ports/git-workspace.js";
+import type { IssueMilestone } from "../../core/ports/forge-host.js";
 import type {
   DurableOrchestrationNodeStatus,
   OrchestrationExecutionAdmission,
@@ -186,6 +187,7 @@ export interface OrchestrationRouteSnapshot {
   repository: string;
   targetBranch: string;
   lane: "fast" | "feature";
+  milestone?: IssueMilestone;
   promotionTarget?: string;
   productionTarget?: string;
 }
@@ -392,6 +394,7 @@ export class OrchestrationController {
           nodeId: item.id,
           wave: 1,
           ...(item.targetBranch !== undefined ? { targetBranch: item.targetBranch } : {}),
+          ...(item.milestoneIdentity !== undefined ? { milestoneIdentity: structuredClone(item.milestoneIdentity) } : {}),
           ...(item.lane !== undefined ? { lane: item.lane } : {}),
           status: "queued",
           attemptCount: 0,
@@ -929,6 +932,7 @@ export class OrchestrationController {
       const childInvestigations = children.map((child): OrchestrationInvestigationRecord => ({
         issue: child.issue, nodeId: child.id, wave: nextWave,
         ...(child.targetBranch !== undefined ? { targetBranch: child.targetBranch } : {}),
+        ...(child.milestoneIdentity !== undefined ? { milestoneIdentity: structuredClone(child.milestoneIdentity) } : {}),
         ...(child.lane !== undefined ? { lane: child.lane } : {}), status: "queued", attemptCount: 0,
       }));
       const childPackets = children.map((child): OrchestrationPacketRecord => ({ nodeId: child.id, wave: nextWave, status: "queued", attemptCount: 0 }));
@@ -1653,6 +1657,7 @@ export class OrchestrationController {
       item,
     });
     state.claim.assertValid();
+    assertRouteMilestone(route, node.id);
     const frozenRepository = orchestrationNodeRepository(state.record, node);
     const authoritativeRepository = normalizeOrchestrationRepository(route.repository);
     if (!authoritativeRepository) throw new Error(`Authoritative route for ${node.id} returned an empty repository`);
@@ -1661,6 +1666,7 @@ export class OrchestrationController {
       repository: route.repository,
       targetBranch: route.targetBranch,
       lane: route.lane,
+      ...(route.milestone !== undefined ? { milestoneIdentity: structuredClone(route.milestone) } : {}),
       ...(route.promotionTarget !== undefined ? { promotionTarget: route.promotionTarget } : {}),
       ...(route.productionTarget !== undefined ? { productionTarget: route.productionTarget } : {}),
     };
@@ -1668,6 +1674,7 @@ export class OrchestrationController {
     const changed = frozenRepository !== authoritativeRepository
       || node.targetBranch !== route.targetBranch
       || node.lane !== route.lane
+      || !sameMilestoneIdentity(node.milestoneIdentity, route.milestone)
       || node.promotionTarget !== route.promotionTarget
       || node.productionTarget !== route.productionTarget;
     if (changed) {
@@ -1694,6 +1701,7 @@ export class OrchestrationController {
       item: itemFromNodeRecord(node),
     });
     state.claim.assertValid();
+    assertRouteMilestone(route, node.id);
     const frozenRepository = orchestrationNodeRepository(state.record, node);
     const authoritativeRepository = normalizeOrchestrationRepository(route.repository);
     if (!authoritativeRepository || authoritativeRepository !== frozenRepository) {
@@ -1706,6 +1714,7 @@ export class OrchestrationController {
       repository: node.repository ?? state.record.repository,
       targetBranch: route.targetBranch,
       lane: route.lane,
+      ...(route.milestone !== undefined ? { milestoneIdentity: structuredClone(route.milestone) } : {}),
       ...(route.promotionTarget !== undefined ? { promotionTarget: route.promotionTarget } : {}),
       ...(route.productionTarget !== undefined ? { productionTarget: route.productionTarget } : {}),
     };
@@ -1717,6 +1726,7 @@ export class OrchestrationController {
     }
     const changed = node.targetBranch !== route.targetBranch
       || node.lane !== route.lane
+      || !sameMilestoneIdentity(node.milestoneIdentity, route.milestone)
       || node.promotionTarget !== route.promotionTarget
       || node.productionTarget !== route.productionTarget;
     if (!changed) return node;
@@ -1736,6 +1746,7 @@ export class OrchestrationController {
       const {
         targetBranch: _targetBranch,
         lane: _lane,
+        milestoneIdentity: _milestoneIdentity,
         promotionTarget: _promotionTarget,
         productionTarget: _productionTarget,
         ...retained
@@ -1744,6 +1755,7 @@ export class OrchestrationController {
         ...retained,
         targetBranch: route.targetBranch,
         lane: route.lane,
+        ...(route.milestone !== undefined ? { milestoneIdentity: structuredClone(route.milestone) } : {}),
         ...(route.promotionTarget !== undefined ? { promotionTarget: route.promotionTarget } : {}),
         ...(route.productionTarget !== undefined ? { productionTarget: route.productionTarget } : {}),
       };
@@ -2807,6 +2819,7 @@ function nodeRecordFromItem(item: ScheduledWorkItem): OrchestrationNodeRecord {
     claims: [...item.claims],
     ...(item.repository !== undefined ? { repository: item.repository } : {}),
     ...(item.targetBranch !== undefined ? { targetBranch: item.targetBranch } : {}),
+    ...(item.milestoneIdentity !== undefined ? { milestoneIdentity: structuredClone(item.milestoneIdentity) } : {}),
     ...(item.targetRouteClaim !== undefined
       ? { targetRouteClaim: item.targetRouteClaim }
       : item.repository !== undefined && item.targetBranch !== undefined
@@ -2837,6 +2850,7 @@ function itemFromNodeRecord(node: OrchestrationNodeRecord): ScheduledWorkItem {
     claims: [...node.claims],
     ...(node.repository !== undefined ? { repository: node.repository } : {}),
     ...(node.targetBranch !== undefined ? { targetBranch: node.targetBranch } : {}),
+    ...(node.milestoneIdentity !== undefined ? { milestoneIdentity: structuredClone(node.milestoneIdentity) } : {}),
     ...(node.targetRouteClaim !== undefined ? { targetRouteClaim: node.targetRouteClaim } : {}),
     ...(node.lane !== undefined ? { lane: node.lane } : {}),
     ...(node.promotionTarget !== undefined ? { promotionTarget: node.promotionTarget } : {}),
@@ -3231,6 +3245,16 @@ function uniqueIssueNumbers(values: readonly number[]): number[] {
     result.push(value);
   }
   return result;
+}
+
+function assertRouteMilestone(route: OrchestrationRouteSnapshot, nodeId: string): void {
+  if (route.lane === "feature" && route.milestone === undefined) {
+    throw new Error(`Feature-lane route for ${nodeId} has no authoritative milestone identity`);
+  }
+}
+
+function sameMilestoneIdentity(left?: IssueMilestone, right?: IssueMilestone): boolean {
+  return left?.number === right?.number && left?.title === right?.title;
 }
 
 function assertProtectedProductionRoute(item: ScheduledWorkItem, productionTarget?: string): void {

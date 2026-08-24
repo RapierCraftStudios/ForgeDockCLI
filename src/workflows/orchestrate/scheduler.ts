@@ -3,6 +3,7 @@
 import { LeaseContinuityError } from "../../core/ports/lease.js";
 import { MAX_ORCHESTRATION_PARALLEL } from "../../core/ports/orchestration.js";
 import type { OrchestrationPlanMetadata, OrchestrationWaitReason } from "../../core/ports/orchestration.js";
+import type { IssueMilestone } from "../../core/ports/forge-host.js";
 
 export { InMemoryLeaseRepository } from "../../core/ports/lease.js";
 export { LeaseContinuityError };
@@ -20,6 +21,8 @@ export interface ScheduledWorkItem {
   targetRouteClaim?: string;
   /** Frozen repository delivery route retained through scheduling and durable recovery. */
   targetBranch?: string;
+  /** Authoritative milestone identity for feature-lane targets. */
+  milestoneIdentity?: IssueMilestone;
   /** Durable retry wake-up metadata; omitted for legacy queued items. */
   retryNextAt?: string;
   retryAttempt?: number;

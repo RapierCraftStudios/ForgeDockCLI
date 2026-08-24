@@ -2,6 +2,7 @@
 
 import { createHash } from "node:crypto";
 import type { InvestigationSnapshot, InvestigationSnapshotIdentity, InvestigationSnapshotManager } from "../../core/ports/git-workspace.js";
+import type { IssueMilestone } from "../../core/ports/forge-host.js";
 import { GitInvestigationSnapshotManager } from "../../adapters/git/git-worktree.js";
 import { assertArtifact, createArtifact, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
@@ -30,6 +31,7 @@ export interface InvestigationFirstRoute {
   issue: InvestigationFirstIssue;
   targetBranch: string;
   lane: "fast" | "feature";
+  milestone?: IssueMilestone;
   promotionTarget?: string;
   productionTarget?: string;
   /** Exact branch head observed during route resolution. */
@@ -129,6 +131,7 @@ export function createInvestigationFirstWorkers(
       target: {
         lane: route.lane,
         targetBranch: route.targetBranch,
+        ...(route.milestone !== undefined ? { milestone: structuredClone(route.milestone) } : {}),
         ...(route.promotionTarget !== undefined ? { promotionTarget: route.promotionTarget } : {}),
         ...(options.productionTarget !== undefined ? { productionTarget: options.productionTarget } : {}),
       },
@@ -180,7 +183,7 @@ export function createInvestigationFirstWorkers(
       throw new Error(`Investigation ${item.id} has no durable snapshot identity; refusing restart dispatch`);
     }
     const baseSha = await resolveExactBaseSha(options, item, route, checkpoint.investigation, context.investigation);
-    assertRouteMatchesCheckpoint(route, checkpoint.run, context.investigation, item.id);
+    assertRouteMatchesCheckpoint(route, checkpoint.run, context.investigation, item, item.id);
     const snapshot = await acquireSnapshot(item, route, baseSha, context.signal);
     assertSnapshotMatchesCheckpoint(snapshot.identity, context.investigation.snapshot, item.id);
     await snapshotManager.validate(snapshot);
@@ -195,6 +198,7 @@ export function createInvestigationFirstWorkers(
         target: {
           lane: route.lane,
           targetBranch: route.targetBranch,
+          ...(route.milestone !== undefined ? { milestone: structuredClone(route.milestone) } : {}),
           ...(route.promotionTarget !== undefined ? { promotionTarget: route.promotionTarget } : {}),
           ...(options.productionTarget !== undefined ? { productionTarget: options.productionTarget } : {}),
         },
@@ -517,6 +521,7 @@ function assertRouteMatchesCheckpoint(
   route: InvestigationFirstRoute,
   run: RunState,
   record: OrchestrationInvestigationRecord,
+  item: ScheduledWorkItem,
   itemId: string,
 ): void {
   if (run.targetBranch !== undefined && run.targetBranch !== route.targetBranch) {
@@ -530,6 +535,18 @@ function assertRouteMatchesCheckpoint(
   }
   if (record.lane !== undefined && record.lane !== route.lane) {
     throw new Error(`Packet ${itemId} investigation lane ${record.lane} does not match route ${route.lane}`);
+  }
+  if (run.milestone !== undefined && !sameMilestoneIdentity(run.milestone, route.milestone)) {
+    throw new Error(`Packet ${itemId} durable run milestone identity does not match route`);
+  }
+  if (record.milestoneIdentity !== undefined && !sameMilestoneIdentity(record.milestoneIdentity, route.milestone)) {
+    throw new Error(`Packet ${itemId} investigation milestone identity does not match route`);
+  }
+  if (item.milestoneIdentity !== undefined && !sameMilestoneIdentity(item.milestoneIdentity, route.milestone)) {
+    throw new Error(`Packet ${itemId} scheduled milestone identity does not match route`);
+  }
+  if (route.lane === "feature" && route.milestone === undefined) {
+    throw new Error(`Packet ${itemId} feature route has no authoritative milestone identity`);
   }
   if (run.promotionTarget !== undefined && run.promotionTarget !== route.promotionTarget) {
     throw new Error(`Packet ${itemId} durable run promotion target does not match route`);
@@ -629,6 +646,10 @@ function assertExactSha(label: string, expected: string, observed: string): void
   if (!/^[0-9a-f]{40,64}$/i.test(observed) || observed.toLowerCase() !== expected.toLowerCase()) {
     throw new Error(`${label} drifted: expected ${expected}, observed ${observed}`);
   }
+}
+
+function sameMilestoneIdentity(left?: IssueMilestone, right?: IssueMilestone): boolean {
+  return left?.number === right?.number && left?.title === right?.title;
 }
 
 function sameSubject(left: Subject, right: Subject): boolean {

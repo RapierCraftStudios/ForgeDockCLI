@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import type { IssueSnapshot } from "../../core/ports/forge-host.js";
+import type { IssueSnapshot, IssueMilestone } from "../../core/ports/forge-host.js";
 import {
   affectedFilesFromIssueBody,
   batchExclusionReason,
@@ -26,7 +26,7 @@ export interface BatchMaterializationHost {
   closeIssue(repo: string, issue: number, reason: string): Promise<void>;
 }
 
-type ExpectedRoute = { targetBranch: string; lane?: "fast" | "feature"; promotionTarget?: string; productionTarget?: string };
+type ExpectedRoute = { targetBranch: string; lane?: "fast" | "feature"; milestoneIdentity?: IssueMilestone; promotionTarget?: string; productionTarget?: string };
 type ExpectedRoutes = ReadonlyMap<string, ExpectedRoute> | ReadonlyMap<number, ExpectedRoute>;
 
 export interface MaterializeBatchGroupsInput {
@@ -123,18 +123,20 @@ export async function revalidateBatchGroup(
     const expectedRoute = expectedRouteFor(expectedRoutes, plannedRepository, planned.issue, repo);
     if (expectedRoute && (planned.targetBranch !== expectedRoute.targetBranch
       || planned.lane !== undefined && planned.lane !== expectedRoute.lane
+      || !sameMilestoneIdentity(planned.milestoneIdentity, expectedRoute.milestoneIdentity)
       || planned.promotionTarget !== expectedRoute.promotionTarget
       || planned.productionTarget !== expectedRoute.productionTarget)) {
       throw new Error(`Cannot batch #${planned.issue}: lane evidence changed since assembly`);
     }
     const observed = await host.getIssue(planned.issue, plannedRepository);
     if (observed.state !== "OPEN") throw new Error(`Cannot batch #${planned.issue}: issue is ${observed.state.toLowerCase()}`);
-    const observedMilestone = observed.milestone?.title;
-    if (milestoneSeen && observedMilestone !== milestone) {
+    const observedMilestone = observed.milestone;
+    const observedMilestoneTitle = observedMilestone?.title;
+    if (milestoneSeen && observedMilestoneTitle !== milestone) {
       throw new Error(`Cannot batch #${planned.issue}: members belong to different milestone lanes`);
     }
     milestoneSeen = true;
-    milestone = observedMilestone;
+    milestone = observedMilestoneTitle;
     const affectedFiles = affectedFilesFromIssueBody(observed.body);
     const observedLabels = observed.labels ?? [];
     assertAuthoritativeEvidence(planned, observed.labels !== undefined ? observedLabels : undefined, affectedFiles, observedMilestone);
@@ -153,7 +155,7 @@ export async function revalidateBatchGroup(
       ...(planned.promotionTarget !== undefined ? { promotionTarget: planned.promotionTarget } : {}),
       ...(planned.productionTarget !== undefined ? { productionTarget: planned.productionTarget } : {}),
       sourceIssueUrl: observed.url,
-      ...(observedMilestone ? { milestone: observedMilestone } : {}),
+      ...(observedMilestoneTitle ? { milestone: observedMilestoneTitle } : {}),
     };
     const exclusion = batchExclusionReason(candidate, { allowOrdinary: true });
     if (exclusion) throw new Error(`Cannot batch #${planned.issue}: authoritative GitHub evidence now reports ${exclusion}`);
@@ -162,6 +164,10 @@ export async function revalidateBatchGroup(
   }
   if (members.length < 2) throw new Error(`Batch group ${proposed.id} must contain at least two members`);
   return { members, ...(milestone ? { milestone } : {}) };
+}
+
+function sameMilestoneIdentity(left?: IssueMilestone, right?: IssueMilestone): boolean {
+  return left?.number === right?.number && left?.title === right?.title;
 }
 
 function expectedRouteFor(
@@ -184,7 +190,7 @@ function assertAuthoritativeEvidence(
   planned: BatchableWorkItem,
   observedLabels: readonly string[] | undefined,
   observedFiles: readonly string[],
-  observedMilestone: string | undefined,
+  observedMilestone: IssueMilestone | undefined,
 ): void {
   const normalize = (values: readonly string[]) => [...new Set(values.map((value) => value.replaceAll("\\", "/").trim()).filter(Boolean))].sort();
   if (normalize(planned.affectedFiles).join("\u0000") !== normalize(observedFiles).join("\u0000")) {
@@ -194,7 +200,8 @@ function assertAuthoritativeEvidence(
     throw new Error(`Cannot batch #${planned.issue}: authoritative labels changed since assembly`);
   }
   const plannedMilestone = typeof planned.milestone === "string" ? planned.milestone : planned.milestone?.title;
-  if (plannedMilestone !== observedMilestone) {
+  if (plannedMilestone !== observedMilestone?.title
+    || !sameMilestoneIdentity(planned.milestoneIdentity, observedMilestone)) {
     throw new Error(`Cannot batch #${planned.issue}: authoritative milestone changed since assembly`);
   }
 }

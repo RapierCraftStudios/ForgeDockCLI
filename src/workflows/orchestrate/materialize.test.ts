@@ -153,6 +153,29 @@ describe("authoritative batch materialization", () => {
     assert.equal(result.members[0]?.sourcePullRequest, 57);
   });
 
+  it("rejects same-title milestone identity drift", async () => {
+    const milestone = { number: 42, title: "Feature Lane" };
+    const members = [
+      { ...item(1), targetBranch: "milestone/feature-lane", lane: "feature" as const, milestone, milestoneIdentity: milestone },
+      { ...item(2), id: "issue-2", targetBranch: "milestone/feature-lane", lane: "feature" as const, milestone, milestoneIdentity: milestone },
+    ];
+    const group = { id: "batch:feature", kind: "same-file" as const, key: "src/api/a.ts", riskClass: "routine" as const, members };
+    await assert.rejects(
+      revalidateBatchGroup(group, "owner/repo", {
+        async getIssue(number) {
+          return {
+            repo: "owner/repo", number, title: `Issue ${number}`, body: "## Affected Files\n- `src/api/a.ts`",
+            url: `https://example.test/issues/${number}`, state: "OPEN" as const,
+            labels: ["enhancement", "priority:P2"], milestone: { number: 43, title: "Feature Lane" },
+          };
+        },
+        async materializeBatchIssue() { throw new Error("not expected"); },
+        async closeIssue() { return; },
+      }, new Map([[1, { targetBranch: "milestone/feature-lane", lane: "feature" as const, milestoneIdentity: milestone }], [2, { targetBranch: "milestone/feature-lane", lane: "feature" as const, milestoneIdentity: milestone }]])),
+      /authoritative milestone changed since assembly/,
+    );
+  });
+
   it("removes HTML comment fragments from materialized batch titles", async () => {
     const host = new FakeBatchHost();
     const poisonedPath = "src/api/a.ts<!-- injected -->";

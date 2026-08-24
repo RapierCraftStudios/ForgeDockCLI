@@ -2216,7 +2216,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
         lane: lane.kind,
         ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}),
         ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
-        ...(observed.milestone ? { milestone: observed.milestone } : {}),
+        ...(observed.milestone ? { milestone: observed.milestone, milestoneIdentity: observed.milestone } : {}),
         labels: observed.labels,
         title: observed.title,
         summary: observed.body.slice(0, 4_000),
@@ -2336,9 +2336,9 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
       getBranchHead: async (repo, branch) => await github.getBranchHead(repo, branch),
       resolveRoute: async (item) => {
         const routed = requiredOrchestrationRoute(routedIssues, { repository: item.repository ?? repository.repo, issue: item.issue });
-        return { issue: { title: routed.issue.title, body: routed.issue.body, url: routed.issue.url }, targetBranch: routed.lane.targetBranch, lane: routed.lane.kind, ...(routed.lane.kind === "feature" && routed.lane.promotionTarget !== undefined ? { promotionTarget: routed.lane.promotionTarget } : {}), ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}) };
+        return { issue: { title: routed.issue.title, body: routed.issue.body, url: routed.issue.url }, targetBranch: routed.lane.targetBranch, lane: routed.lane.kind, ...(routed.lane.kind === "feature" ? { milestone: routed.lane.milestone } : {}), ...(routed.lane.kind === "feature" && routed.lane.promotionTarget !== undefined ? { promotionTarget: routed.lane.promotionTarget } : {}), ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}) };
       },
-      sourceItems: (durable, initial) => durable.investigationWave === 1 ? initial : durable.nodes.map((node) => ({ id: node.id, issue: node.issue, priority: node.priority, dependencies: [...node.dependencies], claims: [...node.claims], ...(node.repository !== undefined ? { repository: node.repository } : {}), ...(node.targetBranch !== undefined ? { targetBranch: node.targetBranch } : {}), ...(node.targetRouteClaim !== undefined ? { targetRouteClaim: node.targetRouteClaim } : {}), ...(node.lane !== undefined ? { lane: node.lane } : {}), ...(node.promotionTarget !== undefined ? { promotionTarget: node.promotionTarget } : {}), ...(node.productionTarget !== undefined ? { productionTarget: node.productionTarget } : {}), ...(node.affectedFiles !== undefined ? { affectedFiles: [...node.affectedFiles] } : {}), ...(node.memberIssues !== undefined ? { memberIssues: [...node.memberIssues] } : {}), ...(node.title !== undefined ? { title: node.title } : {}), ...(node.summary !== undefined ? { summary: node.summary } : {}), ...(node.plan !== undefined ? { plan: structuredClone(node.plan) } : {}) })),
+      sourceItems: (durable, initial) => durable.investigationWave === 1 ? initial : durable.nodes.map((node) => ({ id: node.id, issue: node.issue, priority: node.priority, dependencies: [...node.dependencies], claims: [...node.claims], ...(node.repository !== undefined ? { repository: node.repository } : {}), ...(node.targetBranch !== undefined ? { targetBranch: node.targetBranch } : {}), ...(node.milestoneIdentity !== undefined ? { milestoneIdentity: structuredClone(node.milestoneIdentity) } : {}), ...(node.targetRouteClaim !== undefined ? { targetRouteClaim: node.targetRouteClaim } : {}), ...(node.lane !== undefined ? { lane: node.lane } : {}), ...(node.promotionTarget !== undefined ? { promotionTarget: node.promotionTarget } : {}), ...(node.productionTarget !== undefined ? { productionTarget: node.productionTarget } : {}), ...(node.affectedFiles !== undefined ? { affectedFiles: [...node.affectedFiles] } : {}), ...(node.memberIssues !== undefined ? { memberIssues: [...node.memberIssues] } : {}), ...(node.title !== undefined ? { title: node.title } : {}), ...(node.summary !== undefined ? { summary: node.summary } : {}), ...(node.plan !== undefined ? { plan: structuredClone(node.plan) } : {}) })),
       materializeDecomposition: async ({ orchestration: durable, item, childIssues, signal: materializeSignal, assertActive }) => {
         assertActive?.();
         if (materializeSignal?.aborted) throw materializeSignal.reason ?? new Error("Decomposition materialization cancelled");
@@ -2366,6 +2366,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
             return [orchestrationRouteCacheKey(itemRepository, item.issue), {
               targetBranch: route.lane.targetBranch,
               lane: route.lane.kind,
+              ...(route.lane.kind === "feature" ? { milestoneIdentity: structuredClone(route.lane.milestone) } : {}),
               ...(route.lane.kind === "feature" && route.lane.promotionTarget !== undefined ? { promotionTarget: route.lane.promotionTarget } : {}),
               ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
             }] as const;
@@ -3089,6 +3090,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
           repository: issue.repo,
           targetBranch: lane.targetBranch,
           lane: lane.kind,
+          ...(lane.kind === "feature" ? { milestone: lane.milestone } : {}),
           ...(lane.kind === "feature" && lane.promotionTarget !== undefined ? { promotionTarget: lane.promotionTarget } : {}),
           ...(configuredOrchestration.productionTarget !== undefined ? { productionTarget: configuredOrchestration.productionTarget } : {}),
         };

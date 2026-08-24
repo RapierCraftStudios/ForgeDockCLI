@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import type { InvestigationSnapshotIdentity } from "./git-workspace.js";
+import type { IssueMilestone } from "./forge-host.js";
 
 /** Hard upper bound for one orchestration's issue-slot budget. */
 export const MAX_ORCHESTRATION_PARALLEL = 30;
@@ -82,6 +83,7 @@ export interface OrchestrationInvestigationRecord {
   wave: number;
   baseSha?: string;
   targetBranch?: string;
+  milestoneIdentity?: IssueMilestone;
   lane?: "fast" | "feature";
   snapshot?: InvestigationSnapshotIdentity;
   status: "queued" | "running" | "completed" | "failed" | "cancelled";
@@ -256,6 +258,8 @@ export interface OrchestrationItemRecord {
   /** Optional for records written before repository identity was stored per node. */
   repository?: string;
   targetBranch?: string;
+  /** Authoritative milestone identity for feature-lane targets. */
+  milestoneIdentity?: IssueMilestone;
   /** Normalized repository/target serialization resource. */
   targetRouteClaim?: string;
   lane?: "fast" | "feature";

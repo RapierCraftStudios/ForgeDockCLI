@@ -198,6 +198,7 @@ export function contractBatchGroups(
       ...(group.members[0]?.lane !== undefined ? { lane: group.members[0].lane } : {}),
       ...(group.members[0]?.promotionTarget !== undefined ? { promotionTarget: group.members[0].promotionTarget } : {}),
       ...(group.members[0]?.productionTarget !== undefined ? { productionTarget: group.members[0].productionTarget } : {}),
+      ...(group.members[0]?.milestoneIdentity !== undefined ? { milestoneIdentity: structuredClone(group.members[0].milestoneIdentity) } : {}),
       ...(group.members[0]?.milestone !== undefined ? { milestone: group.members[0].milestone } : {}),
       memberIssues: uniqueNumbers(memberIssues),
     });
