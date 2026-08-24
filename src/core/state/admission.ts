@@ -9,6 +9,7 @@ export type SubjectAdmissionDecision =
   | { action: "start" }
   | { action: "resume"; runId: string; state: "investigating" | "preparing" | "building" | "blocked" | "publishing" | "target_recovery" | "retry_wait" | "failed" | "remediating" | "merging" | "invalid"; checkpoint: "investigation" | "preparation" | "build" | "verification" | "remediation" | "publication" | "target-advance" | "retry" | "completion" | "conflict-recovery" | "invalid-closure"; artifacts: DurableArtifact[] }
   | { action: "skip"; runId: string; state: RunStateName }
+  | { action: "blocked"; runId: string; state: "blocked"; reason: string; artifacts: DurableArtifact[] }
   | { action: "block"; runId: string; state: RunStateName; reason: string };
 
 export interface DurableLaneMismatch {
@@ -193,20 +194,97 @@ export function decideSubjectAdmission(
   const build = latestArtifactOfKind(latest.artifacts, "BuildResult");
   const verdict = latestArtifactOfKind(latest.artifacts, "ReviewVerdict");
   const outcome = latestArtifactOfKind(latest.artifacts, "Outcome");
-  const terminalTargetRecoveryOutcome = outcome?.payload.targetRecovery?.checkpointId !== undefined
-    && (outcome.payload.status === "failed" || outcome.payload.status === "blocked");
-  const remediationCheckpoint = latestArtifactOfKind(latest.artifacts, "RemediationBlocked");
-  const deliveryContext = hasIntent && hasInvestigation && hasPacket;
   const latestBuildIndex = lastArtifactIndex(latest.artifacts, "BuildResult");
   const latestVerdictIndex = lastArtifactIndex(latest.artifacts, "ReviewVerdict");
   const latestOutcomeIndex = lastArtifactIndex(latest.artifacts, "Outcome");
   const latestRemediationCheckpointIndex = lastArtifactIndex(latest.artifacts, "RemediationBlocked");
   const latestTargetAdvance = latestArtifactOfKind(latest.artifacts, "TargetAdvanceCheckpoint");
+  const latestTargetAdvanceArtifactIndex = lastArtifactIndex(latest.artifacts, "TargetAdvanceCheckpoint");
   const latestTargetAdvanceIndex = latestTargetAdvance?.payload.phase === "reviewed"
     ? -1
-    : lastArtifactIndex(latest.artifacts, "TargetAdvanceCheckpoint");
+    : latestTargetAdvanceArtifactIndex;
   const latestRetry = latestArtifactOfKind(latest.artifacts, "RetryCheckpoint");
   const latestRetryIndex = lastArtifactIndex(latest.artifacts, "RetryCheckpoint");
+  const latestRecoveryArtifactIndex = Math.max(
+    latestRemediationCheckpointIndex,
+    latestTargetAdvanceArtifactIndex,
+    latestRetryIndex,
+  );
+  const supersedingOutcomeIndex = outcome !== undefined && outcomeSupersedesBlockedVerdict(outcome)
+    ? latestOutcomeIndex
+    : -1;
+  const latestSemanticSupersederIndex = Math.max(
+    latestBuildIndex,
+    latestRecoveryArtifactIndex,
+    supersedingOutcomeIndex,
+  );
+  const intent = latestArtifactOfKind(latest.artifacts, "Intent");
+  const blockedVerdictLineageMatches = verdict?.payload.disposition === "blocked"
+    && intent !== undefined
+    && verdict.runId === latest.runId
+    && verdict.subject.repo.toLowerCase() === intent.subject.repo.toLowerCase()
+    && verdict.subject.issue !== undefined
+    && verdict.subject.issue === intent.subject.issue
+    && build !== undefined
+    && verdict.payload.headSha.toLowerCase() === build.payload.headSha.toLowerCase();
+  const blockedVerdictHasSuperseder = verdict?.payload.disposition === "blocked"
+    && latestSemanticSupersederIndex > latestVerdictIndex;
+  const blockedVerdictIsCurrent = verdict?.payload.disposition === "blocked"
+    && blockedVerdictLineageMatches
+    && latestSemanticSupersederIndex < latestVerdictIndex
+    && reconciled.state === "blocked";
+  if (verdict?.payload.disposition === "blocked" && !blockedVerdictIsCurrent && !blockedVerdictHasSuperseder) {
+    return {
+      action: "block",
+      runId: latest.runId,
+      state: reconciled.state,
+      reason: `Contradictory durable ReviewVerdict disposition=blocked with run state ${reconciled.state}; refusing recovery mutation`,
+    };
+  }
+  if (blockedVerdictIsCurrent) {
+    const warningReason = verdict.payload.warnings
+      ?.map((warning) => warning.trim())
+      .filter((warning) => warning.length > 0)
+      .join("; ");
+    const findingReason = verdict.payload.findings
+      .filter((finding) => finding.blocking || finding.mustFix)
+      .map((finding) => `${finding.title}: ${finding.evidence}`.trim())
+      .find((reason) => reason.length > 0);
+    const rootLedger = latestArtifactOfKind(latest.artifacts, "FindingRootLedger");
+    const rootLedgerMatches = rootLedger !== undefined
+      && rootLedger.runId === verdict.runId
+      && rootLedger.subject.repo.toLowerCase() === verdict.subject.repo.toLowerCase()
+      && rootLedger.subject.issue === verdict.subject.issue
+      && rootLedger.payload.headSha.toLowerCase() === verdict.payload.headSha.toLowerCase()
+      && (verdict.subject.pr === undefined || rootLedger.payload.pullRequest === verdict.subject.pr);
+    const openRootIds = rootLedgerMatches
+      ? rootLedger!.payload.roots
+        .filter((root) => root.state === "open" || root.state === "fix-attempted" || root.state === "regressed")
+        .map((root) => root.rootId)
+      : undefined;
+    const rootAuthorityReason = openRootIds?.length
+      ? `Review root authority remains unresolved for ${openRootIds.join(", ")}`
+      : undefined;
+    const reviewProjectionOutcome = outcome !== undefined
+      && latestOutcomeIndex > latestVerdictIndex
+      && !outcomeSupersedesBlockedVerdict(outcome)
+      && outcome.runId === verdict.runId
+      && outcome.subject.repo.toLowerCase() === verdict.subject.repo.toLowerCase()
+      && outcome.subject.issue === verdict.subject.issue;
+    const outcomeReason = reviewProjectionOutcome ? outcome.payload.reason.trim() : undefined;
+    return {
+      action: "blocked",
+      runId: latest.runId,
+      state: "blocked",
+      reason: warningReason || findingReason || rootAuthorityReason || outcomeReason
+        || `ReviewVerdict ${verdict.id} is durably blocked; preserved review admission evidence requires reassessment`,
+      artifacts: latest.artifacts,
+    };
+  }
+  const terminalTargetRecoveryOutcome = outcome?.payload.targetRecovery?.checkpointId !== undefined
+    && (outcome.payload.status === "failed" || outcome.payload.status === "blocked");
+  const remediationCheckpoint = latestArtifactOfKind(latest.artifacts, "RemediationBlocked");
+  const deliveryContext = hasIntent && hasInvestigation && hasPacket;
   if (terminalTargetRecoveryOutcome) {
     return {
       action: "block", runId: latest.runId, state: outcome!.payload.status === "blocked" ? "blocked" : "failed",
@@ -370,6 +448,18 @@ export function decideSubjectAdmission(
   }
 
   if (deliveryContext && matchingReviewedHead && verdict.payload.disposition === "request_changes") {
+    const actionableFindings = verdict.payload.findings.filter(isAcceptedRemediationFinding);
+    if (actionableFindings.length > 0) {
+      const rootAuthority = reviewRemediationRootAuthority(latest.artifacts, verdict, actionableFindings);
+      if (!rootAuthority.valid) {
+        return {
+          action: "block",
+          runId: latest.runId,
+          state: reconciled.state,
+          reason: rootAuthority.reason,
+        };
+      }
+    }
     const reviewBudgetExhausted = outcome?.payload.status === "blocked"
       && /^Remediation budget exhausted after \d+ cycle\(s\)$/i.test(outcome.payload.reason);
     const interruptedRemediation = !outcome || outcome.payload.status === "failed" || latestVerdictIndex > latestOutcomeIndex;
@@ -390,6 +480,65 @@ export function decideSubjectAdmission(
     state: reconciled.state,
     reason: `Existing run ${latest.runId} is ${reconciled.state} and has no controller-supported durable resume checkpoint; reset it before starting another run`,
   };
+}
+
+function isAcceptedRemediationFinding(
+  finding: DurableArtifact<"ReviewVerdict">["payload"]["findings"][number],
+): boolean {
+  return finding.scopeDisposition !== "rejected"
+    && finding.scopeDisposition !== "follow_up"
+    && (finding.mustFix ?? finding.blocking);
+}
+
+function reviewRemediationRootAuthority(
+  artifacts: readonly DurableArtifact[],
+  verdict: DurableArtifact<"ReviewVerdict">,
+  findings: readonly DurableArtifact<"ReviewVerdict">["payload"]["findings"][number][],
+): { valid: true } | { valid: false; reason: string } {
+  const ledger = [...artifacts].reverse().find((artifact): artifact is DurableArtifact<"FindingRootLedger"> =>
+    artifact.kind === "FindingRootLedger"
+    && artifact.producer.role === "controller"
+    && artifact.runId === verdict.runId,
+  );
+  if (!ledger
+    || ledger.subject.repo.toLowerCase() !== verdict.subject.repo.toLowerCase()
+    || ledger.subject.issue !== verdict.subject.issue
+    || verdict.subject.pr === undefined
+    || ledger.subject.pr !== verdict.subject.pr
+    || ledger.payload.pullRequest !== verdict.subject.pr
+    || ledger.payload.headSha.toLowerCase() !== verdict.payload.headSha.toLowerCase()) {
+    return {
+      valid: false,
+      reason: "ReviewVerdict request_changes lacks a controller-owned finding-root ledger for the reviewed head; refusing remediation resume",
+    };
+  }
+  const roots = new Map(ledger.payload.roots.map((root) => [root.rootId, root]));
+  if (roots.size !== ledger.payload.roots.length) {
+    return {
+      valid: false,
+      reason: "ReviewVerdict request_changes has ambiguous controller-owned finding-root authority; refusing remediation resume",
+    };
+  }
+  const openStates = new Set(["open", "fix-attempted", "regressed"]);
+  for (const finding of findings) {
+    const rootId = finding.rootId?.trim();
+    const root = rootId ? roots.get(rootId) : undefined;
+    if (!root || !openStates.has(root.state) || !root.findingIds.includes(finding.id)) {
+      return {
+        valid: false,
+        reason: "ReviewVerdict request_changes contains an actionable finding without a controller-owned accepted root; refusing remediation resume",
+      };
+    }
+  }
+  return { valid: true };
+}
+
+function outcomeSupersedesBlockedVerdict(outcome: DurableArtifact<"Outcome">): boolean {
+  if (outcome.payload.status !== "blocked") return true;
+  return outcome.payload.targetRecovery !== undefined
+    || outcome.payload.failureEvidence !== undefined
+    || outcome.payload.mergeGate !== undefined
+    || outcome.payload.supersedes !== undefined;
 }
 
 function isRepairableCheckFailure(check: CheckResult): boolean {

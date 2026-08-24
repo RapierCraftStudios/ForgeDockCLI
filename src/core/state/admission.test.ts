@@ -24,13 +24,18 @@ function intent(runId: string, createdAt: string): DurableArtifact {
   return { ...artifact, createdAt };
 }
 
-function outcome(runId: string, createdAt: string, status: "invalid" | "decomposed" | "blocked" | "failed" | "abandoned"): DurableArtifact {
+function outcome(
+  runId: string,
+  createdAt: string,
+  status: "invalid" | "decomposed" | "blocked" | "failed" | "abandoned",
+  reason: string = status,
+): DurableArtifact {
   const artifact = createArtifact({
     kind: "Outcome",
     runId,
     subject,
     producer: { role: "controller" },
-    payload: { status, reason: status, childIssues: [] },
+    payload: { status, reason, childIssues: [] },
   });
   return { ...artifact, createdAt };
 }
@@ -121,9 +126,227 @@ function publicationArtifacts(runId: string): DurableArtifact[] {
   ];
 }
 
+function retryCheckpoint(runId: string, createdAt: string): DurableArtifact {
+  const artifact = createArtifact({
+    kind: "RetryCheckpoint", runId, subject, producer: { role: "controller" },
+    payload: {
+      checkpoint: "retry", version: "forgedock.retry/v1", domain: "workflow", code: "temporary",
+      phase: "target-read", operationKey: "target-read", semanticKey: "subject-1", artifactIds: [],
+      attempt: {
+        number: 1, max: 3, firstAt: createdAt, nextAt: createdAt,
+      },
+      reconciliation: "pending", status: "waiting",
+      cause: { class: "transient", message: "temporary target read failure" },
+      createdAt, updatedAt: createdAt,
+    },
+  });
+  return { ...artifact, createdAt };
+}
+
+function targetRecoveryCheckpoint(
+  runId: string,
+  createdAt: string,
+  packetArtifactId: string,
+  buildResultId: string,
+  verdictArtifactId: string,
+): DurableArtifact {
+  const artifact = createArtifact({
+    kind: "TargetAdvanceCheckpoint", runId, subject, producer: { role: "controller" },
+    payload: {
+      checkpoint: "target-advance", version: "forgedock.target-advance/v1", repository: subject.repo,
+      targetBranch: "main", routeClaimKey: `${subject.repo}:main`, packetArtifactId, sourceBuildResultId: buildResultId,
+      sourceVerdictId: verdictArtifactId, sourceBaseSha: "a".repeat(40), sourceHeadSha: "d".repeat(40),
+      observedTargetSha: "b".repeat(40), phase: "target-read", expectedPaths: ["docs/a.md"],
+      verifiedContentDigest: "c".repeat(64), verificationPlanId: "plan-1", attempt: { number: 1, max: 2 },
+      workspace: { path: "/tmp/work", branch: "forgedock/issue-1", baseRef: "main" },
+      createdAt, updatedAt: createdAt,
+    },
+  });
+  return { ...artifact, createdAt };
+}
+
 describe("subject run admission", () => {
   it("starts when no durable state exists", () => {
     assert.deepEqual(decideSubjectAdmission([]), { action: "start" });
+  });
+
+  it("returns the original blocker for a durable blocked ReviewVerdict instead of a passed skip", () => {
+    const runId = "run_review_verdict_blocked";
+    const delivery = publicationArtifacts(runId).map((artifact, index) => ({
+      ...artifact, createdAt: `2026-01-01T00:0${index + 1}:00.000Z`,
+    }));
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+      payload: {
+        headSha: "d".repeat(40), disposition: "blocked", reviewerRoles: ["correctness"], findings: [], checks: [],
+        warnings: ["source proof is unavailable at the reviewed head"],
+      },
+    }, { createdAt: "2026-01-01T00:04:00.000Z" });
+    const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict]);
+    assert.equal(decision.action, "blocked");
+    if (decision.action === "blocked") {
+      assert.equal(decision.runId, runId);
+      assert.equal(decision.state, "blocked");
+      assert.equal(decision.reason, "source proof is unavailable at the reviewed head");
+      assert.ok(decision.artifacts.some((artifact) => artifact.kind === "ReviewVerdict"));
+    }
+  });
+
+  it("preserves finding evidence when a blocked verdict has empty warnings", () => {
+    const runId = "run_review_verdict_blocked_finding";
+    const delivery = publicationArtifacts(runId).map((artifact, index) => ({
+      ...artifact, createdAt: `2026-01-01T00:0${index + 1}:00.000Z`,
+    }));
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+      payload: {
+        headSha: "d".repeat(40), disposition: "blocked", reviewerRoles: ["correctness"],
+        findings: [{
+          id: "finding-source-proof", severity: "high", confidence: "high", blocking: true, mustFix: true,
+          title: "Source proof is unavailable", evidence: "The reviewed source snapshot could not be verified at the head.",
+          intentRelevance: "Review authority requires current-head source proof.", remediation: "Restore source proof and reassess.",
+        }], checks: [], warnings: [],
+      },
+    }, { createdAt: "2026-01-01T00:04:00.000Z" });
+    const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict]);
+    assert.equal(decision.action, "blocked");
+    if (decision.action === "blocked") assert.equal(decision.reason, "Source proof is unavailable: The reviewed source snapshot could not be verified at the head.");
+  });
+
+  it("falls back to durable Outcome evidence when blocked verdict warnings are empty or absent", () => {
+    const warningSets: (string[] | undefined)[] = [[], undefined];
+    for (const warnings of warningSets) {
+      const runId = `run_review_verdict_blocked_${warnings === undefined ? "absent" : "empty"}`;
+      const delivery = publicationArtifacts(runId).map((artifact, index) => ({
+        ...artifact, createdAt: `2026-01-01T00:0${index + 1}:00.000Z`,
+      }));
+      const verdict = createArtifact({
+        kind: "ReviewVerdict", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+        payload: {
+          headSha: "d".repeat(40), disposition: "blocked", reviewerRoles: ["correctness"], findings: [], checks: [],
+          ...(warnings === undefined ? {} : { warnings }),
+        },
+      }, { createdAt: "2026-01-01T00:04:00.000Z" });
+      const blocker = outcome(runId, "2026-01-01T00:05:00.000Z", "blocked", "durable blocker reason");
+      const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict, blocker]);
+      assert.equal(decision.action, "blocked");
+      if (decision.action === "blocked") assert.equal(decision.reason, "durable blocker reason");
+    }
+  });
+
+  it("gives current blocking findings precedence over an older unrelated Outcome reason", () => {
+    const runId = "run_review_verdict_reason_order";
+    const delivery = publicationArtifacts(runId).map((artifact, index) => ({
+      ...artifact, createdAt: `2026-01-01T00:0${index + 1}:00.000Z`,
+    }));
+    const olderOutcome = outcome(runId, "2026-01-01T00:04:00.000Z", "blocked", "stale operational blocker");
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+      payload: {
+        headSha: "d".repeat(40), disposition: "blocked", reviewerRoles: ["correctness"], checks: [], warnings: [],
+        findings: [{
+          id: "current-blocker", severity: "high", confidence: "high", blocking: true, mustFix: true,
+          title: "Current review blocker", evidence: "The current head still violates the accepted contract.",
+          intentRelevance: "The accepted contract remains unmet.", remediation: "Fix the current head.",
+        }],
+      },
+    }, { createdAt: "2026-01-01T00:05:00.000Z" });
+    const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, olderOutcome, verdict]);
+    assert.equal(decision.action, "blocked");
+    if (decision.action === "blocked") assert.equal(decision.reason, "Current review blocker: The current head still violates the accepted contract.");
+  });
+
+  it("does not let a stale blocked verdict mask a later terminal target-recovery Outcome", () => {
+    const runId = "run_stale_blocked_target_failure";
+    const delivery = publicationArtifacts(runId).map((artifact, index) => ({
+      ...artifact, createdAt: `2026-01-01T00:0${index + 1}:00.000Z`,
+    }));
+    const build = delivery.find((artifact) => artifact.kind === "BuildResult");
+    assert.ok(build?.kind === "BuildResult");
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+      payload: { headSha: build.payload.headSha, disposition: "blocked", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    }, { createdAt: "2026-01-01T00:04:00.000Z" });
+    const terminal = createArtifact({
+      kind: "Outcome", runId, subject, producer: { role: "controller" },
+      payload: {
+        status: "failed", reason: "target advance failed", childIssues: [],
+        targetRecovery: {
+          checkpointId: "target-checkpoint", phase: "push", cause: "confirmed conflict", attempt: { number: 1, max: 1 },
+        },
+      },
+    }, { createdAt: "2026-01-01T00:05:00.000Z" });
+    const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict, terminal]);
+    assert.equal(decision.action, "block");
+    if (decision.action === "block") {
+      assert.equal(decision.state, "failed");
+      assert.match(decision.reason, /Target recovery checkpoint target-checkpoint is superseded by terminal failed Outcome/);
+    }
+  });
+
+  it("does not let a stale blocked verdict mask a later retry recovery checkpoint", () => {
+    const runId = "run_stale_blocked_retry";
+    const delivery = publicationArtifacts(runId).map((artifact, index) => ({
+      ...artifact, createdAt: `2026-01-01T00:0${index + 1}:00.000Z`,
+    }));
+    const build = delivery.find((artifact) => artifact.kind === "BuildResult");
+    assert.ok(build?.kind === "BuildResult");
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+      payload: { headSha: build.payload.headSha, disposition: "blocked", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    }, { createdAt: "2026-01-01T00:04:00.000Z" });
+    const retry = retryCheckpoint(runId, "2026-01-01T00:05:00.000Z");
+    const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict, retry]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") {
+      assert.equal(decision.state, "retry_wait");
+      assert.equal(decision.checkpoint, "retry");
+    }
+  });
+
+  it("does not let a stale blocked verdict mask a later target-recovery checkpoint", () => {
+    const runId = "run_stale_blocked_target_checkpoint";
+    const delivery = publicationArtifacts(runId).map((artifact, index) => ({
+      ...artifact, createdAt: `2026-01-01T00:0${index + 1}:00.000Z`,
+    }));
+    const packet = delivery.find((artifact) => artifact.kind === "BuildPacket");
+    const build = delivery.find((artifact) => artifact.kind === "BuildResult");
+    assert.ok(packet?.kind === "BuildPacket");
+    assert.ok(build?.kind === "BuildResult");
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+      payload: { headSha: build.payload.headSha, disposition: "blocked", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    }, { createdAt: "2026-01-01T00:04:00.000Z" });
+    const checkpoint = targetRecoveryCheckpoint(runId, "2026-01-01T00:05:00.000Z", packet.id, build.id, verdict.id);
+    const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict, checkpoint]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") {
+      assert.equal(decision.state, "target_recovery");
+      assert.equal(decision.checkpoint, "target-advance");
+    }
+  });
+
+  it("does not let a stale blocked verdict mask a later verified BuildResult", () => {
+    const runId = "run_stale_blocked_build";
+    const delivery = publicationArtifacts(runId).map((artifact, index) => ({
+      ...artifact, createdAt: `2026-01-01T00:0${index + 1}:00.000Z`,
+    }));
+    const build = delivery.find((artifact) => artifact.kind === "BuildResult");
+    assert.ok(build?.kind === "BuildResult");
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+      payload: { headSha: build.payload.headSha, disposition: "blocked", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    }, { createdAt: "2026-01-01T00:04:00.000Z" });
+    const freshBuild = createArtifact({
+      kind: "BuildResult", runId, subject, producer: { role: "controller" },
+      payload: { ...build.payload, headSha: "e".repeat(40), summary: "fresh verified build" },
+    }, { createdAt: "2026-01-01T00:05:00.000Z" });
+    const decision = decideSubjectAdmission([intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict, freshBuild]);
+    assert.equal(decision.action, "resume");
+    if (decision.action === "resume") {
+      assert.equal(decision.state, "publishing");
+      assert.equal(decision.checkpoint, "publication");
+    }
   });
 
   it("skips the newest terminal run instead of publishing duplicate artifacts", () => {
@@ -765,6 +988,92 @@ describe("subject run admission", () => {
       assert.equal(decision.state, "publishing");
       assert.equal(decision.checkpoint, "publication");
     }
+  });
+
+  it("refuses rootless remediation authority but resumes a finding linked to the current controller ledger", () => {
+    const runId = "run_root_authority_admission";
+    const delivery = publicationArtifacts(runId).map((artifact, index) => ({
+      ...artifact, createdAt: `2026-01-01T00:0${index + 1}:00.000Z`,
+    }));
+    const finding = {
+      id: "root-authority-finding", rootId: "root-authority-1", severity: "high" as const,
+      confidence: "high" as const, blocking: true, mustFix: true, scopeDisposition: "in_scope" as const,
+      title: "Guard remains incomplete", evidence: "The accepted guard path is missing.",
+      intentRelevance: "The frozen criterion requires the guard.", remediation: "Complete the guard.",
+    };
+    const { rootId: _rootId, ...rootlessFinding } = finding;
+    const rootlessVerdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+      payload: {
+        headSha: "d".repeat(40), disposition: "request_changes", reviewerRoles: ["correctness"],
+        findings: [rootlessFinding], checks: [],
+      },
+    }, { createdAt: "2026-01-01T00:04:00.000Z" });
+    const rootlessDecision = decideSubjectAdmission([
+      intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, rootlessVerdict,
+    ]);
+    assert.equal(rootlessDecision.action, "block");
+    if (rootlessDecision.action === "block") assert.match(rootlessDecision.reason, /controller-owned finding-root ledger/);
+
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+      payload: {
+        headSha: "d".repeat(40), disposition: "request_changes", reviewerRoles: ["correctness"],
+        findings: [finding], checks: [],
+      },
+    }, { createdAt: "2026-01-01T00:04:00.000Z" });
+    const ledger = createArtifact({
+      kind: "FindingRootLedger", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+      payload: {
+        checkpoint: "finding-root-ledger", pullRequest: 57, headSha: "d".repeat(40), epoch: 1,
+        roots: [{
+          rootId: finding.rootId, structuralKey: "root-structure", aliases: ["root-structure"], criterionIds: ["criterion-1"],
+          component: "docs/a.md", symbols: ["guard"], invariantFamily: "criterion", failureFamily: "guard", triggerFamily: "missing",
+          state: "open", firstSeenHeadSha: "d".repeat(40), lastSeenHeadSha: "d".repeat(40), epochsOpen: 1,
+          findingIds: [finding.id], ownerRoles: ["correctness"], representative: finding,
+        }],
+      },
+    }, { createdAt: "2026-01-01T00:05:00.000Z" });
+    const rootedDecision = decideSubjectAdmission([
+      intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict, ledger,
+    ]);
+    assert.equal(rootedDecision.action, "resume");
+    if (rootedDecision.action === "resume") {
+      assert.equal(rootedDecision.state, "remediating");
+      assert.equal(rootedDecision.checkpoint, "remediation");
+    }
+  });
+
+  it("does not resume remediation when the current root ledger is stale", () => {
+    const runId = "run_stale_root_authority";
+    const delivery = publicationArtifacts(runId).map((artifact, index) => ({
+      ...artifact, createdAt: `2026-01-01T00:0${index + 1}:00.000Z`,
+    }));
+    const finding = {
+      id: "stale-root-finding", rootId: "root-stale", severity: "high" as const, confidence: "high" as const,
+      blocking: true, mustFix: true, scopeDisposition: "in_scope" as const, title: "Stale root", evidence: "stale",
+      intentRelevance: "criterion", remediation: "fix",
+    };
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+      payload: { headSha: "d".repeat(40), disposition: "request_changes", reviewerRoles: ["correctness"], findings: [finding], checks: [] },
+    });
+    const staleLedger = createArtifact({
+      kind: "FindingRootLedger", runId, subject: { ...subject, pr: 57 }, producer: { role: "controller" },
+      payload: {
+        checkpoint: "finding-root-ledger", pullRequest: 57, headSha: "a".repeat(40), epoch: 1,
+        roots: [{
+          rootId: finding.rootId, structuralKey: "stale", aliases: ["stale"], criterionIds: ["criterion-1"], component: "docs/a.md",
+          symbols: ["guard"], invariantFamily: "criterion", failureFamily: "guard", triggerFamily: "missing", state: "open",
+          firstSeenHeadSha: "a".repeat(40), lastSeenHeadSha: "a".repeat(40), epochsOpen: 1, findingIds: [finding.id], ownerRoles: ["correctness"], representative: finding,
+        }],
+      },
+    });
+    const decision = decideSubjectAdmission([
+      intent(runId, "2026-01-01T00:00:00.000Z"), ...delivery, verdict, staleLedger,
+    ]);
+    assert.equal(decision.action, "block");
+    if (decision.action === "block") assert.match(decision.reason, /reviewed head/);
   });
 
   it("resumes an interrupted remediator from the matching request-changes verdict", () => {

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import type { InvestigationSnapshotIdentity } from "./git-workspace.js";
+
 /** Hard upper bound for one orchestration's issue-slot budget. */
 export const MAX_ORCHESTRATION_PARALLEL = 30;
 
@@ -48,6 +50,8 @@ export interface OrchestrationPacketIdentity {
   investigationId: string;
   subject: { repo: string; issue: number };
   baseSha: string;
+  targetBranch?: string;
+  snapshot?: InvestigationSnapshotIdentity;
 }
 
 export interface OrchestrationPacketRecord {
@@ -61,6 +65,7 @@ export interface OrchestrationPacketRecord {
   expectedPaths?: string[];
   semanticDependencies?: string[];
   baseSha?: string;
+  snapshot?: InvestigationSnapshotIdentity;
   startedAt?: string;
   completedAt?: string;
   error?: string;
@@ -78,6 +83,7 @@ export interface OrchestrationInvestigationRecord {
   baseSha?: string;
   targetBranch?: string;
   lane?: "fast" | "feature";
+  snapshot?: InvestigationSnapshotIdentity;
   status: "queued" | "running" | "completed" | "failed" | "cancelled";
   outcome?: OrchestrationInvestigationOutcome;
   evidence?: OrchestrationPlanMetadata;

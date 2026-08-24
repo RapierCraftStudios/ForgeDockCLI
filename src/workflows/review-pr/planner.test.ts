@@ -2,7 +2,8 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { createArtifact } from "../../core/artifacts/schema.js";
+import { Check } from "typebox/value";
+import { createArtifact, ReviewPlanSchema } from "../../core/artifacts/schema.js";
 import { assertReviewPlan, computeReviewPlanId, planReviewPanel, scopedReviewDiff, type ReviewBudget, type ReviewPlan } from "./planner.js";
 
 function packet(risks: Array<{ risk: string; mitigation: string }> = []) {
@@ -79,16 +80,16 @@ describe("evidence-backed review planning", () => {
     assert.equal(plan.executionGroups.slice(1).length, 2);
     assert.equal(plan.budget.maxSpecialistExecutionGroups, 2);
     assert.equal(plan.budget.maxLogicalReviewerSessions, 3);
-    assert.equal(plan.budget.maxAttemptsPerExecutionGroup, 2);
+    assert.equal(plan.budget.maxAttemptsPerExecutionGroup, 3);
     assert.equal(Object.hasOwn(plan.budget, "maxToolCallsPerExecutionGroup"), false);
     assert.deepEqual(plan.budget, {
       maxSpecialistExecutionGroups: 2,
       maxLogicalReviewerSessions: 3,
       maxParallelSessions: 3,
-      maxAttemptsPerExecutionGroup: 2,
-      maxReviewerAttempts: 6,
+      maxAttemptsPerExecutionGroup: 3,
+      maxReviewerAttempts: 9,
       maxScopeAdjudicationAttempts: 2,
-      maxModelCalls: 8,
+      maxModelCalls: 11,
     });
     assert.deepEqual(new Set(plan.capabilities.map(({ id }) => id)), new Set([
       "acceptance-correctness", "security", "data-integrity", "frontend", "release", "concurrency",
@@ -97,6 +98,23 @@ describe("evidence-backed review planning", () => {
     assert.doesNotThrow(() => assertReviewPlan(plan));
   });
 
+  it("emits three-attempt plans while retaining legacy two-attempt budgets", () => {
+    const plan = planReviewPanel({ changedPaths: ["src/worker.ts"], diff: "+work();", packet: packet() });
+    assert.equal(plan.budget.maxAttemptsPerExecutionGroup, 3);
+    assert.equal(Check(ReviewPlanSchema, plan), true);
+
+    const legacyBudget = {
+      ...plan.budget,
+      maxAttemptsPerExecutionGroup: 2 as const,
+      maxReviewerAttempts: plan.executionGroups.length * 2,
+      maxModelCalls: plan.executionGroups.length * 2 + plan.budget.maxScopeAdjudicationAttempts,
+    };
+    const legacy = { ...plan, budget: legacyBudget };
+    const legacyWithId = { ...legacy, planId: computeReviewPlanId(legacy) } as ReviewPlan;
+    assert.equal(Check(ReviewPlanSchema, legacyWithId), true);
+    assert.doesNotThrow(() => assertReviewPlan(legacyWithId));
+    assert.equal(legacyWithId.budget.maxAttemptsPerExecutionGroup, 2);
+  });
   it("keeps legacy reviewer tool quotas decodable without emitting them in new plans", () => {
     const plan = planReviewPanel({ changedPaths: ["src/worker.ts"], diff: "+work();", packet: packet() });
     assert.equal(Object.hasOwn(plan.budget, "maxToolCallsPerExecutionGroup"), false);

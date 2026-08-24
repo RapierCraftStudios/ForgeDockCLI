@@ -42,7 +42,7 @@ export async function verifyFindingSourceAnchors<T extends ReviewFinding>(
     if (verified) {
       try {
         const blob = await input.readBlob!(input.reviewedHeadSha, path!);
-        if (!blob || blob.mode === "120000") verified = false;
+        if (!blob || !isRegularBlobMode(blob.mode)) verified = false;
         else {
           if (snapshot!.excerpt !== undefined && !blob.content.includes(snapshot!.excerpt)) verified = false;
           if (snapshot!.digest !== undefined
@@ -79,6 +79,84 @@ export function isUnverifiedSourceFinding(finding: ReviewFinding): boolean {
     && finding.scopeRationale?.includes("Controller could not verify an exact reviewed-head source anchor") === true;
 }
 
+/**
+ * Repair only factual source proof at the frozen head. Reviewer prose and all
+ * other finding fields remain untouched; an unsafe claim is left unchanged so
+ * the existing diagnostics and anchor validator can fail it closed.
+ *
+ * A source location is not proof. Normalization therefore requires an existing
+ * authorized snapshot and at least one supplied proof field. Every supplied
+ * proof field must match the exact frozen blob before the head is corrected or
+ * a digest is added; invalid claims are deliberately left untouched.
+ */
+export async function normalizeReviewerSourceSnapshots<T extends ReviewFinding>(
+  findings: readonly T[],
+  input: {
+    reviewedHeadSha: string;
+    assignedPaths: readonly string[];
+    reviewedPaths: readonly string[];
+    expectedPaths: readonly string[];
+    readBlob?: (revision: string, path: string) => Promise<ExactSourceBlob | undefined>;
+    verifiedAuthorityReferences: readonly string[];
+  },
+): Promise<T[]> {
+  const allowed = [...input.assignedPaths, ...input.reviewedPaths, ...input.expectedPaths]
+    .map(normalizeRepoPath)
+    .filter(Boolean);
+  const authority = new Set(input.verifiedAuthorityReferences);
+  return Promise.all(findings.map(async (finding) => {
+    if (!(finding.mustFix ?? finding.blocking)) return finding;
+    const anchor = finding.evidenceAnchor;
+    if ((anchor?.kind === "delivery-authority" || anchor?.kind === "deterministic-check")
+      && authority.has(anchor.reference)) return finding;
+
+    const suppliedSnapshot = finding.sourceSnapshot;
+    // A location alone is not source proof. Missing snapshots remain available
+    // to the existing diagnostics/retry/fail-closed path.
+    if (suppliedSnapshot === undefined) return finding;
+    const path = normalizeRepoPath(suppliedSnapshot.path);
+    // A supplied path is an assertion of identity, not a hint. Never replace an
+    // invalid/out-of-scope assertion with a path inferred from prose.
+    if (!isAllowedSourcePath(path, allowed) || !input.readBlob) return finding;
+
+    let blob: ExactSourceBlob | undefined;
+    try {
+      blob = await input.readBlob(input.reviewedHeadSha, path);
+    } catch {
+      return finding;
+    }
+    if (!blob || !isRegularBlobMode(blob.mode)) return finding;
+
+    const digest = createHash("sha256").update(blob.content).digest("hex");
+    const hasProof = suppliedSnapshot.excerpt !== undefined
+      || suppliedSnapshot.digest !== undefined
+      || suppliedSnapshot.symbol !== undefined;
+    if (!hasProof) return finding;
+    const excerptValid = suppliedSnapshot.excerpt === undefined
+      || (typeof suppliedSnapshot.excerpt === "string"
+        && suppliedSnapshot.excerpt.length > 0
+        && blob.content.includes(suppliedSnapshot.excerpt));
+    const digestValid = suppliedSnapshot.digest === undefined
+      || (typeof suppliedSnapshot.digest === "string"
+        && suppliedSnapshot.digest.length > 0
+        && digest === suppliedSnapshot.digest.toLowerCase());
+    const symbolValid = suppliedSnapshot.symbol === undefined
+      || (typeof suppliedSnapshot.symbol === "string"
+        && suppliedSnapshot.symbol.length > 0
+        && blob.content.includes(suppliedSnapshot.symbol));
+    if (!excerptValid || !digestValid || !symbolValid) return finding;
+
+    const snapshot: NonNullable<ReviewFinding["sourceSnapshot"]> = {
+      reviewedHeadSha: input.reviewedHeadSha,
+      path,
+      ...(suppliedSnapshot.excerpt !== undefined ? { excerpt: suppliedSnapshot.excerpt } : {}),
+      digest,
+      ...(suppliedSnapshot.symbol !== undefined ? { symbol: suppliedSnapshot.symbol } : {}),
+    };
+    return { ...finding, sourceSnapshot: snapshot };
+  }));
+}
+
 export async function reviewerSourceSnapshotDiagnostics(
   findings: readonly ReviewFinding[],
   input: {
@@ -106,7 +184,7 @@ export async function reviewerSourceSnapshotDiagnostics(
     if (!input.readBlob) { diagnostics.push(`${finding.id}: controller cannot verify sourceSnapshot without readExactBlob`); continue; }
     try {
       const blob = await input.readBlob(input.reviewedHeadSha, path);
-      if (!blob || blob.mode === "120000") { diagnostics.push(`${finding.id}: sourceSnapshot path is not a regular file at frozen head`); continue; }
+      if (!blob || !isRegularBlobMode(blob.mode)) { diagnostics.push(`${finding.id}: sourceSnapshot path is not a regular file at frozen head`); continue; }
       if (snapshot.excerpt && !blob.content.includes(snapshot.excerpt)) { diagnostics.push(`${finding.id}: sourceSnapshot excerpt is absent from exact file ${path}`); continue; }
       if (snapshot.digest && createHash("sha256").update(blob.content).digest("hex") !== snapshot.digest.toLowerCase()) { diagnostics.push(`${finding.id}: sourceSnapshot digest mismatches exact file ${path}`); continue; }
       if (snapshot.symbol && !blob.content.includes(snapshot.symbol)) diagnostics.push(`${finding.id}: sourceSnapshot symbol is absent from exact file ${path}`);
@@ -339,7 +417,21 @@ function normalizeRepoPath(path: string): string {
   return path.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "");
 }
 
+function isAllowedSourcePath(path: string, allowed: readonly string[]): boolean {
+  return Boolean(path)
+    && !path.startsWith("/")
+    && !path.split("/").some((part) => part === "." || part === "..")
+    && allowed.some((candidate) => pathMatchesExpectation(path, candidate));
+}
+
+function isRegularBlobMode(mode: string): boolean {
+  return /^100[0-7]{3}$/.test(mode);
+}
+
 function pathMatchesExpectation(path: string, expected: string): boolean {
-  if (expected.endsWith("/**")) return path.startsWith(expected.slice(0, -3));
+  if (expected.endsWith("/**")) {
+    const root = expected.slice(0, -3).replace(/\/$/, "");
+    return path === root || path.startsWith(`${root}/`);
+  }
   return path === expected || path.startsWith(`${expected}/`);
 }

@@ -37,6 +37,7 @@ import { modelWithThinking, readForgeDockConfig, resolveAutoMerge, resolveOrches
 import { appendProjectPreference, recordProjectDecision } from "../core/config/project-memory.js";
 import { GitHubArtifactRepository, GitHubClient, type BatchIssueInput } from "../adapters/github/github-client.js";
 import { resolveCheckoutContext } from "../adapters/git/repository-context.js";
+import { GitInvestigationSnapshotManager } from "../adapters/git/git-worktree.js";
 import { SqliteRepositories } from "../adapters/sqlite/sqlite-repositories.js";
 import { createConfiguredLeaseWitness, createOrBootstrapLocalLeaseWitness } from "../adapters/sqlite/lease-witness.js";
 import { LeaseBackedOrchestrationExecutionAdmission } from "../adapters/sqlite/orchestration-admission.js";
@@ -3085,9 +3086,12 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
       const investigationRuns: RunRepository = hasDurableInvestigationRuns
         ? orchestrationRepository!
         : new InMemoryRunRepository();
+      const investigationSnapshotManager = new GitInvestigationSnapshotManager(ctx.cwd);
       const investigationWorkers = createInvestigationFirstWorkers({
         repository: readyRepository.repo,
         checkoutRoot: ctx.cwd,
+        snapshotManager: investigationSnapshotManager,
+        resolveRepositoryRoot: (repositoryName) => resolveCheckoutContext(ctx.cwd, repositoryName).checkoutRoot,
         runtime: investigationRuntime,
         artifacts,
         runs: investigationRuns,
@@ -3202,11 +3206,18 @@ export function registerForgeDockTools(pi: ExtensionAPI, options: ForgeDockToolR
             return;
           }
           if (run.state !== "investigating") return;
+          const durableSnapshot = investigation.snapshot;
+          if (!durableSnapshot) throw new Error(`Investigation ${investigation.issue} has no admitted snapshot for settlement`);
+          if (durableSnapshot.repository.trim().toLowerCase() !== investigationRepository.trim().toLowerCase()) {
+            throw new Error(`Investigation ${investigation.issue} snapshot repository does not match scheduled repository ${investigationRepository}`);
+          }
+          const settlementSnapshot = { identity: structuredClone(durableSnapshot), path: durableSnapshot.snapshotPath };
+          await investigationSnapshotManager.validate(settlementSnapshot);
           const settledIssue = await readyGithub.getIssue(investigation.issue, investigationRepository);
           assertActive?.();
           const settledRepository = await readyGithub.getRepository(investigationRepository);
           const settledLane = await resolveIssueLane(settledIssue, settledRepository.defaultBranch, readyGithub, effective.fastLaneTarget, effective.featurePromotionTarget, effective.productionTarget);
-          const settled = await resumeInvestigationWorkItem({ run, intent, investigation: investigationArtifact, cwd: ctx.cwd, ...(settleSignal !== undefined ? { signal: settleSignal } : {}), target: { lane: settledLane.kind, targetBranch: settledLane.targetBranch, ...(settledLane.kind === "feature" && settledLane.promotionTarget !== undefined ? { promotionTarget: settledLane.promotionTarget } : {}), ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}) }, scopeHints: { affectedFiles: [], claims: [], metadataRoots: STANDARD_SCOPE_METADATA_ROOTS } }, { runtime: investigationRuntime, artifacts, runs: investigationRuns, decomposer: readyGithub, ...(settleSignal !== undefined ? { signal: settleSignal } : {}), ...(assertActive !== undefined ? { assertActive } : {}) });
+          const settled = await resumeInvestigationWorkItem({ run, intent, investigation: investigationArtifact, cwd: settlementSnapshot.path, ...(settleSignal !== undefined ? { signal: settleSignal } : {}), target: { lane: settledLane.kind, targetBranch: settledLane.targetBranch, ...(settledLane.kind === "feature" && settledLane.promotionTarget !== undefined ? { promotionTarget: settledLane.promotionTarget } : {}), ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}) }, scopeHints: { affectedFiles: [], claims: [], metadataRoots: STANDARD_SCOPE_METADATA_ROOTS } }, { runtime: investigationRuntime, artifacts, runs: investigationRuns, decomposer: readyGithub, ...(settleSignal !== undefined ? { signal: settleSignal } : {}), ...(assertActive !== undefined ? { assertActive } : {}) });
           assertActive?.();
           if (settled.outcome?.payload.status === "invalid") await completeInvalidWorkItem({ run: settled.run, investigation: settled.investigation, outcome: settled.outcome }, { host: readyGithub, artifacts, ...(settleSignal !== undefined ? { signal: settleSignal } : {}), ...(assertActive !== undefined ? { assertActive } : {}) });
         },
@@ -4065,8 +4076,8 @@ export async function admitWorkerRecovery(
       },
     ),
   })));
-  const blocked = decisions.find(({ decision }) => decision.action === "block");
-  if (blocked?.decision.action === "block") {
+  const blocked = decisions.find(({ decision }) => decision.action === "block" || decision.action === "blocked");
+  if (blocked?.decision.action === "block" || blocked?.decision.action === "blocked") {
     return { action: "block", runId: blocked.decision.runId, reason: `#${blocked.issue}: ${blocked.decision.reason}` };
   }
   const actions = new Set(decisions.map(({ decision }) => decision.action));
@@ -4088,7 +4099,7 @@ export async function admitWorkerRecovery(
 }
 
 
-async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord, controllerEntryOverride?: string | null): Promise<VisibleDagInput> {
+export async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord, controllerEntryOverride?: string | null): Promise<VisibleDagInput> {
   if (!record) throw new Error("Durable orchestration record is required to rebuild a DAG");
   const config = readForgeDockConfig(cwd);
   const frozenScopeExpansion = orchestrationMetadataString(record.plan, "scopeExpansion");
@@ -4144,9 +4155,12 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord,
     ...(frozenPlanningModel !== undefined ? { planningModel: frozenPlanningModel } : {}),
     ...(frozenPlanningThinking !== undefined ? { planningThinking: frozenPlanningThinking } : {}),
   })) : undefined;
+  const resumedSnapshotManager = investigationFirst ? new GitInvestigationSnapshotManager(cwd) : undefined;
   const resumedWorkers = investigationFirst && resumedStore && resumedInvestigationRuntime ? createInvestigationFirstWorkers({
     repository: record.repository,
     checkoutRoot: cwd,
+    snapshotManager: resumedSnapshotManager!,
+    resolveRepositoryRoot: (repositoryName) => resolveCheckoutContext(cwd, repositoryName).checkoutRoot,
     runtime: resumedInvestigationRuntime,
     artifacts,
     runs: resumedStore,
@@ -4200,12 +4214,20 @@ async function rebuildVisibleDagInput(cwd: string, record?: OrchestrationRecord,
           return;
         }
         if (run.state !== "investigating") return;
+        const durableSnapshot = investigation.snapshot;
+        if (!durableSnapshot) throw new Error(`Investigation ${investigation.issue} has no admitted snapshot for settlement`);
+        if (durableSnapshot.repository.trim().toLowerCase() !== investigationRepository.trim().toLowerCase()) {
+          throw new Error(`Investigation ${investigation.issue} snapshot repository does not match scheduled repository ${investigationRepository}`);
+        }
+        const settlementSnapshot = { identity: structuredClone(durableSnapshot), path: durableSnapshot.snapshotPath };
+        await resumedSnapshotManager!.validate(settlementSnapshot);
         const settledIssue = await github.getIssue(investigation.issue, investigationRepository);
         assertActive?.();
         const settledRepository = await github.getRepository(investigationRepository);
         const settledLane = await resolveIssueLane(settledIssue, settledRepository.defaultBranch, github, effective.fastLaneTarget, effective.featurePromotionTarget, effective.productionTarget);
         const settled = await resumeInvestigationWorkItem({
-          run, intent, investigation: investigationArtifact, cwd,
+          run, intent, investigation: investigationArtifact,
+          cwd: settlementSnapshot.path,
           ...(settleSignal !== undefined ? { signal: settleSignal } : {}),
           target: { lane: settledLane.kind, targetBranch: settledLane.targetBranch, ...(settledLane.kind === "feature" && settledLane.promotionTarget !== undefined ? { promotionTarget: settledLane.promotionTarget } : {}), ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}) },
           scopeHints: { affectedFiles: [], claims: [], metadataRoots: STANDARD_SCOPE_METADATA_ROOTS },

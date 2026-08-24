@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import type { InvestigationSnapshotIdentity } from "../../core/ports/git-workspace.js";
 import type { OrchestrationPlanMetadata } from "../../core/ports/orchestration.js";
 import { materializeClaimDependencies, validateGraph, type ClaimSerializationEdge, type ScheduledWorkItem } from "./scheduler.js";
 
@@ -13,6 +14,8 @@ export interface PacketWaveIdentity {
   subject: { repo: string; issue: number };
   /** Exact revision read while producing the packet. */
   baseRef: string;
+  targetBranch?: string;
+  snapshot?: InvestigationSnapshotIdentity;
   /** Durable Investigation artifact identity. */
   investigationId: string;
 }
@@ -37,7 +40,7 @@ export interface PacketWaveItem {
 export interface PacketDagInput {
   items: readonly ScheduledWorkItem[];
   packets: readonly PacketWaveItem[];
-  /** Exact base is part of the packet barrier identity. */
+  /** First base is retained for backward-compatible barrier display; packet identities may differ. */
   baseRef: string;
   /** Never enabled implicitly. */
   fallback?: "none" | "preview-claims";
@@ -48,6 +51,9 @@ export interface ClaimProvenance {
   packetId: string;
   expectedPaths: string[];
   baseRef: string;
+  repository?: string;
+  targetBranch?: string;
+  snapshotId?: string;
 }
 
 export interface DependencyProvenance {
@@ -58,7 +64,7 @@ export interface DependencyProvenance {
 export interface CompiledPacketDag {
   items: ScheduledWorkItem[];
   edges: ClaimSerializationEdge[];
-  packetBarrier: { baseRef: string; packetIds: string[]; completed: number; total: number };
+  packetBarrier: { baseRef: string; packetIds: string[]; groups: { identity: string; baseRef: string; packetIds: string[] }[]; completed: number; total: number };
   observability: {
     semanticFrontier: number;
     claimEdgeCount: number;
@@ -91,7 +97,9 @@ export function compileExecutionDag(input: PacketDagInput): CompiledPacketDag {
   for (const item of included) {
     const packet = packets.get(item.id);
     if (!packet) throw new Error(`Packet barrier incomplete: missing packet for ${item.id}`);
-    if (packet.baseRef !== input.baseRef) throw new Error(`Packet base drift for ${item.id}: ${packet.baseRef} != ${input.baseRef}`);
+    // A wave may contain multiple immutable route/base groups. The packet's
+    // own base is retained in provenance; only blank bases are rejected.
+    if (!packet.baseRef.trim()) throw new Error(`Packet ${item.id} has no exact base reference`);
     const paths = normalizePacketPaths(packet.expectedPaths);
     if (!paths.length) {
       if (input.fallback !== "preview-claims") throw new Error(`Packet ${item.id} has no bounded expected paths`);
@@ -108,6 +116,9 @@ export function compileExecutionDag(input: PacketDagInput): CompiledPacketDag {
         packetId: packet.id,
         expectedPaths: paths,
         baseRef: packet.baseRef,
+        ...(packet.identity?.subject.repo !== undefined ? { repository: packet.identity.subject.repo } : {}),
+        ...(packet.identity?.targetBranch !== undefined ? { targetBranch: packet.identity.targetBranch } : {}),
+        ...(packet.identity?.snapshot?.snapshotId !== undefined ? { snapshotId: packet.identity.snapshot.snapshotId } : {}),
       } satisfies ClaimProvenance,
       dependencyProvenance: {
         source: "investigation",
@@ -129,12 +140,22 @@ export function compileExecutionDag(input: PacketDagInput): CompiledPacketDag {
   const edges = graph.edges.filter((edge) => activeIds.has(edge.predecessor) && activeIds.has(edge.successor));
   validateGraph(graph.items, edges);
   const frontier = graph.items.filter((item) => item.dependencies.length === 0).length;
+  const packetIds = graph.items.map((item) => packets.get(item.id)!.id);
+  const groups = new Map<string, { identity: string; baseRef: string; packetIds: string[] }>();
+  for (const id of packetIds) {
+    const packet = packets.get(id)!;
+    const identity = JSON.stringify({ repo: packet.identity?.subject.repo ?? "", route: packet.identity?.targetBranch ?? "", base: packet.baseRef, snapshot: packet.identity?.snapshot?.snapshotId ?? "" });
+    const group = groups.get(identity) ?? { identity, baseRef: packet.baseRef, packetIds: [] };
+    group.packetIds.push(id);
+    groups.set(identity, group);
+  }
   return {
     items: graph.items,
     edges,
     packetBarrier: {
       baseRef: input.baseRef,
-      packetIds: graph.items.map((item) => packets.get(item.id)!.id),
+      packetIds,
+      groups: [...groups.values()],
       completed: graph.items.length,
       total: graph.items.length,
     },
@@ -330,6 +351,9 @@ function assertPacketIdentity(
   if (!sameSubject(identity.subject, expected.subject)) throw new Error(`Packet ${item.id} has subject identity drift`);
   if (identity.baseRef !== expected.baseRef) throw new Error(`Packet ${item.id} has base identity drift`);
   if (identity.investigationId !== expected.investigationId) throw new Error(`Packet ${item.id} has investigation identity drift`);
+  if (identity.targetBranch !== expected.targetBranch || !sameSnapshotIdentity(identity.snapshot, expected.snapshot)) {
+    throw new Error(`Packet ${item.id} has route/snapshot identity drift`);
+  }
 }
 
 function validateExpectedIdentity(item: ScheduledWorkItem, identity: PacketWaveIdentity, baseRef: string): void {
@@ -337,6 +361,7 @@ function validateExpectedIdentity(item: ScheduledWorkItem, identity: PacketWaveI
   if (identity.baseRef !== baseRef) throw new Error(`Packet ${item.id} expected identity has base drift`);
   if (!identity.runId.trim() || !identity.investigationId.trim()) throw new Error(`Packet ${item.id} expected identity is incomplete`);
   if (identity.subject.issue !== item.issue || !identity.subject.repo.trim()) throw new Error(`Packet ${item.id} expected identity has subject drift`);
+  if (identity.targetBranch !== undefined && !identity.targetBranch.trim()) throw new Error(`Packet ${item.id} expected identity has blank route`);
 }
 
 function validatePacketIdentity(
@@ -349,6 +374,17 @@ function validatePacketIdentity(
   if (!identity.runId.trim() || !identity.investigationId.trim()) throw new Error(`Packet ${item.id} has incomplete run/investigation identity`);
   if (identity.subject.issue !== item.issue || !identity.subject.repo.trim()) throw new Error(`Packet ${item.id} has subject identity drift`);
   if (identity.baseRef !== baseRef || identity.baseRef !== packet.baseRef) throw new Error(`Packet ${item.id} has base identity drift`);
+}
+
+function sameSnapshotIdentity(left: InvestigationSnapshotIdentity | undefined, right: InvestigationSnapshotIdentity | undefined): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return left.schema === right.schema
+    && left.repository === right.repository
+    && left.repositoryRoot === right.repositoryRoot
+    && left.targetBranch === right.targetBranch
+    && left.baseSha === right.baseSha
+    && left.snapshotId === right.snapshotId
+    && left.snapshotPath === right.snapshotPath;
 }
 
 function sameSubject(left: PacketWaveIdentity["subject"], right: PacketWaveIdentity["subject"]): boolean {

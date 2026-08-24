@@ -55,13 +55,24 @@ describe("packet DAG compilation", () => {
     assert.equal(result.edges.length, 1);
     assert.equal(result.observability.claimComponents, 1);
     assert.deepEqual(result.items[0]?.plan?.claimProvenance, {
-      source: "build-packet", packetId: "i1", expectedPaths: ["src/shared.ts"], baseRef: "origin/staging",
+      source: "build-packet", packetId: "i1", expectedPaths: ["src/shared.ts"], baseRef: "origin/staging", repository: "acme/repository",
     });
   });
 
-  it("fails closed on missing packets and base drift", () => {
+  it("fails closed on missing packets and allows distinct route/base groups", () => {
     assert.throws(() => compileExecutionDag({ items: [item("i1", 1)], packets: [], baseRef: "origin/staging" }), /missing packet/);
-    assert.throws(() => compileExecutionDag({ items: [item("i1", 1)], packets: [packet("i1", "src/a.ts", "origin/main")], baseRef: "origin/staging" }), /base drift/);
+    const result = compileExecutionDag({ items: [item("i1", 1), item("i2", 2)], packets: [packet("i1", "src/a.ts", "origin/staging"), packet("i2", "src/b.ts", "origin/main")], baseRef: "origin/staging" });
+    assert.equal(result.packetBarrier.groups.length, 2);
+    assert.deepEqual(result.packetBarrier.groups.map((group) => group.baseRef).sort(), ["origin/main", "origin/staging"]);
+  });
+
+  it("preserves identity-isolation matrix invariant:matrix-identity-isolation-31307d598639 across packet groups", () => {
+    const result = compileExecutionDag({
+      items: [item("i1", 1), item("i2", 2)],
+      packets: [packet("i1", "src/a.ts", "base-a"), packet("i2", "src/b.ts", "base-b")],
+      baseRef: "base-a",
+    });
+    assert.equal(new Set(result.packetBarrier.groups.map((group) => group.identity)).size, 2);
   });
 });
 

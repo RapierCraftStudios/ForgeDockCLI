@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { createArtifact, type BuildPacketPayload, type InvestigationPayload } from "../../core/artifacts/schema.js";
+import { createArtifact, type BuildPacketPayload, type DurableArtifact, type InvestigationPayload } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestMergeGate, PullRequestSnapshot, ReviewFindingPublicationFence } from "../../core/ports/forge-host.js";
 import { LeaseContinuityError } from "../../core/ports/lease.js";
 import { decideSubjectAdmission } from "../../core/state/admission.js";
@@ -21,13 +21,420 @@ import { terminalOrchestrationResult } from "../orchestrate/terminal-result.js";
 import type { BuilderSubmission, VerificationDiagnosis } from "./build.js";
 import { planReviewPanel } from "../review-pr/planner.js";
 import { WorkflowExecutionError } from "./investigate.js";
-import { certifyPacketRelationAuthority, repositoryPathFromLocation, resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, shouldAppendFailureOutcome, workspacePathsEquivalent, workOn } from "./work-on.js";
+import { admitPostReviewContinuation, certifyPacketRelationAuthority, repositoryPathFromLocation, resumeBuildWorkOn, resumeCompletionWorkOn, resumeEarlyWorkOn, resumePublicationWorkOn, resumeReviewWorkOn, resumeWorkOn, shouldAppendFailureOutcome, workspacePathsEquivalent, workOn } from "./work-on.js";
 import { digestRelation } from "../../core/packet/relation-graph.js";
 
 const sha = "e".repeat(40);
 const fastLane = { kind: "fast", targetBranch: "main", resolution: "repository-default" } as const;
 const runTarget = { lane: "fast", targetBranch: "main" } as const;
 const workspace: GitWorkspace = { path: "/tmp/work", branch: "forgedock/issue-8", baseRef: "main", baseSha: sha };
+
+describe("post-review continuation guard", () => {
+  const runId = "run_post_review_guard";
+  const subject = { repo: "a/b", issue: 8 } as const;
+  const headSha = "a".repeat(40);
+  const packetArtifact = createArtifact({
+    kind: "BuildPacket", runId, subject, producer: { role: "packet-author" }, payload: {
+      scope: ["Guard"], acceptanceCriteria: ["Guard runs"], context: [], implementationPlan: ["Edit src/a.js"],
+      expectedPaths: ["src/a.js"], verificationPlan: ["npm test"], risks: [], outOfScope: [],
+    },
+  });
+  const pullRequest: PullRequestSnapshot = {
+    repo: "a/b", number: 7, title: "Fix", body: "", url: "https://github.test/a/b/pull/7", state: "OPEN",
+    headSha, headBranch: "forgedock/issue-8", baseBranch: "main",
+  };
+
+  it("invariant:matrix-chunk-boundary-7701f1c33be3 · returns the authoritative blocked checkpoint without remediation", () => {
+    const queued = createRun({ workflow: "work-on", subject, runId, target: runTarget });
+    const blocked = transition(queued, "BLOCK", { reason: "source proof is unavailable" }).state;
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 7 }, producer: { role: "controller" },
+      payload: { headSha, disposition: "blocked", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    });
+    const decision = admitPostReviewContinuation({ run: blocked, verdict, packet: packetArtifact, pullRequest });
+    assert.equal(decision.action, "blocked");
+    if (decision.action === "blocked") assert.equal(decision.reason, "source proof is unavailable");
+  });
+
+  it("invariant:matrix-adapter-lifecycle-727d7c2084b4 · fails closed for contradictory blocked identity", () => {
+    const run = createRun({ workflow: "work-on", subject, runId });
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 7 }, producer: { role: "controller" },
+      payload: { headSha, disposition: "blocked", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    });
+    assert.throws(() => admitPostReviewContinuation({ run, verdict, packet: packetArtifact, pullRequest }), /requires blocked run state/);
+  });
+
+  it("invariant:matrix-terminal-metadata-348772f31d76 · never treats findings as approval or remediation", () => {
+    const run = createRun({ workflow: "work-on", subject, runId });
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 7 }, producer: { role: "controller" },
+      payload: { headSha, disposition: "approve", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    });
+    assert.throws(() => admitPostReviewContinuation({ run, verdict, packet: packetArtifact, pullRequest }), /requires merging state/);
+  });
+
+  it("requires controller-owned root authority for remediation while preserving valid request-changes", () => {
+    let remediating = createRun({ workflow: "work-on", subject, runId, target: runTarget });
+    for (const event of [
+      "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED",
+      "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_CHANGES_REQUESTED",
+    ] as const) {
+      remediating = transition(remediating, event, { headSha }).state;
+    }
+    const finding = {
+      id: "root-authority-finding", severity: "high" as const, confidence: "high" as const, blocking: true, mustFix: true,
+      scopeDisposition: "in_scope" as const, title: "Guard remains incomplete", evidence: "The accepted guard path is missing.",
+      intentRelevance: "The frozen criterion requires the guard.", remediation: "Complete the guard.",
+    };
+    const roots = reconcileFindingRootLedger({ packet: packetArtifact, findings: [finding], headSha });
+    const root = roots[0];
+    if (!root) throw new Error("Missing controller finding root fixture");
+    const findingRootLedger = createArtifact({
+      kind: "FindingRootLedger", runId, subject: { ...subject, pr: pullRequest.number }, producer: { role: "controller" },
+      payload: { checkpoint: "finding-root-ledger", pullRequest: pullRequest.number, headSha, epoch: 1, roots },
+    });
+    const rootless = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 7 }, producer: { role: "controller" },
+      payload: { headSha, disposition: "request_changes", reviewerRoles: ["correctness"], findings: [finding], checks: [] },
+    });
+    assert.throws(
+      () => admitPostReviewContinuation({ run: remediating, verdict: rootless, packet: packetArtifact, pullRequest, currentRemediationCycles: 0, maxRemediationCycles: 1 }),
+      /no controller-accepted remediation roots/,
+    );
+    const rooted = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 7 }, producer: { role: "controller" },
+      payload: {
+        headSha, disposition: "request_changes", reviewerRoles: ["correctness"],
+        findings: [{ ...finding, rootId: root.rootId }], checks: [],
+        reviewPlan: currentReviewPlan(packetArtifact, headSha, pullRequest.number),
+      },
+    });
+    const decision = admitPostReviewContinuation({
+      run: remediating, verdict: rooted, packet: packetArtifact, pullRequest,
+      findingRootLedger,
+      currentRemediationCycles: 0, maxRemediationCycles: 1,
+    });
+    assert.equal(decision.action, "remediate");
+    if (decision.action === "remediate") assert.equal(decision.cycle, 1);
+  });
+
+  it("rejects missing, stale-head, and absent-root ledger authority", () => {
+    let remediating = createRun({ workflow: "work-on", subject, runId: `${runId}_ledger`, target: runTarget });
+    for (const event of [
+      "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED",
+      "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_CHANGES_REQUESTED",
+    ] as const) {
+      remediating = transition(remediating, event, { headSha }).state;
+    }
+    const finding = {
+      id: "ledger-authority-finding", severity: "high" as const, confidence: "high" as const, blocking: true, mustFix: true,
+      scopeDisposition: "in_scope" as const, title: "Guard remains incomplete", evidence: "The accepted guard path is missing.",
+      intentRelevance: "The frozen criterion requires the guard.", remediation: "Complete the guard.",
+    };
+    const roots = reconcileFindingRootLedger({ packet: packetArtifact, findings: [finding], headSha });
+    const root = roots[0];
+    if (!root) throw new Error("Missing ledger regression root");
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId: remediating.runId, subject: { ...subject, pr: pullRequest.number }, producer: { role: "controller" },
+      payload: {
+        headSha, disposition: "request_changes", reviewerRoles: ["correctness"],
+        findings: [{ ...finding, rootId: root.rootId }], checks: [],
+        reviewPlan: currentReviewPlan({ ...packetArtifact, runId: remediating.runId }, headSha, pullRequest.number),
+      },
+    });
+    const ledger = createArtifact({
+      kind: "FindingRootLedger", runId: remediating.runId, subject: { ...subject, pr: pullRequest.number }, producer: { role: "controller" },
+      payload: { checkpoint: "finding-root-ledger", pullRequest: pullRequest.number, headSha, epoch: 1, roots },
+    });
+    const staleLedger = createArtifact({
+      kind: "FindingRootLedger", runId: remediating.runId, subject: { ...subject, pr: pullRequest.number }, producer: { role: "controller" },
+      payload: { ...ledger.payload, headSha: "b".repeat(40) },
+    });
+    const absentRootLedger = createArtifact({
+      kind: "FindingRootLedger", runId: remediating.runId, subject: { ...subject, pr: pullRequest.number }, producer: { role: "controller" },
+      payload: { ...ledger.payload, roots: [] },
+    });
+    for (const [label, findingRootLedger, pattern] of [
+      ["missing", undefined, /FindingRootLedger/],
+      ["stale-head", staleLedger, /reviewed head|does not match/],
+      ["absent root membership", absentRootLedger, /does not contain accepted finding root/],
+    ] as const) {
+      assert.throws(
+        () => admitPostReviewContinuation({
+          run: remediating, verdict, packet: { ...packetArtifact, runId: remediating.runId }, pullRequest,
+          findingRootLedger, currentRemediationCycles: 0, maxRemediationCycles: 1,
+        }),
+        pattern,
+        label,
+      );
+    }
+  });
+
+  it("settles a rooted request-changes verdict as budget-exhausted at a zero target-recovery limit", () => {
+    let remediating = createRun({ workflow: "work-on", subject, runId, target: runTarget });
+    for (const event of [
+      "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED",
+      "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_CHANGES_REQUESTED",
+    ] as const) {
+      remediating = transition(remediating, event, { headSha }).state;
+    }
+    const finding = {
+      id: "target-recovery-root", severity: "high" as const, confidence: "high" as const, blocking: true, mustFix: true,
+      scopeDisposition: "in_scope" as const,
+      title: "Guard remains incomplete", evidence: "The accepted guard path is missing.",
+      intentRelevance: "The frozen criterion requires the guard.", remediation: "Complete the guard.",
+    };
+    const roots = reconcileFindingRootLedger({ packet: packetArtifact, findings: [finding], headSha });
+    const root = roots[0];
+    if (!root) throw new Error("Missing budget root fixture");
+    const findingRootLedger = createArtifact({
+      kind: "FindingRootLedger", runId, subject: { ...subject, pr: pullRequest.number }, producer: { role: "controller" },
+      payload: { checkpoint: "finding-root-ledger", pullRequest: pullRequest.number, headSha, epoch: 1, roots },
+    });
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 7 }, producer: { role: "controller" },
+      payload: {
+        headSha, disposition: "request_changes", reviewerRoles: ["correctness"],
+        findings: [{ ...finding, rootId: root.rootId }], checks: [],
+        reviewPlan: currentReviewPlan(packetArtifact, headSha, pullRequest.number),
+      },
+    });
+    const decision = admitPostReviewContinuation({
+      run: remediating, verdict, packet: packetArtifact, pullRequest, findingRootLedger,
+      currentRemediationCycles: 0, maxRemediationCycles: 0,
+    });
+    assert.equal(decision.action, "budget-exhausted");
+    if (decision.action === "budget-exhausted") assert.match(decision.reason, /budget exhausted/);
+  });
+
+  it("fails completion recovery closed when a legacy verdict meets a retargeted PR", async () => {
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const completionSubject = { repo: "a/b", issue: 8 };
+    const runId = "run_completion_retargeted";
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...completionSubject, pr: host.snapshot.number }, producer: { role: "controller" },
+      payload: { headSha: sha, disposition: "approve", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    });
+    let run = createRun({ workflow: "work-on", subject: completionSubject, runId, target: runTarget });
+    await runs.create(run);
+    for (const event of [
+      "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED",
+      "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_APPROVED",
+    ] as const) {
+      const advanced = transition(run, event, { headSha: sha });
+      await runs.commit(run.version, advanced.state, advanced.record);
+      run = advanced.state;
+    }
+    await assert.rejects(
+      resumeCompletionWorkOn({
+        run, verdict, pullRequest: { ...host.snapshot, baseBranch: "release" }, autoMerge: true,
+      }, { runtime: new FakeAgentRuntime([]), artifacts, runs, git, verifier: new EndToEndVerifier(), host }),
+      /base branch to match controller-owned target identity/,
+    );
+    assert.equal(host.snapshot.state, "OPEN");
+    assert.equal((await runs.history(runId)).at(-1)?.event, "REVIEW_APPROVED");
+  });
+
+  it("invariant:matrix-adapter-lifecycle-3f4408636d75 · preserves terminal metadata on blocked publication", () => {
+    const queued = createRun({ workflow: "work-on", subject, runId, target: runTarget });
+    const blocked = transition(queued, "BLOCK", { reason: "original blocker" }).state;
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...subject, pr: 7 }, producer: { role: "controller" },
+      payload: { headSha, disposition: "blocked", reviewerRoles: ["correctness"], findings: [], checks: [] },
+    });
+    const decision = admitPostReviewContinuation({ run: blocked, verdict, packet: packetArtifact, pullRequest });
+    assert.equal(decision.action, "blocked");
+  });
+
+  it("rejects stale or foreign retained verdicts before interrupted remediation mutates state", async () => {
+    const runId = "run_post_review_guard_resume";
+    const runSubject = { repo: "a/b", issue: 8 } as const;
+    const intent = createArtifact({
+      kind: "Intent", runId, subject: runSubject, producer: { role: "controller" },
+      payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: [], dependencies: [] },
+    });
+    const investigationArtifact = createArtifact({
+      kind: "Investigation", runId, subject: runSubject, producer: { role: "investigator" }, payload: investigation,
+    });
+    const buildResult = createArtifact({
+      kind: "BuildResult", runId, subject: runSubject, producer: { role: "controller" },
+      payload: {
+        branch: workspace.branch, headSha, changedPaths: ["src/a.js"], summary: "built",
+        acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "verified" }],
+        checks: [], decisions: [], residualRisks: [],
+      },
+    });
+    let baseRun = createRun({ workflow: "work-on", subject: runSubject, runId, target: runTarget });
+    for (const event of [
+      "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED",
+      "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_CHANGES_REQUESTED",
+    ] as const) {
+      baseRun = transition(baseRun, event, { headSha }).state;
+    }
+    for (const [label, verdictSubject, verdictRunId] of [
+      ["stale issue", { repo: runSubject.repo, issue: 9, pr: pullRequest.number }, runId],
+      ["foreign run", { repo: "other/repo", issue: runSubject.issue, pr: pullRequest.number }, "run_foreign"],
+    ] as const) {
+      const priorVerdict = createArtifact({
+        kind: "ReviewVerdict", runId: verdictRunId, subject: verdictSubject, producer: { role: "controller" },
+        payload: {
+          headSha, disposition: "request_changes", reviewerRoles: ["correctness"], findings: [], checks: [],
+        },
+      });
+      const runs = new InMemoryRunRepository();
+      await runs.create(baseRun);
+      const runtime = new FakeAgentRuntime([]);
+      await assert.rejects(
+        resumeReviewWorkOn({
+          run: baseRun, intent, investigation: investigationArtifact, packet: packetArtifact, buildResult, priorVerdict,
+          pullRequest, workspace, baseBranch: "main", verification: [targetedTestVerification],
+        }, {
+          runtime, artifacts: new InMemoryArtifactRepository(), runs, git: new EndToEndGit(),
+          verifier: new EndToEndVerifier(), host: new EndToEndHost(),
+        }),
+        /ReviewVerdict identity does not match/,
+        label,
+      );
+      assert.equal(runtime.tasks.length, 0, `${label} must not dispatch remediation`);
+      assert.equal((await runs.load(runId))?.state, "remediating", `${label} must not transition the run`);
+    }
+  });
+});
+
+describe("interrupted remediation admission", () => {
+  async function fixture(runId: string) {
+    const artifacts = new InMemoryArtifactRepository();
+    const runs = new InMemoryRunRepository();
+    const git = new EndToEndGit();
+    const host = new EndToEndHost();
+    const intent = createWorkOnIntent(runId);
+    const investigationArtifact = createArtifact({
+      kind: "Investigation", runId, subject: intent.subject, producer: { role: "investigator" }, payload: investigation,
+    });
+    const packetArtifact = createArtifact({
+      kind: "BuildPacket", runId, subject: intent.subject, producer: { role: "packet-author" }, payload: packet,
+    });
+    const buildResult = createArtifact({
+      kind: "BuildResult", runId, subject: intent.subject, producer: { role: "controller" },
+      payload: {
+        branch: workspace.branch, baseSha: sha, headSha: sha, changedPaths: ["src/a.js"], summary: "Built guard",
+        acceptanceEvidence: [{ criterion: "Guard runs", status: "passed", evidence: "verified" }],
+        checks: [{ command: "npm test", commandId: "test", status: "passed", durationMs: 1 }], decisions: [], residualRisks: [],
+      },
+    });
+    const finding = {
+      id: "interrupted-root", severity: "high" as const, confidence: "high" as const, blocking: true, mustFix: true,
+      scopeDisposition: "in_scope" as const,
+      title: "Guard is incomplete", evidence: "The accepted path still misses one case", location: "src/a.js:1",
+      intentRelevance: "The frozen criterion requires the accepted guard behavior.", remediation: "Complete the guard in src/a.js",
+    };
+    const roots = reconcileFindingRootLedger({ packet: packetArtifact, findings: [finding], headSha: sha });
+    const root = roots[0];
+    if (!root) throw new Error("Missing interrupted remediation root");
+    const findingRootLedger = createArtifact({
+      kind: "FindingRootLedger", runId, subject: { ...intent.subject, pr: host.snapshot.number }, producer: { role: "controller" },
+      payload: {
+        checkpoint: "finding-root-ledger", pullRequest: host.snapshot.number, headSha: sha, epoch: 1, roots,
+      },
+    });
+    const priorVerdict = createArtifact({
+      kind: "ReviewVerdict", runId, subject: { ...intent.subject, pr: host.snapshot.number }, producer: { role: "controller" },
+      payload: {
+        headSha: sha, headBranch: workspace.branch, baseBranch: "main", disposition: "request_changes",
+        reviewerRoles: ["correctness"], findings: [{ ...finding, rootId: root.rootId }], checks: [],
+        reviewPlan: currentReviewPlan(packetArtifact, sha, host.snapshot.number),
+      },
+    });
+    let run = attachArtifact(
+      createRun({ workflow: "work-on", subject: intent.subject, runId, target: runTarget }),
+      "FindingRootLedger",
+      findingRootLedger.id,
+    );
+    await runs.create(run);
+    for (const event of [
+      "START_INVESTIGATION", "INVESTIGATION_CONFIRMED", "BUILD_PACKET_READY", "BUILD_COMPLETED",
+      "VERIFICATION_PASSED", "PR_PUBLISHED", "REVIEW_CHANGES_REQUESTED",
+    ] as const) {
+      const advanced = transition(run, event, { headSha: sha });
+      await runs.commit(run.version, advanced.state, advanced.record);
+      run = advanced.state;
+    }
+    for (const artifact of [intent, investigationArtifact, packetArtifact, buildResult, findingRootLedger]) await artifacts.append(artifact);
+    return { artifacts, runs, git, host, intent, investigationArtifact, packetArtifact, buildResult, priorVerdict, findingRootLedger, run };
+  }
+
+  it("uses the in-flight verdict cycle once before interrupted remediation", async () => {
+    const runtime = new FakeAgentRuntime([new AgentExecutionInterruptedError("remediator interrupted", { reason: "cancelled", resumable: true })]);
+    const state = await fixture("run_interrupted_remediation_cycle");
+    await assert.rejects(
+      resumeReviewWorkOn({
+        run: state.run, intent: state.intent, investigation: state.investigationArtifact, packet: state.packetArtifact,
+        buildResult: state.buildResult, priorVerdict: state.priorVerdict, pullRequest: state.host.snapshot,
+        workspace, baseBranch: "main", verification: [targetedTestVerification], priorRemediationCycles: 1,
+        maxRemediationCycles: 2,
+      }, { runtime, artifacts: state.artifacts, runs: state.runs, git: state.git, verifier: new EndToEndVerifier(), host: state.host }),
+      (error: unknown) => error instanceof WorkflowExecutionError && error.recoverable,
+    );
+    assert.deepEqual(runtime.tasks.map((task) => task.role), ["remediator"]);
+    assert.equal((await state.runs.load(state.intent.runId))?.state, "remediating");
+    assert.equal((await state.runs.history(state.intent.runId)).some((record) => record.event === "FAIL"), false);
+  });
+
+  it("rejects missing, stale-head, and absent-root ledgers before resume transition or dispatch", async () => {
+    for (const [label, mutate, expected] of [
+      ["missing", (state: Awaited<ReturnType<typeof fixture>>) => {
+        const index = state.artifacts.artifacts.findIndex((artifact) => artifact.id === state.findingRootLedger.id);
+        if (index < 0) throw new Error("Missing fixture ledger to remove");
+        state.artifacts.artifacts.splice(index, 1);
+      }, /foreign or missing FindingRootLedger/],
+      ["stale-head", (state: Awaited<ReturnType<typeof fixture>>) => {
+        const ledger = state.artifacts.artifacts.find((artifact): artifact is DurableArtifact<"FindingRootLedger"> => artifact.kind === "FindingRootLedger");
+        if (!ledger) throw new Error("Missing fixture ledger to stale");
+        ledger.payload = { ...ledger.payload, headSha: "b".repeat(40) };
+      }, /stale.*reviewed head/],
+      ["absent-root", (state: Awaited<ReturnType<typeof fixture>>) => {
+        const ledger = state.artifacts.artifacts.find((artifact): artifact is DurableArtifact<"FindingRootLedger"> => artifact.kind === "FindingRootLedger");
+        if (!ledger) throw new Error("Missing fixture ledger to clear");
+        ledger.payload = { ...ledger.payload, roots: [] };
+      }, /does not contain accepted finding root/],
+    ] as const) {
+      const state = await fixture(`run_interrupted_remediation_${label}`);
+      mutate(state);
+      const runtime = new FakeAgentRuntime([]);
+      await assert.rejects(
+        resumeReviewWorkOn({
+          run: state.run, intent: state.intent, investigation: state.investigationArtifact, packet: state.packetArtifact,
+          buildResult: state.buildResult, priorVerdict: state.priorVerdict, pullRequest: state.host.snapshot,
+          workspace, baseBranch: "main", verification: [targetedTestVerification], priorRemediationCycles: 1,
+          maxRemediationCycles: 2,
+        }, { runtime, artifacts: state.artifacts, runs: state.runs, git: state.git, verifier: new EndToEndVerifier(), host: state.host }),
+        expected,
+        label,
+      );
+      assert.equal(runtime.tasks.length, 0, `${label} must not dispatch remediation`);
+      assert.equal((await state.runs.load(state.intent.runId))?.state, "remediating", `${label} must not transition the run`);
+      assert.equal((await state.runs.history(state.intent.runId)).some((record) => record.event === "RESUME_REMEDIATION"), false);
+    }
+  });
+
+  it("blocks an exhausted interrupted remediation before dispatch", async () => {
+    const runtime = new FakeAgentRuntime([]);
+    const state = await fixture("run_interrupted_remediation_budget");
+    const result = await resumeReviewWorkOn({
+      run: state.run, intent: state.intent, investigation: state.investigationArtifact, packet: state.packetArtifact,
+      buildResult: state.buildResult, priorVerdict: state.priorVerdict, pullRequest: state.host.snapshot,
+      workspace, baseBranch: "main", verification: [targetedTestVerification], priorRemediationCycles: 2,
+      maxRemediationCycles: 1,
+    }, { runtime, artifacts: state.artifacts, runs: state.runs, git: state.git, verifier: new EndToEndVerifier(), host: state.host });
+    assert.equal(result.run.state, "blocked");
+    assert.equal(runtime.tasks.length, 0);
+    assert.equal((await state.runs.history(state.intent.runId)).some((record) => record.event === "RESUME_REMEDIATION"), false);
+  });
+});
 
 describe("durable workspace identity", () => {
   it("treats Windows and WSL spellings as the same retained workspace", () => {
@@ -226,14 +633,18 @@ const targetedTestVerification = {
 };
 const { verificationRequirements: _legacyRequirements, ...legacyPacket } = packet;
 
-function currentReviewPlan(packetArtifact: ReturnType<typeof createArtifact<"BuildPacket">>, reviewedHeadSha = sha) {
+function currentReviewPlan(
+  packetArtifact: ReturnType<typeof createArtifact<"BuildPacket">>,
+  reviewedHeadSha = sha,
+  pullRequest = 11,
+) {
   return planReviewPanel({
     changedPaths: ["src/a.js"], diff: "diff --git a/src/a.js b/src/a.js\n+guard();", packet: packetArtifact,
     context: {
       runId: packetArtifact.runId,
       repo: packetArtifact.subject.repo,
       ...(packetArtifact.subject.issue !== undefined ? { issue: packetArtifact.subject.issue } : {}),
-      pullRequest: 11,
+      pullRequest,
       deliveryRunId: packetArtifact.runId,
       buildResultBranch: workspace.branch,
       targetBranch: "main",
@@ -2142,6 +2553,7 @@ describe("complete work-on trajectory", () => {
       investigation, packet, submission,
       { summary: "Changes required", findings: [finding] },
       { summary: "Scope confirmed", findings: [finding] },
+      { summary: "Scope confirmed after the bounded reviewer retry", findings: [finding] },
       acceptAdjudication,
     ]);
     const artifacts = new InMemoryArtifactRepository();

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
 import { Check } from "typebox/value";
 import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
@@ -172,24 +173,32 @@ function priorRootArtifacts(
 }
 
 describe("fresh-context PR review", () => {
-  it("blocks closure when a blocking finding has stale source proof", async () => {
+  it("repairs a stale source head only when the supplied proof validates", async () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);
     const context = artifacts(run);
     const stale = { ...inScope, id: "stale-source", severity: "high" as const, confidence: "high" as const,
       blocking: true, title: "Guard is stale", evidence: "The guarded write is absent", location: "src/lock.ts:1",
-      remediation: "Restore the guarded write", intentRelevance: "The accepted guard must remain present", sourceSnapshot: { reviewedHeadSha: sha, path: "src/lock.ts", excerpt: "missing-now" } };
+      remediation: "Restore the guarded write", intentRelevance: "The accepted guard must remain present", sourceSnapshot: { reviewedHeadSha: "b".repeat(40), path: "src/lock.ts", excerpt: "current", symbol: "current" } };
     const host = new FakeHost();
     const result = await reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd(),
       readExactBlob: async () => ({ content: "current source", mode: "100644" }) }, {
-      runtime: new FakeAgentRuntime([() => ({ summary: "Blocking stale claim", findings: [stale] }), () => ({ summary: "Blocking stale claim", findings: [stale] }), () => ({ summary: "Blocking stale claim", findings: [stale] }), () => ({ summary: "Blocking stale claim", findings: [stale] }), clean]),
+      runtime: new FakeAgentRuntime([() => ({ summary: "Blocking stale claim", findings: [stale] }), clean, acceptAdjudication]),
       host, artifacts: new InMemoryArtifactRepository(), runs,
     });
-    assert.equal(result.verdict.payload.disposition, "blocked");
-    assert.equal(result.run.state, "blocked");
-    assert.equal(result.verdict.payload.findings[0]?.blocking, false);
-    assert.equal(result.verdict.payload.findings[0]?.mustFix, false);
-    assert.equal(host.findingIssues.length, 0);
+    const finding = result.verdict.payload.findings[0]!;
+    assert.equal(result.verdict.payload.disposition, "request_changes");
+    assert.equal(result.run.state, "remediating");
+    assert.equal(finding.blocking, true);
+    assert.equal(finding.mustFix, true);
+    assert.deepEqual(finding.sourceSnapshot, {
+      reviewedHeadSha: sha,
+      path: "src/lock.ts",
+      excerpt: "current",
+      digest: createHash("sha256").update("current source").digest("hex"),
+      symbol: "current",
+    });
+    assert.equal(host.findingIssues.length, 1);
   });
 
   it("routes risk specialists and approves only the frozen SHA", async () => {
@@ -842,7 +851,7 @@ describe("fresh-context PR review", () => {
     assert.ok(correctnessTasks[1]?.instructions.includes("Continue only the persisted incomplete reviewer session"));
   });
 
-  it("settles successful siblings, preserves their report, caps attempts at two, and issues no partial approval", async () => {
+  it("settles successful siblings, preserves their report, caps attempts at three, and issues no partial approval", async () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);
     const context = artifacts(run);
@@ -860,7 +869,7 @@ describe("fresh-context PR review", () => {
       /Review incomplete.*successful reviewer reports were preserved and no partial approval was issued/,
     );
     assert.equal(runtime.tasks.length, 3);
-    assert.ok([...new Set(runtime.tasks.map(({ id }) => id))].every((id) => runtime.tasks.filter((task) => task.id === id).length <= 2));
+    assert.ok([...new Set(runtime.tasks.map(({ id }) => id))].every((id) => runtime.tasks.filter((task) => task.id === id).length <= 3));
     assert.equal(host.comments.length, 1);
     assert.match(host.comments[0]?.body ?? "", /ForgeDock Review Evidence/);
     assert.match(host.comments[0]?.body ?? "", /wave is incomplete; no partial approval was issued/i);
@@ -868,6 +877,40 @@ describe("fresh-context PR review", () => {
     assert.equal((await runs.load(run.runId))?.state, "blocked");
     assert.equal(isTransientReviewerTransportFailure("read failed: optional path missing"), false);
     assert.equal(isTransientReviewerTransportFailure("Codex error: Our servers are currently overloaded"), true);
+  });
+
+  it("settles a third fresh attempt before blocking the wave without partial approval", async () => {
+    class ThreeAttemptRuntime extends FakeAgentRuntime {
+      readonly attempts = new Map<string, number>();
+
+      override async run<T>(task: AgentTask<T>): Promise<AgentRunResult<T>> {
+        this.tasks.push(task as AgentTask<unknown>);
+        const attempt = (this.attempts.get(task.id) ?? 0) + 1;
+        this.attempts.set(task.id, attempt);
+        if (task.id.endsWith(":review-correctness") && attempt <= 3) {
+          throw new Error("provider read failed");
+        }
+        return { output: clean as T, sessionRef: `session-${this.tasks.length}`, provider: "fake", model: "three-attempt" };
+      }
+    }
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const context = artifacts(run);
+    const runtime = new ThreeAttemptRuntime();
+    const host = new FakeHost();
+    const artifactStore = new InMemoryArtifactRepository();
+    await assert.rejects(
+      reviewPullRequest({ run, pullRequest: pr, ...context, workspace: process.cwd(), readExactBlob: sourceBlob }, {
+        runtime, host, artifacts: artifactStore, runs,
+      }),
+      /Review incomplete.*no partial approval was issued/,
+    );
+    assert.equal(runtime.attempts.get(`${run.runId}:review:${sha}:cycle-1-of-1:review-correctness`), 3);
+    assert.equal(runtime.attempts.get(`${run.runId}:review:${sha}:cycle-1-of-1:review-concurrency`), 1);
+    assert.equal(host.comments.length, 1);
+    assert.match(host.comments[0]?.body ?? "", /wave is incomplete; no partial approval was issued/i);
+    assert.equal(artifactStore.artifacts.some(({ kind }) => kind === "ReviewVerdict"), false);
+    assert.equal((await runs.load(run.runId))?.state, "blocked");
   });
 
   it("enforces the frozen reviewer-attempt budget across the whole wave", async () => {
@@ -977,11 +1020,11 @@ describe("fresh-context PR review", () => {
       }, { runtime, host: new FakeHost(), artifacts: new InMemoryArtifactRepository(), runs }),
       /timed out after 25ms/,
     );
-    assert.equal(runtime.tasks.length, 4);
-    assert.ok([...new Set(runtime.tasks.map(({ id }) => id))].every((id) => runtime.tasks.filter((task) => task.id === id).length === 2));
+    assert.equal(runtime.tasks.length, 6);
+    assert.ok([...new Set(runtime.tasks.map(({ id }) => id))].every((id) => runtime.tasks.filter((task) => task.id === id).length === 3));
     const progress = await runs.listProgress(run.runId);
     assert.ok(progress.some(({ message }) => message.includes("timed out")));
-    assert.ok(progress.some(({ message }) => message.includes("fresh retry 2/2 scheduled")));
+    assert.ok(progress.some(({ message }) => message.includes("fresh retry 3/3 scheduled")));
   });
 
   it("drains an externally cancelled reviewer before releasing its operation", async () => {
@@ -1049,7 +1092,7 @@ describe("fresh-context PR review", () => {
     assert.ok([...new Set(runtime.tasks.map(({ id }) => id))].every((id) => runtime.tasks.filter((task) => task.id === id).length === 1));
     assert.deepEqual(result.sessionRefs.sort(), ["late-session-1", "late-session-2"]);
     const progress = await runs.listProgress(run.runId);
-    assert.equal(progress.some(({ message }) => message.includes("retry 2/2 scheduled")), false);
+    assert.equal(progress.some(({ message }) => message.includes("retry 3/3 scheduled")), false);
   });
 
   it("does not resume a terminal non-resumable provider failure received during timeout drain", async () => {

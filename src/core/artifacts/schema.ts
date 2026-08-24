@@ -542,10 +542,11 @@ export const ReviewPlanSchema = Type.Object({
     maxParallelSessions: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
     maxTurnsPerExecutionGroup: Type.Optional(Type.Integer({ minimum: 1, maximum: 24 })),
     maxToolCallsPerExecutionGroup: Type.Optional(Type.Integer({ minimum: 1, maximum: 64 })),
-    maxAttemptsPerExecutionGroup: Type.Literal(2),
-    maxReviewerAttempts: Type.Integer({ minimum: 1, maximum: 128 }),
+    /** Legacy plans use two attempts; current plans use three. */
+    maxAttemptsPerExecutionGroup: Type.Union([Type.Literal(2), Type.Literal(3)]),
+    maxReviewerAttempts: Type.Integer({ minimum: 1, maximum: 192 }),
     maxScopeAdjudicationAttempts: Type.Integer({ minimum: 1, maximum: 2 }),
-    maxModelCalls: Type.Optional(Type.Integer({ minimum: 1, maximum: 130 })),
+    maxModelCalls: Type.Optional(Type.Integer({ minimum: 1, maximum: 194 })),
   })),
   capabilities: Type.Optional(Type.Array(ReviewCapabilitySchema, { minItems: 1 })),
   executionGroups: Type.Optional(Type.Array(Type.Object({

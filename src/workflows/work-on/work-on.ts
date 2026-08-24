@@ -44,6 +44,8 @@ import { remediateReview } from "./remediate.js";
 import { recoverVerificationCheckpoint, verificationProgressRecorder, verifyAndCommit, verifyCommittedRepair, deliveryContentDigest, VerificationDiagnosisCallbackError, type VerificationResult } from "./verify.js";
 import { recoverConflictingRevision, resolvePacketConflicts, resolvePacketConflictsForPacket } from "./conflict-recovery.js";
 import { materializeReviewFindings, resumeReviewFindingProjection, reviewPullRequest } from "../review-pr/review.js";
+import { canonicalReviewDigest } from "../review-pr/planner.js";
+import type { FindingRoot } from "../review-pr/finding-root-ledger.js";
 import { makePullRequestCiGreen } from "../review-pr/fix-ci.js";
 import { RemediationSupervisor, verifyParentRevision } from "../orchestrate/remediation.js";
 import type { RemediationFindingInput } from "../orchestrate/remediation.js";
@@ -407,6 +409,25 @@ async function resumeTargetAdvanceWorkOnInternal(
           : {}), findingIssuePolicy: "all", reviewCycle: { current: 1, total: 1 },
     }, { runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
       ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}) });
+    const continuation = admitPostReviewContinuation({
+      run: reviewed.run, verdict: reviewed.verdict, packet: input.packet,
+      buildResult: recoveredFresh, pullRequest: published.pullRequest,
+      findingRootLedger: await loadCurrentFindingRootLedger({
+        run: reviewed.run, verdict: reviewed.verdict, packet: input.packet, pullRequest: published.pullRequest,
+      }, dependencies.artifacts),
+      currentRemediationCycles: 0,
+      maxRemediationCycles: 0,
+    });
+    if (continuation.action === "blocked") return { run: continuation.run, pullRequest: published.pullRequest, buildResult: recoveredFresh };
+    if (continuation.action === "budget-exhausted") {
+      const blocked = await blockForReviewFindings(
+        reviewed.run, published.pullRequest, reviewed.verdict, dependencies, continuation.reason,
+      );
+      return { run: blocked, pullRequest: published.pullRequest, buildResult: recoveredFresh };
+    }
+    if (continuation.action !== "complete") {
+      throw new Error(`Target recovery review cannot continue with action ${continuation.action}`);
+    }
     await persistTargetAdvanceCheckpoint({
       run: reviewed.run, packet: input.packet, buildResult: recoveredFresh, sourceBuildResult: input.buildResult,
       workspace: input.workspace, targetBranch: checkpoint.targetBranch, observedTargetSha: targetSha, phase: "reviewed",
@@ -618,6 +639,24 @@ async function resumeTargetAdvanceWorkOnInternal(
       : {}), findingIssuePolicy: "all", reviewCycle: { current: 1, total: 1 },
   }, { runtime: dependencies.runtime, host: dependencies.host, artifacts: dependencies.artifacts, runs: dependencies.runs,
     ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}) });
+  const continuation = admitPostReviewContinuation({
+    run: reviewed.run, verdict: reviewed.verdict, packet: input.packet,
+    buildResult: freshBuildResult, pullRequest: published.pullRequest,
+    findingRootLedger: await loadCurrentFindingRootLedger({
+      run: reviewed.run, verdict: reviewed.verdict, packet: input.packet, pullRequest: published.pullRequest,
+    }, dependencies.artifacts),
+    currentRemediationCycles: 0, maxRemediationCycles: 0,
+  });
+  if (continuation.action === "blocked") return { run: continuation.run, pullRequest: published.pullRequest, buildResult: freshBuildResult };
+  if (continuation.action === "budget-exhausted") {
+    const blocked = await blockForReviewFindings(
+      reviewed.run, published.pullRequest, reviewed.verdict, dependencies, continuation.reason,
+    );
+    return { run: blocked, pullRequest: published.pullRequest, buildResult: freshBuildResult };
+  }
+  if (continuation.action !== "complete") {
+    throw new Error(`Target recovery review cannot continue with action ${continuation.action}`);
+  }
   // Review is the final semantic phase of ordinary target recovery. Persist it
   // against the fresh receipts so a crash after review resumes remediation (or
   // merge) rather than replaying target movement from the stale source head.
@@ -2363,7 +2402,15 @@ async function continueBuildDelivery(
     run = reviewed.run;
     verdict = reviewed.verdict;
     priorVerdict = verdict;
-    if (isTerminalReviewCheckpoint(run, verdict)) return { run, pullRequest };
+    const continuation = admitPostReviewContinuation({
+      run, verdict, packet: input.packet, buildResult, pullRequest,
+      findingRootLedger: await loadCurrentFindingRootLedger({
+        run, verdict, packet: input.packet, pullRequest,
+      }, dependencies.artifacts),
+      currentRemediationCycles: cycle,
+      ...(input.maxRemediationCycles !== undefined ? { maxRemediationCycles: input.maxRemediationCycles } : {}),
+    });
+    if (continuation.action === "blocked") return { run: continuation.run, pullRequest };
     const scopeViolation = blockingFindingOutsidePacket(
       verdict, input.packet, undefined, input.scopeExpansion === "recursive",
     );
@@ -2371,6 +2418,10 @@ async function continueBuildDelivery(
       run = await blockForScopeViolation(
         run, pullRequest, input.packet, verdict, scopeViolation, input, dependencies,
       );
+      return { run, pullRequest };
+    }
+    if (continuation.action === "budget-exhausted") {
+      run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, continuation.reason);
       return { run, pullRequest };
     }
     if (run.state === "merging") {
@@ -2609,6 +2660,15 @@ export async function resumeWorkOn(
       run = reviewed.run;
       verdict = reviewed.verdict;
       priorVerdict = verdict;
+      const continuation = admitPostReviewContinuation({
+        run, verdict, packet: input.packet, buildResult, pullRequest,
+        findingRootLedger: await loadCurrentFindingRootLedger({
+          run, verdict, packet: input.packet, pullRequest,
+        }, dependencies.artifacts),
+        currentRemediationCycles: cycle,
+        ...(input.maxRemediationCycles !== undefined ? { maxRemediationCycles: input.maxRemediationCycles } : {}),
+      });
+      if (continuation.action === "blocked") return { run: continuation.run, pullRequest };
       const scopeViolation = blockingFindingOutsidePacket(
         verdict, input.packet, undefined, input.scopeExpansion === "recursive",
       );
@@ -2739,13 +2799,52 @@ export async function resumeReviewWorkOn(
     throw new Error("Remediation resume requires an interrupted remediation or remediation-budget blocked run");
   }
   assertRunTargetsBranch(input.run, input.baseBranch);
-  if (input.priorVerdict.payload.disposition !== "request_changes"
-    || input.priorVerdict.payload.headSha !== input.buildResult.payload.headSha
-    || input.pullRequest.headSha !== input.buildResult.payload.headSha
-    || input.pullRequest.baseBranch !== input.baseBranch) {
-    throw new Error("Review resume requires one matching request-changes verdict, verified Build Result, and open PR head");
-  }
+  const exhaustedCycleCount = Number(/^Remediation budget exhausted after (\d+) cycle\(s\)$/i
+    .exec(input.run.blockedReason ?? "")?.[1] ?? 0);
+  let cycle = Math.max(0, input.priorRemediationCycles ?? (interruptedRemediation ? 1 : exhaustedCycleCount));
+  const remediationLimit = input.maxRemediationCycles ?? 2;
   let run = input.run;
+  if (interruptedRemediation) {
+    // A retained remediating run is already authorized for the remediation
+    // represented by its prior verdict. Admit that exact checkpoint before
+    // advancing the run or dispatching another agent.
+    const continuation = admitPostReviewContinuation({
+      run: input.run,
+      verdict: input.priorVerdict,
+      packet: input.packet,
+      buildResult: input.buildResult,
+      pullRequest: input.pullRequest,
+      findingRootLedger: await loadCurrentFindingRootLedger({
+        run: input.run, verdict: input.priorVerdict, packet: input.packet, pullRequest: input.pullRequest,
+      }, dependencies.artifacts),
+      currentRemediationCycles: Math.max(0, cycle - 1),
+      ...(input.maxRemediationCycles !== undefined ? { maxRemediationCycles: input.maxRemediationCycles } : {}),
+    });
+    if (continuation.action === "blocked") return { run: continuation.run, pullRequest: input.pullRequest };
+    if (continuation.action === "budget-exhausted") {
+      run = await blockForReviewFindings(
+        run, input.pullRequest, input.priorVerdict, dependencies, continuation.reason,
+      );
+      return { run, pullRequest: input.pullRequest };
+    }
+    if (continuation.action === "complete") {
+      const completed = await completeWorkItem({
+        run,
+        pullRequest: input.pullRequest,
+        verdict: input.priorVerdict,
+        autoMerge: input.autoMerge ?? false,
+        ...(dependencies.ciPolicy ? { ciPolicy: dependencies.ciPolicy } : {}),
+        ...(input.batchMembers?.length ? { childIssues: input.batchMembers } : {}),
+        ...(input.batchMemberContracts !== undefined ? { memberContracts: input.batchMemberContracts } : {}),
+        ...(input.signal !== undefined ? { signal: input.signal } : {}),
+      }, dependencies);
+      return { run: completed.run, pullRequest: input.pullRequest, awaitingHuman: completed.awaitingHuman };
+    }
+    if (continuation.action !== "remediate") {
+      throw new Error("Interrupted remediation requires a controller-admitted remediation continuation");
+    }
+    cycle = continuation.cycle;
+  }
   let retainWorkspaceForRecovery = false;
   const resumed = transition(run, budgetBlocked ? "RESUME_REVIEW" : "RESUME_REMEDIATION", {
     reason: budgetBlocked
@@ -2764,10 +2863,6 @@ export async function resumeReviewWorkOn(
   let buildResult = input.buildResult;
   let pullRequest = input.pullRequest;
   let verdict = input.priorVerdict;
-  const exhaustedCycleCount = Number(/^Remediation budget exhausted after (\d+) cycle\(s\)$/i
-    .exec(input.run.blockedReason ?? "")?.[1] ?? 0);
-  let cycle = Math.max(0, input.priorRemediationCycles ?? (interruptedRemediation ? 1 : exhaustedCycleCount));
-  const remediationLimit = input.maxRemediationCycles ?? 2;
   try {
     if (budgetBlocked) {
       const reassessed = await reviewPullRequest({
@@ -2788,7 +2883,14 @@ export async function resumeReviewWorkOn(
       });
       run = reassessed.run;
       verdict = reassessed.verdict;
-      if (isTerminalReviewCheckpoint(run, verdict)) return { run, pullRequest };
+      const continuation = admitPostReviewContinuation({
+        run, verdict, packet: input.packet, buildResult, pullRequest,
+        findingRootLedger: await loadCurrentFindingRootLedger({
+          run, verdict, packet: input.packet, pullRequest,
+        }, dependencies.artifacts),
+        currentRemediationCycles: cycle, maxRemediationCycles: remediationLimit,
+      });
+      if (continuation.action === "blocked") return { run: continuation.run, pullRequest };
       const scopeViolation = blockingFindingOutsidePacket(
         verdict, input.packet, undefined, input.scopeExpansion === "recursive",
       );
@@ -2796,6 +2898,10 @@ export async function resumeReviewWorkOn(
         run = await blockForScopeViolation(
           run, pullRequest, input.packet, verdict, scopeViolation, input, dependencies,
         );
+        return { run, pullRequest };
+      }
+      if (continuation.action === "budget-exhausted") {
+        run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, continuation.reason);
         return { run, pullRequest };
       }
       if (run.state === "merging") {
@@ -2872,6 +2978,14 @@ export async function resumeReviewWorkOn(
       });
       run = reviewed.run;
       verdict = reviewed.verdict;
+      const continuation = admitPostReviewContinuation({
+        run, verdict, packet: input.packet, buildResult, pullRequest,
+        findingRootLedger: await loadCurrentFindingRootLedger({
+          run, verdict, packet: input.packet, pullRequest,
+        }, dependencies.artifacts),
+        currentRemediationCycles: cycle, maxRemediationCycles: remediationLimit,
+      });
+      if (continuation.action === "blocked") return { run: continuation.run, pullRequest };
       const scopeViolation = blockingFindingOutsidePacket(
         verdict, input.packet, undefined, input.scopeExpansion === "recursive",
       );
@@ -2879,6 +2993,10 @@ export async function resumeReviewWorkOn(
         run = await blockForScopeViolation(
           run, pullRequest, input.packet, verdict, scopeViolation, input, dependencies,
         );
+        return { run, pullRequest };
+      }
+      if (continuation.action === "budget-exhausted") {
+        run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, continuation.reason);
         return { run, pullRequest };
       }
       if (run.state === "merging") break;
@@ -3041,9 +3159,22 @@ export async function resumeExpandedReviewWorkOn(
     runs: dependencies.runs,
     ...(dependencies.onAgentEvent !== undefined ? { onAgentEvent: dependencies.onAgentEvent } : {}),
   });
-  if (isTerminalReviewCheckpoint(reviewed.run, reviewed.verdict)) {
-    return { run: reviewed.run, pullRequest: input.pullRequest };
-  }
+  const continuation = admitPostReviewContinuation({
+    run: reviewed.run,
+    verdict: reviewed.verdict,
+    packet: input.packet,
+    buildResult: proof.buildResult,
+    pullRequest: { ...input.pullRequest, headSha: proof.buildResult.payload.headSha },
+    findingRootLedger: await loadCurrentFindingRootLedger({
+      run: reviewed.run,
+      verdict: reviewed.verdict,
+      packet: input.packet,
+      pullRequest: { ...input.pullRequest, headSha: proof.buildResult.payload.headSha },
+    }, dependencies.artifacts),
+    currentRemediationCycles: 0,
+    maxRemediationCycles: 0,
+  });
+  if (continuation.action === "blocked") return { run: continuation.run, pullRequest: input.pullRequest };
   const expandedViolation = blockingFindingOutsidePacket(
     reviewed.verdict, input.packet, input.checkpoint, input.scopeExpansion === "recursive",
   );
@@ -3172,7 +3303,15 @@ export async function resumePublicationWorkOn(
       run = resumedProjectionReview.run;
       verdict = resumedProjectionReview.verdict;
       priorVerdict = verdict;
-      if (isTerminalReviewCheckpoint(run, verdict)) return { run, pullRequest };
+      const continuation = admitPostReviewContinuation({
+        run, verdict, packet: input.packet, buildResult, pullRequest,
+        findingRootLedger: await loadCurrentFindingRootLedger({
+          run, verdict, packet: input.packet, pullRequest,
+        }, dependencies.artifacts),
+        currentRemediationCycles: cycle,
+        ...(input.maxRemediationCycles !== undefined ? { maxRemediationCycles: input.maxRemediationCycles } : {}),
+      });
+      if (continuation.action === "blocked") return { run: continuation.run, pullRequest };
     }
     while (true) {
       if (resumedProjectionReview) {
@@ -3196,6 +3335,15 @@ export async function resumePublicationWorkOn(
         run = reviewed.run;
         verdict = reviewed.verdict;
         priorVerdict = verdict;
+        const continuation = admitPostReviewContinuation({
+          run, verdict, packet: input.packet, buildResult, pullRequest,
+          findingRootLedger: await loadCurrentFindingRootLedger({
+            run, verdict, packet: input.packet, pullRequest,
+          }, dependencies.artifacts),
+          currentRemediationCycles: cycle,
+          ...(input.maxRemediationCycles !== undefined ? { maxRemediationCycles: input.maxRemediationCycles } : {}),
+        });
+        if (continuation.action === "blocked") return { run: continuation.run, pullRequest };
       }
       const scopeViolation = blockingFindingOutsidePacket(
         verdict, input.packet, undefined, input.scopeExpansion === "recursive",
@@ -3293,6 +3441,7 @@ export async function resumeCompletionWorkOn(
     run: RunState;
     verdict: DurableArtifact<"ReviewVerdict">;
     pullRequest: PullRequestSnapshot;
+    packet?: DurableArtifact<"BuildPacket">;
     autoMerge?: boolean;
     batchMembers?: readonly number[];
     batchMemberContracts?: readonly BatchMemberContract[];
@@ -3303,10 +3452,27 @@ export async function resumeCompletionWorkOn(
 ): Promise<WorkOnResult> {
   dependencies = guardMutationBoundaries(dependencies);
   if (input.run.state !== "merging" && input.run.state !== "closing") throw new Error(`Completion resume requires merging or closing state, found ${input.run.state}`);
-  if (input.verdict.payload.disposition !== "approve"
-    || input.verdict.payload.headSha !== input.pullRequest.headSha) {
-    throw new Error("Completion resume requires an approving verdict for the current pull request head");
+  const expectedBaseBranches = [input.run.targetBranch, input.run.mergeAttempt?.baseBranch]
+    .filter((branch): branch is string => branch !== undefined && branch.trim().length > 0);
+  if (expectedBaseBranches.length === 0 || expectedBaseBranches.some((branch) => input.pullRequest.baseBranch !== branch)) {
+    throw new Error("Completion resume requires the pull request base branch to match controller-owned target identity");
   }
+  const continuation = admitPostReviewContinuation({
+    run: input.run,
+    verdict: input.verdict,
+    ...(input.packet !== undefined ? { packet: input.packet } : {}),
+    pullRequest: input.pullRequest,
+    ...(input.packet !== undefined
+      ? {
+        findingRootLedger: await loadCurrentFindingRootLedger({
+          run: input.run, verdict: input.verdict, packet: input.packet, pullRequest: input.pullRequest,
+        }, dependencies.artifacts),
+      }
+      : {}),
+    allowClosingCompletion: true,
+  });
+  if (continuation.action === "blocked") return { run: continuation.run, pullRequest: input.pullRequest };
+  if (continuation.action !== "complete") throw new Error("Completion resume requires an approving verdict admitted for merging");
   let run = input.run;
   let retainWorkspaceForRecovery = false;
   try {
@@ -3484,6 +3650,14 @@ export async function resumeConflictRecoveryWorkOn(
       run = reviewed.run;
       verdict = reviewed.verdict;
       priorVerdict = verdict;
+      const continuation = admitPostReviewContinuation({
+        run, verdict, packet: input.packet, buildResult, pullRequest,
+        findingRootLedger: await loadCurrentFindingRootLedger({
+          run, verdict, packet: input.packet, pullRequest,
+        }, dependencies.artifacts),
+        currentRemediationCycles: cycle, maxRemediationCycles: remediationLimit,
+      });
+      if (continuation.action === "blocked") return { run: continuation.run, pullRequest };
       const scopeViolation = blockingFindingOutsidePacket(
         verdict,
         input.packet,
@@ -3492,6 +3666,10 @@ export async function resumeConflictRecoveryWorkOn(
       );
       if (scopeViolation) {
         run = await blockForScopeViolation(run, pullRequest, input.packet, verdict, scopeViolation, input, dependencies);
+        return { run, pullRequest };
+      }
+      if (continuation.action === "budget-exhausted") {
+        run = await blockForReviewFindings(run, pullRequest, verdict, dependencies, continuation.reason);
         return { run, pullRequest };
       }
       if (run.state === "merging") break;
@@ -3589,11 +3767,297 @@ export async function resumeConflictRecoveryWorkOn(
   }
 }
 
-function isTerminalReviewCheckpoint(
+const OPEN_FINDING_ROOT_STATES: ReadonlySet<FindingRoot["state"]> = new Set([
+  "open", "fix-attempted", "regressed",
+]);
+
+type FindingRootLedger = DurableArtifact<"FindingRootLedger">;
+
+interface FindingRootLedgerAuthorityInput {
+  run: RunState;
+  verdict: DurableArtifact<"ReviewVerdict">;
+  packet?: DurableArtifact<"BuildPacket"> | undefined;
+  pullRequest?: PullRequestSnapshot | undefined;
+}
+
+/**
+ * Load the controller ledger attached to the current review checkpoint. The
+ * repository is authoritative on resume; run artifact IDs are only used to
+ * ensure a referenced ledger cannot silently fall back to an older projection.
+ */
+async function loadCurrentFindingRootLedger(
+  input: FindingRootLedgerAuthorityInput,
+  artifacts: ArtifactRepository,
+): Promise<FindingRootLedger | undefined> {
+  if (input.verdict.payload.disposition !== "request_changes" || input.run.state === "blocked") return undefined;
+  const pullRequestNumber = input.pullRequest?.number ?? input.verdict.subject.pr;
+  if (pullRequestNumber === undefined) return undefined;
+  const subject = {
+    repo: input.run.subject.repo,
+    ...(input.run.subject.issue !== undefined ? { issue: input.run.subject.issue } : {}),
+    pr: pullRequestNumber,
+  };
+  const ledgers = (await artifacts.list(subject, "FindingRootLedger"))
+    .filter((artifact): artifact is FindingRootLedger => artifact.kind === "FindingRootLedger");
+  const matching = ledgers.filter((ledger) => findingRootLedgerIdentityMatches(ledger, input.run, pullRequestNumber));
+  const referencedIds = input.run.artifactIds.FindingRootLedger ?? [];
+  const referencedId = referencedIds.at(-1);
+  if (referencedId !== undefined) {
+    const referenced = ledgers.find((ledger) => ledger.id === referencedId);
+    if (!referenced || !findingRootLedgerIdentityMatches(referenced, input.run, pullRequestNumber)) {
+      throw new Error("Current run references a foreign or missing FindingRootLedger authority");
+    }
+    assertFindingRootLedgerLineage(matching);
+    if (referenced.payload.headSha.toLowerCase() !== input.verdict.payload.headSha.toLowerCase()) {
+      throw new Error("FindingRootLedger authority is stale for the reviewed head");
+    }
+    const current = currentFindingRootLedgerAtHead(matching, input.verdict.payload.headSha);
+    if (current.id !== referenced.id) {
+      throw new Error("Current run references a stale FindingRootLedger epoch");
+    }
+    return referenced;
+  }
+  if (matching.length === 0) {
+    // A ledger for this route but a different head is useful evidence that the
+    // retained checkpoint is stale; do not silently treat it as absent.
+    const routeLedgers = ledgers.filter((ledger) => ledger.runId === input.run.runId
+      && ledger.subject.repo.trim().toLowerCase() === input.run.subject.repo.trim().toLowerCase()
+      && ledger.subject.issue === input.run.subject.issue
+      && ledger.subject.pr === pullRequestNumber);
+    if (routeLedgers.length > 0) {
+      throw new Error("FindingRootLedger authority is stale for the reviewed head");
+    }
+    return undefined;
+  }
+  assertFindingRootLedgerLineage(matching);
+  return currentFindingRootLedgerAtHead(matching, input.verdict.payload.headSha);
+}
+
+function findingRootLedgerIdentityMatches(
+  ledger: FindingRootLedger,
   run: RunState,
-  verdict: DurableArtifact<"ReviewVerdict">,
+  pullRequestNumber: number,
 ): boolean {
-  return run.state === "blocked" || verdict.payload.disposition === "blocked";
+  return ledger.producer.role === "controller"
+    && ledger.runId === run.runId
+    && ledger.subject.repo.trim().toLowerCase() === run.subject.repo.trim().toLowerCase()
+    && ledger.subject.issue === run.subject.issue
+    && ledger.subject.pr === pullRequestNumber
+    && ledger.payload.checkpoint === "finding-root-ledger"
+    && ledger.payload.pullRequest === pullRequestNumber;
+}
+
+function assertFindingRootLedgerLineage(ledgers: readonly FindingRootLedger[]): void {
+  const byId = new Map(ledgers.map((ledger) => [ledger.id, ledger]));
+  for (const ledger of ledgers) {
+    if (!Number.isSafeInteger(ledger.payload.epoch) || ledger.payload.epoch < 1) {
+      throw new Error(`FindingRootLedger ${ledger.id} has an invalid epoch`);
+    }
+    if (ledger.payload.epoch === 1) {
+      if (ledger.payload.supersedes !== undefined) {
+        throw new Error(`FindingRootLedger ${ledger.id} has invalid initial lineage`);
+      }
+      continue;
+    }
+    const parent = ledger.payload.supersedes === undefined
+      ? undefined
+      : byId.get(ledger.payload.supersedes);
+    if (!parent || parent.payload.epoch + 1 !== ledger.payload.epoch) {
+      throw new Error(`FindingRootLedger ${ledger.id} has broken supersedes lineage`);
+    }
+  }
+}
+
+function currentFindingRootLedgerAtHead(
+  ledgers: readonly FindingRootLedger[],
+  headSha: string,
+): FindingRootLedger {
+  const atHead = ledgers.filter((ledger) => ledger.payload.headSha.toLowerCase() === headSha.toLowerCase());
+  if (atHead.length === 0) throw new Error("FindingRootLedger authority is stale for the reviewed head");
+  const highestEpoch = Math.max(...atHead.map((ledger) => ledger.payload.epoch));
+  const current = atHead.filter((ledger) => ledger.payload.epoch === highestEpoch);
+  if (current.length !== 1) throw new Error("FindingRootLedger authority is ambiguous at the reviewed head");
+  return current[0]!;
+}
+
+function assertFindingRootLedgerAuthority(
+  input: FindingRootLedgerAuthorityInput & { findingRootLedger?: FindingRootLedger | undefined },
+): void {
+  const { run, verdict, packet, pullRequest, findingRootLedger } = input;
+  if (!findingRootLedger) {
+    throw new Error("request_changes ReviewVerdict requires controller-owned FindingRootLedger authority");
+  }
+  const expectedPullRequest = pullRequest?.number ?? verdict.subject.pr;
+  if (expectedPullRequest === undefined
+    || !findingRootLedgerIdentityMatches(findingRootLedger, run, expectedPullRequest)
+    || findingRootLedger.payload.headSha.toLowerCase() !== verdict.payload.headSha.toLowerCase()) {
+    throw new Error("FindingRootLedger authority does not match the repository, run, issue, PR, or reviewed head");
+  }
+  if (!packet) {
+    throw new Error("request_changes ReviewVerdict requires the exact Build Packet lineage");
+  }
+  const context = verdict.payload.reviewPlan?.context;
+  if (!context
+    || context.runId !== run.runId
+    || context.repo.trim().toLowerCase() !== run.subject.repo.trim().toLowerCase()
+    || context.issue !== run.subject.issue
+    || context.pullRequest !== expectedPullRequest
+    || context.packetId !== packet.id
+    || context.packetDigest !== canonicalReviewDigest(packet.payload)
+    || context.deliveryRunId !== run.runId
+    || context.reviewedHeadSha?.toLowerCase() !== verdict.payload.headSha.toLowerCase()) {
+    throw new Error("FindingRootLedger authority is not bound to the exact Build Packet lineage");
+  }
+  const rootsById = new Map(findingRootLedger.payload.roots.map((root) => [root.rootId, root]));
+  if (rootsById.size !== findingRootLedger.payload.roots.length) {
+    throw new Error("FindingRootLedger authority contains duplicate root IDs");
+  }
+  const acceptedRoots = verdict.payload.findings.filter((finding) =>
+    typeof finding.rootId === "string"
+      && finding.rootId.trim().length > 0
+      && finding.scopeDisposition !== "rejected"
+      && finding.scopeDisposition !== "follow_up"
+      && (finding.mustFix ?? finding.blocking),
+  );
+  for (const finding of acceptedRoots) {
+    const root = rootsById.get(finding.rootId!);
+    if (!root || !root.findingIds.includes(finding.id)) {
+      throw new Error(`FindingRootLedger authority does not contain accepted finding root ${finding.rootId}`);
+    }
+    if (!OPEN_FINDING_ROOT_STATES.has(root.state)
+      || root.representative.id !== finding.id
+      || root.representative.rootId !== root.rootId
+      || root.representative.scopeDisposition === "rejected"
+      || root.representative.scopeDisposition === "follow_up"
+      || !(root.representative.mustFix ?? root.representative.blocking)) {
+      throw new Error(`FindingRootLedger root ${root.rootId} is closed or lacks an accepted authoritative disposition`);
+    }
+  }
+}
+
+export type PostReviewContinuation =
+  | { action: "blocked"; run: RunState; verdict: DurableArtifact<"ReviewVerdict">; reason: string }
+  | { action: "remediate"; run: RunState; verdict: DurableArtifact<"ReviewVerdict">; cycle: number }
+  | { action: "complete"; run: RunState; verdict: DurableArtifact<"ReviewVerdict"> }
+  | { action: "budget-exhausted"; run: RunState; verdict: DurableArtifact<"ReviewVerdict">; reason: string };
+
+/**
+ * The only admission point after a review or durable finding-projection resume.
+ * This function is deliberately pure: it validates the durable identity chain
+ * before callers can inspect findings or perform workspace/agent/publication
+ * work. In particular, findings never imply remediation; the verdict and the
+ * state-machine transition remain the authority.
+ */
+export function admitPostReviewContinuation(input: {
+  run: RunState;
+  verdict: DurableArtifact<"ReviewVerdict">;
+  packet?: DurableArtifact<"BuildPacket">;
+  buildResult?: DurableArtifact<"BuildResult">;
+  pullRequest?: PullRequestSnapshot;
+  findingRootLedger?: FindingRootLedger | undefined;
+  currentRemediationCycles?: number;
+  maxRemediationCycles?: number;
+  /** Completion recovery may resume after merge has already entered closing. */
+  allowClosingCompletion?: boolean;
+}): PostReviewContinuation {
+  const { run, verdict, packet, buildResult, pullRequest, findingRootLedger } = input;
+  const disposition = verdict.payload.disposition;
+  if (disposition !== "blocked" && disposition !== "request_changes" && disposition !== "approve") {
+    throw new Error("Post-review continuation received unknown ReviewVerdict disposition; refusing mutation");
+  }
+  if (!verdict.payload.headSha || !/^[0-9a-f]{7,64}$/i.test(verdict.payload.headSha)) {
+    throw new Error("Post-review continuation requires a valid ReviewVerdict head SHA");
+  }
+  if (verdict.runId !== run.runId || verdict.subject.repo.toLowerCase() !== run.subject.repo.toLowerCase()
+    || verdict.subject.issue !== run.subject.issue
+    || (run.subject.pr !== undefined && verdict.subject.pr !== run.subject.pr)) {
+    throw new Error("Post-review continuation ReviewVerdict identity does not match the admitted run");
+  }
+  if (packet !== undefined && (packet.runId !== run.runId || packet.subject.repo.toLowerCase() !== run.subject.repo.toLowerCase()
+    || packet.subject.issue !== run.subject.issue)) {
+    throw new Error("Post-review continuation Build Packet identity does not match the admitted run");
+  }
+  if (buildResult !== undefined) {
+    if (buildResult.runId !== run.runId || buildResult.subject.repo.toLowerCase() !== run.subject.repo.toLowerCase()
+      || buildResult.subject.issue !== run.subject.issue || buildResult.payload.headSha.toLowerCase() !== verdict.payload.headSha.toLowerCase()) {
+      throw new Error("Post-review continuation Build Result identity does not match the ReviewVerdict");
+    }
+    if (pullRequest !== undefined
+      && (buildResult.payload.branch !== pullRequest.headBranch
+        || (buildResult.payload.targetBranch !== undefined && buildResult.payload.targetBranch !== pullRequest.baseBranch))) {
+      throw new Error("Post-review continuation Build Result branch/base identity does not match the pull request");
+    }
+  }
+  if (pullRequest !== undefined) {
+    if (verdict.subject.pr !== pullRequest.number
+      || pullRequest.repo.toLowerCase() !== run.subject.repo.toLowerCase()
+      || pullRequest.headSha.toLowerCase() !== verdict.payload.headSha.toLowerCase()
+      || (verdict.payload.headBranch !== undefined && verdict.payload.headBranch !== pullRequest.headBranch)
+      || (verdict.payload.baseBranch !== undefined && verdict.payload.baseBranch !== pullRequest.baseBranch)) {
+      throw new Error("Post-review continuation PR/head identity does not match the ReviewVerdict");
+    }
+  }
+  if (run.headSha !== undefined && run.headSha.toLowerCase() !== verdict.payload.headSha.toLowerCase()) {
+    throw new Error("Post-review continuation run head does not match the ReviewVerdict");
+  }
+  if (disposition === "blocked") {
+    if (run.state !== "blocked") {
+      throw new Error(`Blocked ReviewVerdict requires blocked run state, found ${run.state}`);
+    }
+    const warningReason = verdict.payload.warnings
+      ?.map((warning) => warning.trim())
+      .filter((warning) => warning.length > 0)
+      .join("; ");
+    return {
+      action: "blocked",
+      run,
+      verdict,
+      reason: warningReason || run.blockedReason?.trim() || "ReviewVerdict disposition=blocked",
+    };
+  }
+  if (run.state === "blocked") {
+    if (disposition === "approve") {
+      throw new Error("Contradictory post-review state: approve ReviewVerdict with blocked run");
+    }
+    return {
+      action: "blocked",
+      run,
+      verdict,
+      reason: run.blockedReason ?? `Durable run ${run.runId} is blocked; preserving its review checkpoint`,
+    };
+  }
+  if (disposition === "approve") {
+    if (run.state !== "merging" && !(run.state === "closing" && input.allowClosingCompletion === true)) {
+      throw new Error(`Approve ReviewVerdict requires merging state, found ${run.state}`);
+    }
+    return { action: "complete", run, verdict };
+  }
+  if (run.state !== "remediating") {
+    throw new Error(`request_changes ReviewVerdict requires remediating state, found ${run.state}`);
+  }
+  const acceptedRoots = verdict.payload.findings.filter((finding) =>
+    typeof finding.rootId === "string"
+      && finding.rootId.trim().length > 0
+      && finding.scopeDisposition !== "rejected"
+      && finding.scopeDisposition !== "follow_up"
+      && (finding.mustFix ?? finding.blocking));
+  if (!acceptedRoots.length) {
+    throw new Error("request_changes ReviewVerdict has no controller-accepted remediation roots");
+  }
+  assertFindingRootLedgerAuthority({
+    run, verdict, packet, pullRequest, findingRootLedger,
+  });
+  const cycle = (input.currentRemediationCycles ?? 0) + 1;
+  const limit = input.maxRemediationCycles ?? 2;
+  if (!Number.isSafeInteger(cycle) || cycle > limit) {
+    return {
+      action: "budget-exhausted",
+      run,
+      verdict,
+      reason: `Remediation budget exhausted after ${Math.max(0, cycle - 1)} cycle(s)`,
+    };
+  }
+  return { action: "remediate", run, verdict, cycle };
 }
 
 function blockingFindingOutsidePacket(

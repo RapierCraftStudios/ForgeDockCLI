@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, it } from "node:test";
 import { AdvertisedRemoteHeadMismatchError } from "../../core/ports/git-workspace.js";
-import { GitWorktreeManager } from "./git-worktree.js";
+import { GitInvestigationSnapshotManager, GitWorktreeManager } from "./git-worktree.js";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -146,6 +146,68 @@ async function targetRefreshFixture(): Promise<{
 async function removeTargetRefreshFixture(fixture: Awaited<ReturnType<typeof targetRefreshFixture>>): Promise<void> {
   try { await fixture.manager.remove(fixture.workspace); }
   finally { rmSync(fixture.root, { recursive: true, force: true }); }
+}
+
+async function investigationSnapshotFixture(): Promise<{
+  root: string;
+  repo: string;
+  source: string;
+  remote: string;
+  mainSha: string;
+  targetSha: string;
+  foreignSha: string;
+}> {
+  const root = mkdtempSync(join(tmpdir(), "forgedock-investigation-snapshot-"));
+  const seed = join(root, "seed");
+  const remote = join(root, "remote.git");
+  const foreign = join(root, "foreign");
+  execFileSync("git", ["init", "--bare", remote], { stdio: "ignore" });
+  execFileSync("git", ["init", seed], { stdio: "ignore" });
+  git(seed, "config", "user.name", "ForgeDock Test");
+  git(seed, "config", "user.email", "forgedock@example.invalid");
+  writeFileSync(join(seed, "README.md"), "main\n");
+  git(seed, "add", "README.md");
+  git(seed, "commit", "-m", "main");
+  git(seed, "branch", "-M", "main");
+  git(seed, "remote", "add", "origin", remote);
+  git(seed, "push", "origin", "main");
+  const mainSha = git(seed, "rev-parse", "HEAD");
+  git(seed, "checkout", "--orphan", "staging");
+  git(seed, "rm", "-rf", ".");
+  writeFileSync(join(seed, "STAGING.md"), "staging\n");
+  git(seed, "add", "STAGING.md");
+  git(seed, "commit", "-m", "staging");
+  const targetSha = git(seed, "rev-parse", "HEAD");
+  git(seed, "push", "origin", "staging");
+  const source = join(root, "source");
+  execFileSync("git", ["clone", "--no-local", "--single-branch", "--branch", "main", remote, source], { stdio: "ignore" });
+  // Snapshot admission requires an exact GitHub repository identity.  Keep
+  // fetches local through Git's URL rewrite so the fixture remains offline.
+  git(source, "remote", "set-url", "origin", "https://github.com/owner/repo.git");
+  git(source, "config", `url.${remote}.insteadOf`, "https://github.com/owner/repo.git");
+  git(source, "config", "user.name", "ForgeDock Test");
+  git(source, "config", "user.email", "forgedock@example.invalid");
+  execFileSync("git", ["init", foreign], { stdio: "ignore" });
+  git(foreign, "config", "user.name", "ForgeDock Test");
+  git(foreign, "config", "user.email", "forgedock@example.invalid");
+  writeFileSync(join(foreign, "FOREIGN.md"), "foreign\n");
+  git(foreign, "add", "FOREIGN.md");
+  git(foreign, "commit", "-m", "foreign");
+  const foreignSha = git(foreign, "rev-parse", "HEAD");
+  return { root, repo: source, source, remote, mainSha, targetSha, foreignSha };
+}
+
+function removeInvestigationSnapshotFixture(fixture: { root: string }): void {
+  rmSync(fixture.root, { recursive: true, force: true });
+}
+
+function installPostFetchSentinelHook(repo: string, sentinel: string): void {
+  const hooks = resolve(repo, git(repo, "rev-parse", "--git-path", "hooks"));
+  mkdirSync(hooks, { recursive: true });
+  const quotedSentinel = `'${sentinel.replaceAll("'", "'\\''")}'`;
+  writeFileSync(join(hooks, "post-fetch"), `#!/bin/sh\nprintf 'post-fetch-ran\\n' > ${quotedSentinel}\n`);
+  chmodSync(join(hooks, "post-fetch"), 0o755);
+  git(repo, "config", "core.hooksPath", hooks);
 }
 
 describe("isolated Git worktrees", () => {
@@ -1215,6 +1277,244 @@ describe("isolated Git worktrees", () => {
       assert.equal(git(parentSwapped.workspace.path, "status", "--porcelain"), "");
     } finally {
       await removeRemoteBaseIntegrationFixture(parentSwapped);
+    }
+  });
+});
+
+describe("investigation snapshot worktrees", () => {
+  it("canonicalizes a linked source checkout to the Git common repository root", async () => {
+    const fixture = await investigationSnapshotFixture();
+    const linked = join(fixture.root, "linked");
+    try {
+      git(fixture.source, "remote", "set-url", "origin", "https://github.com/owner/repo.git");
+      git(fixture.source, "worktree", "add", "--detach", linked, fixture.mainSha);
+      const manager = new GitInvestigationSnapshotManager(linked, join(fixture.root, "snapshots"));
+      const snapshot = await manager.acquire({ repository: "owner/repo", repositoryRoot: linked, targetBranch: "main", baseSha: fixture.mainSha });
+      assert.equal(snapshot.identity.repositoryRoot, git(fixture.source, "rev-parse", "--show-toplevel"));
+      assert.notEqual(snapshot.identity.repositoryRoot, git(linked, "rev-parse", "--show-toplevel"));
+      await manager.validate(snapshot);
+      await manager.release(snapshot);
+      assert.doesNotMatch(git(fixture.source, "worktree", "list", "--porcelain"), /snapshots/);
+    } finally {
+      removeInvestigationSnapshotFixture(fixture);
+    }
+  });
+
+  it("hydrates a remote-only target commit into FETCH_HEAD without moving the source checkout", async () => {
+    const fixture = await investigationSnapshotFixture();
+    try {
+      const manager = new GitInvestigationSnapshotManager(fixture.source, join(fixture.root, "snapshots"));
+      const beforeHead = git(fixture.source, "rev-parse", "HEAD");
+      const beforeBranch = git(fixture.source, "branch", "--show-current");
+      const snapshots = await Promise.all(Array.from({ length: 4 }, () => manager.acquire({
+        repository: "owner/repo",
+        repositoryRoot: fixture.source,
+        targetBranch: "staging",
+        baseSha: fixture.targetSha,
+      })));
+      assert.deepEqual(new Set(snapshots.map((snapshot) => snapshot.path)).size, 1);
+      assert.equal(git(snapshots[0]!.path, "rev-parse", "HEAD"), fixture.targetSha);
+      assert.equal(git(fixture.source, "rev-parse", "FETCH_HEAD"), fixture.targetSha);
+      assert.equal(git(fixture.source, "rev-parse", "HEAD"), beforeHead);
+      assert.equal(git(fixture.source, "branch", "--show-current"), beforeBranch);
+      await manager.release(snapshots[0]!);
+    } finally {
+      removeInvestigationSnapshotFixture(fixture);
+    }
+  });
+
+  it("does not execute a repository post-fetch hook while hydrating a snapshot", async () => {
+    const fixture = await investigationSnapshotFixture();
+    try {
+      const sentinel = join(fixture.root, "post-fetch-ran");
+      installPostFetchSentinelHook(fixture.source, sentinel);
+      const manager = new GitInvestigationSnapshotManager(fixture.source, join(fixture.root, "snapshots"));
+      const snapshot = await manager.acquire({
+        repository: "owner/repo",
+        repositoryRoot: fixture.source,
+        targetBranch: "staging",
+        baseSha: fixture.targetSha,
+      });
+      assert.equal(existsSync(sentinel), false, "snapshot hydration must use a trusted empty hooks path");
+      await manager.release(snapshot);
+    } finally {
+      removeInvestigationSnapshotFixture(fixture);
+    }
+  });
+
+  it("ignores a repository-controlled pre-existing hooks symlink", { skip: process.platform === "win32" }, async () => {
+    const fixture = await investigationSnapshotFixture();
+    try {
+      const sentinel = join(fixture.root, "symlink-hook-ran");
+      const maliciousHooks = join(fixture.root, "malicious-hooks");
+      mkdirSync(maliciousHooks, { recursive: true });
+      const quotedSentinel = `'${sentinel.replaceAll("'", "'\\''")}'`;
+      writeFileSync(join(maliciousHooks, "post-fetch"), `#!/bin/sh\nprintf 'symlink-hook-ran\\n' > ${quotedSentinel}\n`);
+      chmodSync(join(maliciousHooks, "post-fetch"), 0o755);
+      const forgedock = join(fixture.source, ".forgedock");
+      mkdirSync(forgedock, { recursive: true });
+      const repositoryHooks = join(forgedock, "empty-hooks");
+      symlinkSync(maliciousHooks, repositoryHooks, "dir");
+      git(fixture.source, "config", "core.hooksPath", repositoryHooks);
+
+      const manager = new GitInvestigationSnapshotManager(fixture.source, join(fixture.root, "snapshots"));
+      const snapshot = await manager.acquire({
+        repository: "owner/repo",
+        repositoryRoot: fixture.source,
+        targetBranch: "staging",
+        baseSha: fixture.targetSha,
+      });
+      assert.equal(existsSync(sentinel), false, "a repository hooks symlink must not become the trusted hooks path");
+      assert.equal(lstatSync(repositoryHooks).isSymbolicLink(), true);
+      await manager.release(snapshot);
+    } finally {
+      removeInvestigationSnapshotFixture(fixture);
+    }
+  });
+  it("rejects missing, malformed, wrong-host, and wrong-repository origins for local commits", async () => {
+    const cases: Array<{ name: string; configure: (repo: string) => void; message: RegExp }> = [
+      {
+        name: "missing origin",
+        configure: (repo) => { git(repo, "remote", "remove", "origin"); },
+        message: /config|origin|remote/i,
+      },
+      {
+        name: "malformed origin",
+        configure: (repo) => { git(repo, "remote", "set-url", "origin", "not a remote URL"); },
+        message: /unsupported|malformed|origin/i,
+      },
+      {
+        name: "wrong host",
+        configure: (repo) => { git(repo, "remote", "set-url", "origin", "https://gitlab.com/owner/repo.git"); },
+        message: /unsupported|malformed|gitlab|origin/i,
+      },
+      {
+        name: "wrong repository",
+        configure: (repo) => { git(repo, "remote", "set-url", "origin", "https://github.com/other/repo.git"); },
+        message: /other\/repo|not requested|origin/i,
+      },
+    ];
+
+    for (const candidate of cases) {
+      const fixture = await investigationSnapshotFixture();
+      try {
+        candidate.configure(fixture.source);
+        const manager = new GitInvestigationSnapshotManager(fixture.source, join(fixture.root, "snapshots"));
+        await assert.rejects(
+          manager.acquire({
+            repository: "owner/repo",
+            repositoryRoot: fixture.source,
+            targetBranch: "main",
+            baseSha: fixture.mainSha,
+          }),
+          candidate.message,
+          candidate.name,
+        );
+        assert.doesNotMatch(git(fixture.source, "worktree", "list", "--porcelain"), /snapshots/);
+      } finally {
+        removeInvestigationSnapshotFixture(fixture);
+      }
+    }
+  });
+
+  it("accepts a safely parsed credential-bearing origin for an existing commit", async () => {
+    const fixture = await investigationSnapshotFixture();
+    try {
+      git(fixture.source, "remote", "set-url", "origin", "https://token:secret@github.com/owner/repo.git");
+      const manager = new GitInvestigationSnapshotManager(fixture.source, join(fixture.root, "snapshots"));
+      const snapshot = await manager.acquire({
+        repository: "owner/repo",
+        repositoryRoot: fixture.source,
+        targetBranch: "main",
+        baseSha: fixture.mainSha,
+      });
+      await manager.release(snapshot);
+    } finally {
+      removeInvestigationSnapshotFixture(fixture);
+    }
+  });
+  it("rejects a wrong-repository SHA and does not add a snapshot", async () => {
+    const fixture = await investigationSnapshotFixture();
+    try {
+      const manager = new GitInvestigationSnapshotManager(fixture.source, join(fixture.root, "snapshots"));
+      await assert.rejects(
+        manager.acquire({ repository: "owner/repo", repositoryRoot: fixture.source, targetBranch: "staging", baseSha: fixture.foreignSha }),
+        /absent|history|hydrate|base/i,
+      );
+      assert.doesNotMatch(git(fixture.source, "worktree", "list", "--porcelain"), /snapshots/);
+    } finally {
+      removeInvestigationSnapshotFixture(fixture);
+    }
+  });
+
+  it("fails validation for tracked and untracked snapshot dirt", async () => {
+    const fixture = await investigationSnapshotFixture();
+    try {
+      const manager = new GitInvestigationSnapshotManager(fixture.source, join(fixture.root, "snapshots"));
+      const snapshot = await manager.acquire({ repository: "owner/repo", repositoryRoot: fixture.source, targetBranch: "main", baseSha: fixture.mainSha });
+      writeFileSync(join(snapshot.path, "README.md"), "dirty\n");
+      await assert.rejects(manager.validate(snapshot), /dirty/);
+      git(snapshot.path, "reset", "--hard", fixture.mainSha);
+      writeFileSync(join(snapshot.path, "untracked.txt"), "dirty\n");
+      await assert.rejects(manager.validate(snapshot), /dirty/);
+      rmSync(join(snapshot.path, "untracked.txt"), { force: true });
+      await manager.release(snapshot);
+    } finally {
+      removeInvestigationSnapshotFixture(fixture);
+    }
+  });
+
+  it("preserves a pre-existing snapshot path when worktree add loses a race", async () => {
+    const fixture = await investigationSnapshotFixture();
+    try {
+      const manager = new GitInvestigationSnapshotManager(fixture.source, join(fixture.root, "snapshots"));
+      const internals = manager as unknown as { git: (args: string[], cwd: string) => Promise<string> };
+      const originalGit = internals.git.bind(manager);
+      let injected = false;
+      internals.git = async (args, cwd) => {
+        if (!injected && args.includes("worktree") && args.includes("add")) {
+          injected = true;
+          const snapshotPath = args[args.length - 2];
+          if (!snapshotPath) throw new Error("test could not identify snapshot path");
+          mkdirSync(snapshotPath, { recursive: true });
+          writeFileSync(join(snapshotPath, "pre-existing.txt"), "must survive\n");
+          throw new Error("simulated pre-existing snapshot path race");
+        }
+        return originalGit(args, cwd);
+      };
+
+      await assert.rejects(
+        manager.acquire({
+          repository: "owner/repo",
+          repositoryRoot: fixture.source,
+          targetBranch: "main",
+          baseSha: fixture.mainSha,
+        }),
+        /simulated pre-existing snapshot path race/,
+      );
+      const snapshots = readdirSync(join(fixture.root, "snapshots"));
+      assert.equal(snapshots.length, 1);
+      const snapshotPath = join(fixture.root, "snapshots", snapshots[0]!);
+      assert.equal(readFileSync(join(snapshotPath, "pre-existing.txt"), "utf8"), "must survive\n");
+      assert.doesNotMatch(git(fixture.source, "worktree", "list", "--porcelain"), /snapshots/);
+    } finally {
+      removeInvestigationSnapshotFixture(fixture);
+    }
+  });
+  it("rolls back a newly registered snapshot when post-create validation fails", async () => {
+    const fixture = await investigationSnapshotFixture();
+    try {
+      const manager = new GitInvestigationSnapshotManager(fixture.source, join(fixture.root, "snapshots"));
+      manager.validate = async () => { throw new Error("forced snapshot validation failure"); };
+      await assert.rejects(
+        manager.acquire({ repository: "owner/repo", repositoryRoot: fixture.source, targetBranch: "main", baseSha: fixture.mainSha }),
+        /forced snapshot validation failure/,
+      );
+      assert.doesNotMatch(git(fixture.source, "worktree", "list", "--porcelain"), /snapshots/);
+      assert.equal(existsSync(join(fixture.root, "snapshots")), true);
+      assert.deepEqual(readdirSync(join(fixture.root, "snapshots")), []);
+    } finally {
+      removeInvestigationSnapshotFixture(fixture);
     }
   });
 });

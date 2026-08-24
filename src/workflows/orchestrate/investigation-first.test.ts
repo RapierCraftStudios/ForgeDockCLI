@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { describe, it } from "node:test";
+import { join } from "node:path";
 import { createInvestigationFirstWorkers } from "./investigation-first.js";
 import type { OrchestrationRecord, OrchestrationInvestigationRecord } from "../../core/ports/orchestration.js";
+import type { InvestigationSnapshot, InvestigationSnapshotIdentity, InvestigationSnapshotManager } from "../../core/ports/git-workspace.js";
 import type { OrchestrationInvestigationWorkerContext, OrchestrationPacketWorkerContext } from "./controller.js";
 import type { ScheduledWorkItem } from "./scheduler.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
@@ -92,18 +93,52 @@ interface FactoryFixture {
   subject: { repo: string; issue: number };
   runId: string;
   runtimeCalls: () => number;
+  runtimeCwds: () => readonly string[];
 }
 
 async function createFactoryFixture(): Promise<FactoryFixture> {
-  const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  // Keep this factory hermetic: the adapter-level tests own real Git common-dir
+  // and detached-worktree behavior. These worker tests only need an exact,
+  // controller-admitted snapshot identity.
+  const baseSha = "f".repeat(40);
   const workItem = item("integration", 101);
   const subject = { repo: "owner/repo", issue: workItem.issue };
+  const repositoryRoot = process.cwd();
+  const snapshotIdentity: InvestigationSnapshotIdentity = {
+    schema: "forgedock.investigation-snapshot/v1",
+    repository: subject.repo,
+    repositoryRoot,
+    targetBranch: "staging",
+    baseSha,
+    snapshotId: "fixture-investigation-snapshot",
+    snapshotPath: join(repositoryRoot, ".forgedock-test-investigation-snapshot"),
+  };
+  const admittedSnapshot: InvestigationSnapshot = {
+    identity: snapshotIdentity,
+    path: snapshotIdentity.snapshotPath,
+  };
+  const assertAdmittedSnapshot = (snapshot: InvestigationSnapshot): void => {
+    assert.deepEqual(snapshot, admittedSnapshot);
+  };
+  const snapshotManager: InvestigationSnapshotManager = {
+    acquire: async (input) => {
+      assert.equal(input.repository, subject.repo);
+      assert.equal(input.repositoryRoot, repositoryRoot);
+      assert.equal(input.targetBranch, snapshotIdentity.targetBranch);
+      assert.equal(input.baseSha, baseSha);
+      return structuredClone(admittedSnapshot);
+    },
+    validate: async (snapshot) => assertAdmittedSnapshot(snapshot),
+    release: async (snapshot) => assertAdmittedSnapshot(snapshot),
+  };
   const runs = new InMemoryRunRepository();
   const artifacts = new InMemoryArtifactRepository();
   let runtimeCallCount = 0;
+  const runtimeCwds: string[] = [];
   const runtime = {
-    run: async (task: { role: string }) => {
+    run: async (task: { role: string; workspace?: { cwd?: string } }) => {
       runtimeCallCount += 1;
+      if (task.workspace?.cwd) runtimeCwds.push(task.workspace.cwd);
       if (task.role === "investigator") {
         return {
           output: {
@@ -141,7 +176,8 @@ async function createFactoryFixture(): Promise<FactoryFixture> {
   } as unknown as AgentRuntime;
   const workers = createInvestigationFirstWorkers({
     repository: subject.repo,
-    checkoutRoot: process.cwd(),
+    checkoutRoot: repositoryRoot,
+    snapshotManager,
     runtime,
     artifacts,
     runs,
@@ -187,6 +223,7 @@ async function createFactoryFixture(): Promise<FactoryFixture> {
     investigationArtifactId: investigationId,
     wave: 1,
     baseSha,
+    ...(investigated.snapshot !== undefined ? { snapshot: investigated.snapshot } : {}),
     targetBranch: "staging",
     lane: "fast",
     status: "completed",
@@ -201,10 +238,45 @@ async function createFactoryFixture(): Promise<FactoryFixture> {
     investigation,
   } as unknown as OrchestrationPacketWorkerContext;
   await workers.packetWorker(workItem, packetContext);
-  return { item: workItem, workers, runs, artifacts, investigation, packetContext, subject, runId, runtimeCalls: () => runtimeCallCount };
+  return { item: workItem, workers, runs, artifacts, investigation, packetContext, subject, runId, runtimeCalls: () => runtimeCallCount, runtimeCwds: () => runtimeCwds };
 }
 
 describe("investigation-first factory recovery", () => {
+  it("preserves invariant:matrix-identity-isolation-241064d3a2cb for repository/route/base/snapshot checkpoints", async () => {
+    const fixture = await createFactoryFixture();
+    assert.equal(fixture.investigation.snapshot?.repository, "owner/repo");
+    assert.equal(fixture.investigation.snapshot?.targetBranch, "staging");
+    assert.equal(fixture.investigation.snapshot?.baseSha, fixture.investigation.baseSha);
+    assert.equal(fixture.investigation.evidence?.snapshotId, fixture.investigation.snapshot?.snapshotId);
+    assert.ok(fixture.runtimeCwds().length >= 2);
+    assert.ok(fixture.runtimeCwds().every((cwd) => cwd === fixture.investigation.snapshot?.snapshotPath));
+  });
+
+  it("preserves invariant:matrix-adapter-lifecycle-0ba2e567ffc0 through detached snapshot admission", async () => {
+    const fixture = await createFactoryFixture();
+    assert.ok(fixture.investigation.snapshot?.snapshotPath);
+    assert.notEqual(fixture.investigation.snapshot?.snapshotPath, process.cwd());
+    assert.equal(fixture.investigation.snapshot?.repositoryRoot, process.cwd());
+  });
+
+  it("reuses invariant:matrix-identity-isolation-30f627af23aa only for the exact route/base snapshot", async () => {
+    const fixture = await createFactoryFixture();
+    const repeated = await fixture.workers.investigationWorker(fixture.item, {
+      ...fixture.packetContext, phase: "investigation", wave: 1,
+    } as unknown as OrchestrationInvestigationWorkerContext);
+    assert.equal(repeated.snapshot?.snapshotId, fixture.investigation.snapshot?.snapshotId);
+    assert.equal(repeated.snapshot?.targetBranch, "staging");
+  });
+
+  it("fails closed before packet agent dispatch when restart loses the admitted snapshot", async () => {
+    const fixture = await createFactoryFixture();
+    const callsBefore = fixture.runtimeCalls();
+    const { snapshot: _snapshot, ...investigationWithoutSnapshot } = fixture.investigation;
+    fixture.packetContext.investigation = investigationWithoutSnapshot;
+    await assert.rejects(() => fixture.workers.packetWorker(fixture.item, fixture.packetContext), /no durable snapshot identity/);
+    assert.equal(fixture.runtimeCalls(), callsBefore);
+  });
+
   it("replays the confirmed transition before preparing from an investigating run", async () => {
     const fixture = await createFactoryFixture();
     const run = await fixture.runs.load(fixture.runId);

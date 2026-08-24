@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -13,9 +14,11 @@ import { createArtifact } from "../core/artifacts/schema.js";
 import { readForgeDockConfig, updateForgeDockConfig } from "../core/config/forgedock-config.js";
 import { DEFAULT_REMOTE_READ_CONCURRENCY } from "../core/concurrency.js";
 import { GitHubArtifactRepository, GitHubClient } from "../adapters/github/github-client.js";
+import { SqliteRepositories } from "../adapters/sqlite/sqlite-repositories.js";
 import { InMemoryLeaseRepository } from "../core/ports/lease.js";
+import { createRun, transition } from "../core/state/machine.js";
 import type { OrchestrationRecord } from "../core/ports/orchestration.js";
-import { InMemoryOrchestrationRepository } from "../core/ports/repositories.js";
+import { InMemoryOrchestrationRepository, type ArtifactRepository } from "../core/ports/repositories.js";
 import { LeaseBackedOrchestrationExecutionAdmission } from "../adapters/sqlite/orchestration-admission.js";
 import { createOrBootstrapLocalLeaseWitness } from "../adapters/sqlite/lease-witness.js";
 import { ClaimPromotionConflictError, materializeClaimDependencies } from "../workflows/orchestrate/scheduler.js";
@@ -40,6 +43,7 @@ import {
   decompositionChildIssuesFromArtifacts,
   materializeVisibleDecomposition,
   orchestrationTransportKey,
+  rebuildVisibleDagInput,
   type ControllerTaskSpec,
   type OrchestrationTransportIdentity,
   VisibleDagDelegator,
@@ -2318,6 +2322,64 @@ test("explicit orchestration reruns admit recoverable runs as resume and termina
   assert.deepEqual(terminalSkip, { action: "skip", runId: terminalRun, state: "decomposed" });
 });
 
+test("durable blocked ReviewVerdict admission blocks the node and its dependents without launching a worker", async () => {
+  const runId = "run_review_verdict_blocked_tui";
+  const subject = { repo: "a/b", issue: 509 } as const;
+  const headSha = "d".repeat(40);
+  const intent = createArtifact({
+    kind: "Intent", runId, subject, producer: { role: "controller" },
+    payload: { title: "Fix", problem: "Broken", constraints: [], acceptanceHints: [], dependencies: [] },
+  }, { createdAt: "2026-01-01T00:00:00.000Z" });
+  const build = createArtifact({
+    kind: "BuildResult", runId, subject, producer: { role: "controller" },
+    payload: {
+      branch: "forge/issue-509", targetBranch: "staging", headSha, changedPaths: ["src/a.ts"], summary: "built",
+      acceptanceEvidence: [], checks: [], decisions: [], residualRisks: [],
+    },
+  }, { createdAt: "2026-01-01T00:01:00.000Z" });
+  const verdict = createArtifact({
+    kind: "ReviewVerdict", runId, subject: { ...subject, pr: 509 }, producer: { role: "controller" },
+    payload: { headSha, disposition: "blocked", reviewerRoles: ["correctness"], findings: [], checks: [], warnings: ["human review required"] },
+  }, { createdAt: "2026-01-01T00:02:00.000Z" });
+  const blockedArtifacts: ArtifactRepository = {
+    list: async (requested) => requested.issue === subject.issue ? [intent, build, verdict] : [],
+    append: async () => undefined,
+  };
+  const blockedItem = {
+    id: "issue-509", issue: 509, repository: subject.repo, targetBranch: "staging", priority: 1,
+    dependencies: [], claims: [], labels: [], affectedFiles: [], memberIssues: [509],
+    title: "Blocked", summary: "Blocked review",
+  };
+  const dependentItem = {
+    id: "issue-510", issue: 510, repository: subject.repo, targetBranch: "staging", priority: 2,
+    dependencies: ["issue-509"], claims: [], labels: [], affectedFiles: [], memberIssues: [510],
+    title: "Dependent", summary: "Must wait",
+  };
+  const state = fakePi();
+  const repository = new InMemoryOrchestrationRepository();
+  const delegator = witnessedDagDelegator(state.pi, repository);
+  let launches = 0;
+  const run = await delegator.start({
+    repository: subject.repo,
+    items: [blockedItem, dependentItem],
+    maxParallel: 1,
+    resolveWorkerRecovery: async (item, recovery) => await admitWorkerRecovery(item, recovery, blockedArtifacts, subject.repo),
+    taskFor: () => {
+      launches += 1;
+      return { agent: "forgedock-issue-worker", task: "must not launch", cwd: process.cwd() };
+    },
+    assertCompleted: async () => undefined,
+    onComplete: () => undefined,
+  });
+  await run.completion;
+  const record = await repository.loadOrchestration(run.id);
+  assert.equal(launches, 0);
+  assert.equal(record?.nodes.find((node) => node.id === blockedItem.id)?.status, "blocked");
+  assert.equal(record?.nodes.find((node) => node.id === dependentItem.id)?.status, "blocked");
+  assert.match(record?.nodes.find((node) => node.id === blockedItem.id)?.error ?? "", /human review required/);
+  await delegator.shutdown();
+});
+
 
 test("visible DAG persists its durable parent record and terminal node state", async () => {
   const state = fakePi();
@@ -3344,6 +3406,102 @@ test("native resume admits completed investigation outcomes at the TUI boundary"
   }));
   await assert.rejects(() => ordinaryDelegator.resume("dag_execution_invalid"), /terminally invalid work/);
   await ordinaryDelegator.shutdown();
+});
+
+test("rebuilt investigation settlement validates the durable snapshot before GitHub side effects", async () => {
+  const fixture = createTempWorkspaceFixture();
+  const cwd = fixture.root;
+  const subject = { repo: "a/b", issue: 488 } as const;
+  const runId = "run_investigation_snapshot_resume";
+  const timestamp = new Date(0).toISOString();
+  const baseSha = "a".repeat(40);
+  const snapshotRoot = join(fixture.workspace, ".forgedock-worktrees", "root-investigation");
+  const snapshotId = createHash("sha256").update(JSON.stringify({
+    schema: "forgedock.investigation-snapshot/v1",
+    repository: subject.repo,
+    repositoryRoot: cwd,
+    targetBranch: "staging",
+    baseSha,
+  })).digest("hex");
+  const snapshot = {
+    schema: "forgedock.investigation-snapshot/v1" as const,
+    repository: subject.repo,
+    repositoryRoot: cwd,
+    targetBranch: "staging",
+    baseSha,
+    snapshotId,
+    snapshotPath: join(snapshotRoot, snapshotId),
+  };
+  const intent = createArtifact({
+    kind: "Intent", runId, subject, producer: { role: "controller" },
+    payload: { title: "Investigate", problem: "Broken", constraints: [], acceptanceHints: [], dependencies: [] },
+  }, { createdAt: timestamp });
+  const investigationArtifact = createArtifact({
+    kind: "Investigation", runId, subject, producer: { role: "investigator" },
+    payload: {
+      outcome: "invalid", confidence: "high", summary: "Invalid issue", evidence: [{ claim: "not applicable", source: "issue", detail: "invalid" }],
+      affectedSurfaces: [], risks: [], recommendation: "close",
+    },
+  }, { id: "investigation-snapshot-resume", createdAt: timestamp });
+  const node = {
+    id: "issue-488", issue: subject.issue, priority: 1, dependencies: [], claims: [], status: "invalid" as const,
+    childRunIds: [], attempts: [],
+  };
+  const record: OrchestrationRecord = {
+    schema: "forgedock.orchestration/v1",
+    orchestrationId: "dag_investigation_snapshot_resume",
+    repository: subject.repo,
+    issueNumbers: [subject.issue],
+    maxParallel: 1,
+    autoMerge: true,
+    status: "failed",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    phase: "investigating",
+    investigationWave: 1,
+    nodes: [node],
+    investigations: [{
+      issue: subject.issue, nodeId: node.id, runId, investigationArtifactId: investigationArtifact.id,
+      wave: 1, baseSha, targetBranch: "staging", lane: "fast", snapshot,
+      status: "completed", outcome: "invalid", attemptCount: 1, completedAt: timestamp,
+    }],
+    investigationBarrier: { expected: 1, completed: 1, startedAt: timestamp },
+  };
+  const runs = new SqliteRepositories(join(cwd, ".forgedock", "state.db"));
+  const queued = createRun({ workflow: "work-on", subject, runId, now: timestamp, target: { lane: "fast", targetBranch: "staging" } });
+  const investigating = transition(queued, "START_INVESTIGATION", { now: timestamp });
+  await runs.create(queued);
+  await runs.commit(queued.version, investigating.state, investigating.record);
+  const originalArtifactList = GitHubArtifactRepository.prototype.list;
+  let issueReads = 0;
+  let repositoryReads = 0;
+  (GitHubArtifactRepository.prototype as any).list = async () => [intent, investigationArtifact];
+  try {
+    await withDiscoveryGitHub({
+      getRepository: async () => {
+        repositoryReads += 1;
+        return { repo: subject.repo, defaultBranch: "main" };
+      },
+      getIssue: async (issue: number, repo?: string) => {
+        issueReads += 1;
+        return { repo: repo ?? subject.repo, number: issue, title: `Issue ${issue}`, body: "", url: `https://github.test/a/b/issues/${issue}`, state: "OPEN", labels: [], comments: [] };
+      },
+      listIssueComments: async () => [],
+    }, async () => {
+      const input = await rebuildVisibleDagInput(cwd, record, null);
+      assert.ok(input.settleInvestigation);
+      await assert.rejects(
+        () => input.settleInvestigation!({ orchestration: record, investigation: record.investigations![0]!, result: { outcome: "invalid" } }),
+        /snapshot is missing/,
+      );
+    });
+    assert.equal(repositoryReads, 1, "rebuild may read repository identity once, but settlement must not reread it before validation");
+    assert.equal(issueReads, 0, "settlement must validate the durable snapshot before reading the issue");
+  } finally {
+    GitHubArtifactRepository.prototype.list = originalArtifactList;
+    runs.close();
+    rmSync(fixture.workspace, { recursive: true, force: true });
+  }
 });
 
 function stateForResume(repository: InMemoryOrchestrationRepository): FakePiState {

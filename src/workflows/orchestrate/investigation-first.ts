@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHash } from "node:crypto";
-import { execFile as execFileCallback } from "node:child_process";
-import { promisify } from "node:util";
+import type { InvestigationSnapshot, InvestigationSnapshotIdentity, InvestigationSnapshotManager } from "../../core/ports/git-workspace.js";
+import { GitInvestigationSnapshotManager } from "../../adapters/git/git-worktree.js";
 import { assertArtifact, createArtifact, type DurableArtifact, type Subject } from "../../core/artifacts/schema.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import type {
@@ -19,8 +19,6 @@ import { attachArtifact, transition, type RunState } from "../../core/state/mach
 import type { ThinkingLevel } from "../../core/config/forgedock-config.js";
 import { materializeClaimDependencies } from "./scheduler.js";
 import { compileExecutionDag, normalizePacketPaths, normalizeSemanticDependencies } from "./packet-wave.js";
-
-const execFile = promisify(execFileCallback);
 
 export interface InvestigationFirstIssue {
   title: string;
@@ -41,6 +39,10 @@ export interface InvestigationFirstRoute {
 export interface InvestigationFirstFactoryOptions {
   repository: string;
   checkoutRoot: string;
+  /** Controller-owned detached snapshot lifecycle; never the operator checkout. */
+  snapshotManager?: InvestigationSnapshotManager;
+  /** Resolve a local checkout for repository-qualified routes. */
+  resolveRepositoryRoot?: (repository: string) => string | Promise<string>;
   runtime: AgentRuntime;
   artifacts: ArtifactRepository;
   runs: RunRepository;
@@ -81,6 +83,27 @@ export function createInvestigationFirstWorkers(
   options: InvestigationFirstFactoryOptions,
   initialItems: readonly ScheduledWorkItem[],
 ): InvestigationFirstWorkers {
+  const snapshotManager = options.snapshotManager ?? new GitInvestigationSnapshotManager(options.checkoutRoot);
+  const snapshotPromises = new Map<string, Promise<InvestigationSnapshot>>();
+  const acquireSnapshot = async (item: ScheduledWorkItem, route: InvestigationFirstRoute, baseSha: string, signal?: AbortSignal): Promise<InvestigationSnapshot> => {
+    const repository = item.repository ?? options.repository;
+    const repositoryRoot = await options.resolveRepositoryRoot?.(repository) ?? options.checkoutRoot;
+    if (!repositoryRoot.trim()) throw new Error(`Investigation ${item.id} has no resolved checkout for repository ${repository}`);
+    const key = `${repository.trim().toLowerCase()}\\0${repositoryRoot}\\0${route.targetBranch}\\0${baseSha.toLowerCase()}`;
+    let pending = snapshotPromises.get(key);
+    if (!pending) {
+      pending = snapshotManager.acquire({ repository, repositoryRoot, targetBranch: route.targetBranch, baseSha, ...(signal !== undefined ? { signal } : {}) });
+      snapshotPromises.set(key, pending);
+    }
+    try {
+      const snapshot = await pending;
+      await snapshotManager.validate(snapshot);
+      return snapshot;
+    } catch (error) {
+      snapshotPromises.delete(key);
+      throw error;
+    }
+  };
   const investigationWorker: OrchestrationInvestigationWorker = async (item, context) => {
     const route = await options.resolveRoute(item);
     const intent = createArtifact({
@@ -99,10 +122,10 @@ export function createInvestigationFirstWorkers(
     });
     await context.recordTask({ runId: intent.runId });
     const baseSha = await contextBaseSha(options, route, item);
-    await assertExactCheckout(options.checkoutRoot, baseSha);
+    const snapshot = await acquireSnapshot(item, route, baseSha, context.signal);
     const investigated = await investigateWorkItem({
       intent,
-      cwd: options.checkoutRoot,
+      cwd: snapshot.path,
       target: {
         lane: route.lane,
         targetBranch: route.targetBranch,
@@ -122,9 +145,9 @@ export function createInvestigationFirstWorkers(
       ...(context.signal !== undefined ? { signal: context.signal } : {}),
     }, { runtime: options.runtime, artifacts: options.artifacts, runs: options.runs, ...(context.signal !== undefined ? { signal: context.signal } : {}), assertActive: context.assertActive });
     if (context.signal?.aborted) throw context.signal.reason ?? new Error("Investigation cancelled before interpretation");
-    await assertExactCheckout(options.checkoutRoot, baseSha);
+    await snapshotManager.validate(snapshot);
     const observedBaseSha = await options.getBranchHead(item.repository ?? options.repository, route.targetBranch);
-    if (observedBaseSha !== baseSha) {
+    if (observedBaseSha.toLowerCase() !== baseSha.toLowerCase()) {
       const drift = new Error(`Investigation base drifted for ${item.id}: expected ${baseSha}, observed ${observedBaseSha}`);
       Object.assign(drift, { code: "base-drift", domain: "workflow" });
       throw drift;
@@ -133,10 +156,15 @@ export function createInvestigationFirstWorkers(
     return {
       outcome: payload.outcome,
       baseSha,
+      snapshot: snapshot.identity,
       evidence: {
         investigationId: investigated.investigation.id,
         runId: intent.runId,
         baseSha,
+        snapshotId: snapshot.identity.snapshotId,
+        snapshotPath: snapshot.identity.snapshotPath,
+        repositoryRoot: snapshot.identity.repositoryRoot,
+        targetBranch: snapshot.identity.targetBranch,
         rootCause: payload.rootCause ?? null,
         summary: payload.summary,
         affectedSurfaces: payload.affectedSurfaces,
@@ -148,9 +176,14 @@ export function createInvestigationFirstWorkers(
   const packetWorker: OrchestrationPacketWorker = async (item, context) => {
     const route = await options.resolveRoute(item);
     const checkpoint = await loadExactInvestigationCheckpoint(options, item, context.investigation);
+    if (context.investigation.snapshot === undefined) {
+      throw new Error(`Investigation ${item.id} has no durable snapshot identity; refusing restart dispatch`);
+    }
     const baseSha = await resolveExactBaseSha(options, item, route, checkpoint.investigation, context.investigation);
     assertRouteMatchesCheckpoint(route, checkpoint.run, context.investigation, item.id);
-    await assertExactCheckout(options.checkoutRoot, baseSha);
+    const snapshot = await acquireSnapshot(item, route, baseSha, context.signal);
+    assertSnapshotMatchesCheckpoint(snapshot.identity, context.investigation.snapshot, item.id);
+    await snapshotManager.validate(snapshot);
 
     let run = checkpoint.run;
     if (run.state === "investigating") {
@@ -158,7 +191,7 @@ export function createInvestigationFirstWorkers(
         run,
         intent: checkpoint.intent,
         investigation: checkpoint.investigation,
-        cwd: options.checkoutRoot,
+        cwd: snapshot.path,
         target: {
           lane: route.lane,
           targetBranch: route.targetBranch,
@@ -186,16 +219,17 @@ export function createInvestigationFirstWorkers(
 
     if (run.state === "building") {
       const packet = reusableBuildPacket(checkpoint.artifacts, run, checkpoint.subject, baseSha, item.id, checkpoint.investigation);
-      await assertExactCheckout(options.checkoutRoot, baseSha);
+      await snapshotManager.validate(snapshot);
       const observed = await options.getBranchHead(item.repository ?? options.repository, route.targetBranch);
       assertExactSha(`Packet ${item.id} base`, baseSha, observed);
       await context.recordTask({ runId: run.runId });
       return {
         packetId: packet.id,
-        identity: packetIdentity(item, packet.id, run, checkpoint.investigation, baseSha),
+        identity: packetIdentity(item, packet.id, run, checkpoint.investigation, baseSha, snapshot.identity, route.targetBranch),
         expectedPaths: packet.payload.expectedPaths,
         semanticDependencies: item.dependencies,
         baseSha,
+        snapshot: snapshot.identity,
       };
     }
 
@@ -214,10 +248,11 @@ export function createInvestigationFirstWorkers(
       await context.recordTask({ runId: run.runId });
       return {
         packetId: orphan.id,
-        identity: packetIdentity(item, orphan.id, run, checkpoint.investigation, baseSha),
+        identity: packetIdentity(item, orphan.id, run, checkpoint.investigation, baseSha, snapshot.identity, route.targetBranch),
         expectedPaths: orphan.payload.expectedPaths,
         semanticDependencies: item.dependencies,
         baseSha,
+        snapshot: snapshot.identity,
       };
     }
 
@@ -225,7 +260,7 @@ export function createInvestigationFirstWorkers(
       run,
       intent: checkpoint.intent,
       investigation: checkpoint.investigation,
-      cwd: options.checkoutRoot,
+      cwd: snapshot.path,
       baseSha,
       scopeHints: { affectedFiles: item.affectedFiles ?? [], claims: item.claims, metadataRoots: STANDARD_SCOPE_METADATA_ROOTS },
       ...(options.verificationCatalog !== undefined ? { verificationCatalog: options.verificationCatalog } : {}),
@@ -235,16 +270,17 @@ export function createInvestigationFirstWorkers(
       ...(options.planning ?? {}),
       ...(context.signal !== undefined ? { signal: context.signal } : {}),
     }, { runtime: options.runtime, artifacts: options.artifacts, runs: options.runs });
-    await assertExactCheckout(options.checkoutRoot, baseSha);
+    await snapshotManager.validate(snapshot);
     const observed = await options.getBranchHead(item.repository ?? options.repository, route.targetBranch);
     assertExactSha(`Packet ${item.id} base`, baseSha, observed);
     await context.recordTask({ runId: prepared.run.runId });
     return {
       packetId: prepared.packet.id,
-      identity: packetIdentity(item, prepared.packet.id, prepared.run, checkpoint.investigation, baseSha),
+      identity: packetIdentity(item, prepared.packet.id, prepared.run, checkpoint.investigation, baseSha, snapshot.identity, route.targetBranch),
       expectedPaths: prepared.packet.payload.expectedPaths,
       semanticDependencies: item.dependencies,
       baseSha,
+      snapshot: snapshot.identity,
     };
   };
 
@@ -341,6 +377,7 @@ export function createInvestigationFirstWorkers(
           expectedPaths: normalizePacketPaths(packet.expectedPaths),
           baseRef: packet.baseSha,
           semanticDependencies,
+          ...(packet.identity !== undefined ? { identity: { ...packet.identity, baseRef: packet.identity.baseSha } } : {}),
           ...(item.memberIssues !== undefined ? { childIssues: item.memberIssues } : {}),
         };
       });
@@ -349,7 +386,6 @@ export function createInvestigationFirstWorkers(
         executionEdges = [];
       } else {
         const baseRef = packetInputs[0]!.baseRef;
-        if (packetInputs.some((packet) => packet.baseRef !== baseRef)) throw new Error("Packet barrier contains multiple or missing exact bases");
         const compiled = compileExecutionDag({ items, packets: packetInputs, baseRef });
         executionItems = compiled.items;
         executionEdges = compiled.edges;
@@ -568,7 +604,10 @@ function packetIdentity(
   run: RunState,
   investigation: DurableArtifact<"Investigation">,
   baseSha: string,
+  snapshot: InvestigationSnapshotIdentity | undefined,
+  routeTargetBranch: string,
 ): OrchestrationPacketIdentity {
+  const targetBranch = run.targetBranch ?? routeTargetBranch ?? item.targetBranch;
   return {
     nodeId: item.id,
     packetId,
@@ -576,6 +615,8 @@ function packetIdentity(
     investigationId: investigation.id,
     subject: { repo: run.subject.repo, issue: item.issue },
     baseSha,
+    ...(targetBranch !== undefined ? { targetBranch } : {}),
+    ...(snapshot !== undefined ? { snapshot } : {}),
   };
 }
 
@@ -584,8 +625,8 @@ function assertOptionalIdentity(value: unknown, expected: string, label: string)
 }
 
 function assertExactSha(label: string, expected: string, observed: string): void {
-  if (!/^[0-9a-f]{7,64}$/i.test(expected)) throw new Error(`${label} is not an exact SHA: ${expected}`);
-  if (!/^[0-9a-f]{7,64}$/i.test(observed) || observed.toLowerCase() !== expected.toLowerCase()) {
+  if (!/^[0-9a-f]{40,64}$/i.test(expected)) throw new Error(`${label} is not a full commit SHA: ${expected}`);
+  if (!/^[0-9a-f]{40,64}$/i.test(observed) || observed.toLowerCase() !== expected.toLowerCase()) {
     throw new Error(`${label} drifted: expected ${expected}, observed ${observed}`);
   }
 }
@@ -597,16 +638,17 @@ function sameSubject(left: Subject, right: Subject): boolean {
 }
 
 
-async function assertExactCheckout(cwd: string, expectedSha: string): Promise<void> {
-  let stdout: string;
-  try {
-    ({ stdout } = await execFile("git", ["rev-parse", "HEAD"], { cwd, maxBuffer: 128 * 1024 }));
-  } catch (error) {
-    throw new Error(`Investigation requires an exact git checkout at ${expectedSha}`, { cause: error });
-  }
-  const observed = stdout.trim();
-  if (observed.toLowerCase() !== expectedSha.toLowerCase()) {
-    throw new Error(`Investigation checkout drifted: expected local HEAD ${expectedSha}, observed ${observed}`);
+function assertSnapshotMatchesCheckpoint(
+  actual: InvestigationSnapshotIdentity,
+  expected: InvestigationSnapshotIdentity | undefined,
+  itemId: string,
+): void {
+  if (!expected) throw new Error(`Investigation ${itemId} has no durable snapshot identity; refusing restart dispatch`);
+  const fields: (keyof InvestigationSnapshotIdentity)[] = ["schema", "repository", "repositoryRoot", "targetBranch", "baseSha", "snapshotId", "snapshotPath"];
+  for (const field of fields) {
+    if (actual[field] !== expected[field]) {
+      throw new Error(`Investigation ${itemId} snapshot identity drifted for route ${actual.targetBranch} base ${actual.baseSha}: ${field} mismatch`);
+    }
   }
 }
 async function contextBaseSha(
@@ -614,7 +656,9 @@ async function contextBaseSha(
   route: InvestigationFirstRoute,
   item: ScheduledWorkItem,
 ): Promise<string> {
-  const snapshot = route.baseSha;
-  if (snapshot) return snapshot;
-  return options.getBranchHead(item.repository ?? options.repository, route.targetBranch);
+  const baseSha = route.baseSha ?? await options.getBranchHead(item.repository ?? options.repository, route.targetBranch);
+  if (!/^[0-9a-f]{40,64}$/i.test(baseSha.trim())) {
+    throw new Error(`Investigation ${item.id} base is not a full commit SHA`);
+  }
+  return baseSha.trim().toLowerCase();
 }

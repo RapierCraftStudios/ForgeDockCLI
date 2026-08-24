@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
-import { applyFindingScopePolicy, reviewerSourceSnapshotDiagnostics, shouldMaterializeFinding, verifyFindingSourceAnchors, type ReviewFinding } from "./scope.js";
+import { applyFindingScopePolicy, normalizeReviewerSourceSnapshots, reviewerSourceSnapshotDiagnostics, shouldMaterializeFinding, verifyFindingSourceAnchors, type ReviewFinding } from "./scope.js";
 
 const runId = "run_scope";
 const subject = { repo: "a/b", issue: 1 };
@@ -69,6 +70,150 @@ describe("review finding scope policy", () => {
     assert.equal(diagnostics.length, 1);
     assert.match(diagnostics[0]!, /does not match frozen head/);
   });
+  it("normalizes only existing authorized proof from the exact reviewed head", async () => {
+    const reviewedHeadSha = "a".repeat(40);
+    const content = "function guardedUpdate() { return exact; }";
+    const digest = createHash("sha256").update(content).digest("hex");
+    const reads: Array<{ revision: string; path: string }> = [];
+    const missing = finding({ id: "missing-snapshot" });
+    delete missing.sourceSnapshot;
+    const validStale = finding({
+      id: "valid-stale-head",
+      sourceSnapshot: {
+        reviewedHeadSha: "b".repeat(40), path: "src/a.ts", excerpt: "guardedUpdate", symbol: "guardedUpdate",
+      },
+    });
+    const invalidProof = finding({
+      id: "invalid-proof",
+      sourceSnapshot: {
+        reviewedHeadSha: "b".repeat(40), path: "src/a.ts", digest: "b".repeat(64),
+        excerpt: "not in the exact blob", symbol: "missingSymbol",
+      },
+    });
+    const [unchangedMissing, corrected, unchangedInvalid] = await normalizeReviewerSourceSnapshots(
+      [missing, validStale, invalidProof],
+      {
+        reviewedHeadSha,
+        assignedPaths: ["src/a.ts"],
+        reviewedPaths: ["src/a.ts"],
+        expectedPaths: ["src/a.ts"],
+        readBlob: async (revision, path) => {
+          reads.push({ revision, path });
+          return { content, mode: "100644" };
+        },
+        verifiedAuthorityReferences: [],
+      },
+    );
+    assert.equal(unchangedMissing?.sourceSnapshot, undefined, "location alone is not source proof");
+    assert.deepEqual(corrected?.sourceSnapshot, {
+      reviewedHeadSha,
+      path: "src/a.ts",
+      excerpt: "guardedUpdate",
+      digest,
+      symbol: "guardedUpdate",
+    });
+    assert.deepEqual(unchangedInvalid?.sourceSnapshot, invalidProof.sourceSnapshot,
+      "invalid supplied proof must not be dropped or replaced");
+    assert.deepEqual(reads, [
+      { revision: reviewedHeadSha, path: "src/a.ts" },
+      { revision: reviewedHeadSha, path: "src/a.ts" },
+    ]);
+    const diagnostics = await reviewerSourceSnapshotDiagnostics([unchangedMissing!, corrected!, unchangedInvalid!], {
+      reviewedHeadSha,
+      assignedPaths: ["src/a.ts"],
+      reviewedPaths: ["src/a.ts"],
+      expectedPaths: ["src/a.ts"],
+      readBlob: async () => ({ content, mode: "100644" }),
+      verifiedAuthorityReferences: [],
+    });
+    assert.equal(diagnostics.length, 2);
+    assert.ok(diagnostics.some((message) => message.includes("missing-snapshot") && message.includes("missing sourceSnapshot")));
+    assert.ok(diagnostics.some((message) => message.includes("invalid-proof")));
+  });
+
+  it("preserves invalid supplied paths and fails closed for unsafe or missing blobs", async () => {
+    const reviewedHeadSha = "a".repeat(40);
+    const outOfScope = finding({
+      id: "out-of-scope",
+      location: "src/a.ts:20",
+      sourceSnapshot: { reviewedHeadSha, path: "src/other.ts", excerpt: "exact" },
+    });
+    const missingPath = finding({ id: "missing-path" });
+    delete missingPath.location;
+    delete missingPath.sourceSnapshot;
+    const unsafeBlob = finding({ id: "unsafe-blob", sourceSnapshot: { reviewedHeadSha, path: "src/a.ts", excerpt: "exact" } });
+    const missingBlob = finding({ id: "missing-blob", sourceSnapshot: { reviewedHeadSha, path: "src/a.ts", excerpt: "exact" } });
+    const validMissing = finding({ id: "valid-missing" });
+    let normalizationReads = 0;
+    const normalized = await normalizeReviewerSourceSnapshots([outOfScope, missingPath, unsafeBlob, missingBlob, validMissing], {
+      reviewedHeadSha,
+      assignedPaths: ["src/a.ts"],
+      reviewedPaths: ["src/a.ts"],
+      expectedPaths: ["src/a.ts"],
+      readBlob: async () => {
+        normalizationReads++;
+        if (normalizationReads === 1) return { content: "exact", mode: "120000" };
+        return undefined;
+      },
+      verifiedAuthorityReferences: [],
+    });
+    assert.deepEqual(normalized[0]?.sourceSnapshot, outOfScope.sourceSnapshot);
+    assert.equal(normalized[1]?.sourceSnapshot, undefined);
+    assert.deepEqual(normalized[2]?.sourceSnapshot, unsafeBlob.sourceSnapshot);
+    assert.deepEqual(normalized[3]?.sourceSnapshot, missingBlob.sourceSnapshot);
+    assert.equal(normalized[4]?.sourceSnapshot, undefined);
+    assert.equal(normalizationReads, 2);
+    let diagnosticReads = 0;
+    const diagnostics = await reviewerSourceSnapshotDiagnostics(normalized, {
+      reviewedHeadSha,
+      assignedPaths: ["src/a.ts"],
+      reviewedPaths: ["src/a.ts"],
+      expectedPaths: ["src/a.ts"],
+      readBlob: async () => {
+        diagnosticReads++;
+        if (diagnosticReads === 1) return { content: "exact", mode: "120000" };
+        return undefined;
+      },
+      verifiedAuthorityReferences: [],
+    });
+    assert.equal(diagnostics.length, 5);
+    assert.ok(diagnostics.some((message) => message.includes("out-of-scope") && message.includes("under assigned/reviewed scope")));
+    assert.ok(diagnostics.some((message) => message.includes("missing-path") && message.includes("missing sourceSnapshot")));
+    assert.ok(diagnostics.some((message) => message.includes("unsafe-blob") && message.includes("regular file")));
+    assert.ok(diagnostics.some((message) => message.includes("missing-blob") && message.includes("regular file")));
+  });
+
+  it("does not treat a glob root prefix as an authorized sibling path", async () => {
+    const reviewedHeadSha = "a".repeat(40);
+    const findingOutsideGlob = finding({
+      id: "glob-sibling",
+      sourceSnapshot: { reviewedHeadSha, path: "src-other/file.ts", excerpt: "exact" },
+    });
+    let reads = 0;
+    const [normalized] = await normalizeReviewerSourceSnapshots([findingOutsideGlob], {
+      reviewedHeadSha,
+      assignedPaths: ["src/**"],
+      reviewedPaths: [],
+      expectedPaths: [],
+      readBlob: async () => {
+        reads++;
+        return { content: "exact", mode: "100644" };
+      },
+      verifiedAuthorityReferences: [],
+    });
+    assert.deepEqual(normalized?.sourceSnapshot, findingOutsideGlob.sourceSnapshot);
+    assert.equal(reads, 0);
+    const diagnostics = await reviewerSourceSnapshotDiagnostics([normalized!], {
+      reviewedHeadSha,
+      assignedPaths: ["src/**"],
+      reviewedPaths: [],
+      expectedPaths: [],
+      readBlob: async () => ({ content: "exact", mode: "100644" }),
+      verifiedAuthorityReferences: [],
+    });
+    assert.match(diagnostics[0] ?? "", /under assigned\/reviewed scope/);
+  });
+
   it("keeps legacy findings decodable but advisory without current-source proof", async () => {
     const [legacy] = await verifyFindingSourceAnchors([finding({})], {
       reviewedHeadSha: "a".repeat(40), changedPaths: ["src/a.ts"], expectedPaths: packet.payload.expectedPaths,

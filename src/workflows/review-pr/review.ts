@@ -14,7 +14,7 @@ import { WorkflowExecutionError, retryableExternalWorkflowError } from "../work-
 import { consolidateReviewerFindings, type ConsolidatedFinding } from "./consolidate.js";
 import { openLedgerFindings, reconcileFindingRootLedger, type FindingRoot, type RootAssessment } from "./finding-root-ledger.js";
 import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, planReviewPanel, ROLE_ORDER, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
-import { applyFindingScopePolicy, findingAuthorityEligible, findingMaterializationReason, isUnverifiedSourceFinding, reviewerSourceSnapshotDiagnostics, shouldMaterializeFinding, verifyFindingSourceAnchors, type FindingProjectionMode } from "./scope.js";
+import { applyFindingScopePolicy, findingAuthorityEligible, findingMaterializationReason, isUnverifiedSourceFinding, normalizeReviewerSourceSnapshots, reviewerSourceSnapshotDiagnostics, shouldMaterializeFinding, verifyFindingSourceAnchors, type FindingProjectionMode } from "./scope.js";
 
 const ReviewerFindingSchema = Type.Object({
   ...FindingSchema.properties,
@@ -670,7 +670,19 @@ export async function reviewPullRequest(
               },
             },
           );
-          const sourceDiagnostics = await reviewerSourceSnapshotDiagnostics(result.output.findings, {
+          const normalizedFindings = await normalizeReviewerSourceSnapshots(result.output.findings, {
+            reviewedHeadSha: frozen.headSha,
+            assignedPaths: selection.scope,
+            reviewedPaths: changedPaths,
+            expectedPaths: input.packet.payload.expectedPaths,
+            verifiedAuthorityReferences: reviewerKnownAuthorityReferences,
+            ...(input.readExactBlob ? { readBlob: input.readExactBlob } : {}),
+          });
+          const normalizedOutput: ReviewerSubmission = {
+            ...result.output,
+            findings: normalizedFindings,
+          };
+          const sourceDiagnostics = await reviewerSourceSnapshotDiagnostics(normalizedOutput.findings, {
             reviewedHeadSha: frozen.headSha,
             assignedPaths: selection.scope,
             reviewedPaths: changedPaths,
@@ -687,7 +699,7 @@ export async function reviewPullRequest(
           completed = {
             executionGroupId: selection.id,
             role,
-            output: result.output,
+            output: normalizedOutput,
             sessionRef: result.sessionRef,
             sessionLineage: result.sessionLineage ?? [result.sessionRef],
           };

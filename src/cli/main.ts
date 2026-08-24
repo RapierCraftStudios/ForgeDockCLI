@@ -20,7 +20,7 @@ import {
   workOnDeliveryArtifacts,
 } from "../core/state/admission.js";
 import { reconcileLatestRunArtifacts } from "../core/state/reconcile.js";
-import { GitWorktreeManager } from "../adapters/git/git-worktree.js";
+import { GitInvestigationSnapshotManager, GitWorktreeManager } from "../adapters/git/git-worktree.js";
 import { GitHubArtifactRepository, GitHubClient } from "../adapters/github/github-client.js";
 import { resolveCheckoutContext } from "../adapters/git/repository-context.js";
 import { ProcessVerificationRunner } from "../adapters/process/process-verifier.js";
@@ -539,6 +539,11 @@ async function workOn(
       process.stdout.write(`${statusGlyph("passed", mode)} Existing run ${admission.runId} is already ${admission.state}; no duplicate run was created.\n`);
       return;
     }
+    if (admission.action === "blocked") {
+      process.stdout.write(`${statusGlyph("failed", mode)} Existing run ${admission.runId} is blocked: ${admission.reason}\n`);
+      process.exitCode = 2;
+      return;
+    }
     if (admission.action === "block") {
       throw new Error(admission.reason);
     }
@@ -682,6 +687,11 @@ async function workOn(
 
     if (resumeRunId) {
       const admission = decideSubjectAdmission(resumeArtifacts, { currentTargetBranch: deliveryTargetBranch });
+      if (admission.action === "blocked") {
+        process.stdout.write(`${statusGlyph("failed", mode)} Existing run ${admission.runId} is blocked: ${admission.reason}\n`);
+        process.exitCode = 2;
+        return;
+      }
       if (admission.action === "block") throw new Error(admission.reason);
       if (admission.action !== "resume" || admission.runId !== resumeRunId) {
         throw new Error(`Run ${resumeRunId} no longer has a recoverable durable checkpoint`);
@@ -1152,6 +1162,7 @@ async function workOn(
           run,
           verdict: priorVerdict!,
           pullRequest: checkpointPullRequest!,
+          ...(packet !== undefined ? { packet } : {}),
           ...(workspace ? { workspace } : {}),
           ...(durableBatchMembers.length ? { batchMembers: durableBatchMembers } : {}),
           ...(durableBatchMemberContracts.length ? { batchMemberContracts: durableBatchMemberContracts } : {}),
@@ -2308,9 +2319,12 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
     const outcomes = new Map<string, string>();
     const skipped = new Map<string, string>();
     const owner = `pid-${process.pid}-${crypto.randomUUID()}`;
+    const investigationSnapshotManager = new GitInvestigationSnapshotManager(checkoutRoot);
     const sharedInvestigationWorkers = createInvestigationFirstWorkers({
       repository: repository.repo,
       checkoutRoot,
+      snapshotManager: investigationSnapshotManager,
+      resolveRepositoryRoot: (repositoryName) => resolveCheckoutContext(launchCwd, repositoryName).checkoutRoot,
       runtime,
       artifacts,
       runs,
@@ -2321,7 +2335,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
       ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}),
       getBranchHead: async (repo, branch) => await github.getBranchHead(repo, branch),
       resolveRoute: async (item) => {
-        const routed = requiredOrchestrationRoute(routedIssues, { repository: repository.repo, issue: item.issue });
+        const routed = requiredOrchestrationRoute(routedIssues, { repository: item.repository ?? repository.repo, issue: item.issue });
         return { issue: { title: routed.issue.title, body: routed.issue.body, url: routed.issue.url }, targetBranch: routed.lane.targetBranch, lane: routed.lane.kind, ...(routed.lane.kind === "feature" && routed.lane.promotionTarget !== undefined ? { promotionTarget: routed.lane.promotionTarget } : {}), ...(effective.productionTarget !== undefined ? { productionTarget: effective.productionTarget } : {}) };
       },
       sourceItems: (durable, initial) => durable.investigationWave === 1 ? initial : durable.nodes.map((node) => ({ id: node.id, issue: node.issue, priority: node.priority, dependencies: [...node.dependencies], claims: [...node.claims], ...(node.repository !== undefined ? { repository: node.repository } : {}), ...(node.targetBranch !== undefined ? { targetBranch: node.targetBranch } : {}), ...(node.targetRouteClaim !== undefined ? { targetRouteClaim: node.targetRouteClaim } : {}), ...(node.lane !== undefined ? { lane: node.lane } : {}), ...(node.promotionTarget !== undefined ? { promotionTarget: node.promotionTarget } : {}), ...(node.productionTarget !== undefined ? { productionTarget: node.productionTarget } : {}), ...(node.affectedFiles !== undefined ? { affectedFiles: [...node.affectedFiles] } : {}), ...(node.memberIssues !== undefined ? { memberIssues: [...node.memberIssues] } : {}), ...(node.title !== undefined ? { title: node.title } : {}), ...(node.summary !== undefined ? { summary: node.summary } : {}), ...(node.plan !== undefined ? { plan: structuredClone(node.plan) } : {}) })),
@@ -2403,7 +2417,10 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
         if (result.outcome !== "invalid" && result.outcome !== "decompose") return;
         assertActive?.();
         if (settleSignal?.aborted) throw settleSignal.reason ?? new Error("Investigation settlement cancelled");
-        const subject = { repo: repository.repo, issue: investigation.issue };
+        const itemRepository = scheduleItems.items.find((item) => item.id === investigation.nodeId)?.repository
+          ?? investigation.snapshot?.repository
+          ?? repository.repo;
+        const subject = { repo: itemRepository, issue: investigation.issue };
         const durable = await artifacts.list(subject);
         const currentRunId = investigation.runId;
         const currentInvestigationId = investigation.investigationArtifactId;
@@ -2428,9 +2445,17 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
           return;
         }
         if (run.state !== "investigating") return;
-        const lane = requiredOrchestrationRoute(routedIssues, { repository: repository.repo, issue: investigation.issue }).lane;
+        const durableSnapshot = investigation.snapshot;
+        if (!durableSnapshot) throw new Error(`Investigation ${investigation.issue} has no admitted snapshot for settlement`);
+        if (durableSnapshot.repository.trim().toLowerCase() !== itemRepository.trim().toLowerCase()) {
+          throw new Error(`Investigation ${investigation.issue} snapshot repository does not match scheduled repository ${itemRepository}`);
+        }
+        const settlementSnapshot = { identity: structuredClone(durableSnapshot), path: durableSnapshot.snapshotPath };
+        await investigationSnapshotManager.validate(settlementSnapshot);
+        const lane = requiredOrchestrationRoute(routedIssues, { repository: itemRepository, issue: investigation.issue }).lane;
         const settled = await resumeInvestigationWorkItem({
-          run, intent, investigation: investigationArtifact, cwd: checkoutRoot,
+          run, intent, investigation: investigationArtifact,
+          cwd: settlementSnapshot.path,
           ...(settleSignal !== undefined ? { signal: settleSignal } : {}),
           target: runTargetForLane(lane, effective.productionTarget),
           scopeHints: { affectedFiles: [], claims: [], metadataRoots: STANDARD_SCOPE_METADATA_ROOTS },
@@ -2485,6 +2510,11 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
           }
           return;
         }
+        if (admission.action === "blocked") {
+          outcomes.set(item.id, "blocked");
+          process.stdout.write(`${statusGlyph("failed", mode)} ${item.id} blocked · ${admission.reason}\n`);
+          return { status: "blocked", error: admission.reason, retryable: false };
+        }
         if (admission.action === "block") {
           throw new Error(admission.reason);
         }
@@ -2528,9 +2558,17 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
               ...(process.env.FORGEDOCK_CONTROLLER_TASK_ID ? { controllerTaskId: process.env.FORGEDOCK_CONTROLLER_TASK_ID } : {}),
             });
           }
-          const resumed = reconcileLatestRunArtifacts(await artifacts.list(subject));
+          const resumedArtifacts = await artifacts.list(subject);
+          const resumed = reconcileLatestRunArtifacts(resumedArtifacts);
           if (resumed.runId) await controllerContext.recordTask({ runId: resumed.runId });
           outcomes.set(item.id, resumed.state);
+          if (resumed.state === "blocked") {
+            const durableBlocker = terminalOrchestrationResult(item.issue, resumedArtifacts, resumed);
+            const reason = durableBlocker?.status === "blocked" && durableBlocker.error !== undefined
+              ? durableBlocker.error
+              : resumed.warnings.join("; ") || `${item.id} resumed to blocked`;
+            return { status: "blocked", error: reason, retryable: false };
+          }
           if (resumed.state !== "completed") throw new Error(`${item.id} resumed to ${resumed.state}; ${resumed.warnings.join("; ") || "durable recovery details are required"}`);
           process.stdout.write(`${statusGlyph("passed", mode)} ${item.id} resumed · completed\n`);
           return;
@@ -3081,6 +3119,7 @@ async function resumeCliOrchestration(argv: string[], orchestrationId: string, s
           if (terminal) return terminal;
           throw new Error(`#${item.issue} has terminal state ${current.state} without a supported orchestration result`);
         }
+        if (current.action === "blocked") return { status: "blocked", error: current.reason, retryable: false };
         if (current.action === "block") throw new Error(current.reason);
         const workerArgs = [String(item.issue), "--repo", itemRepository];
         const dependencies = item.dependencies.map(issueNumberFromScheduledId);

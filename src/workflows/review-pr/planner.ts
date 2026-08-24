@@ -37,6 +37,8 @@ export interface ReviewSkip {
   evidence: string[];
 }
 
+export type ReviewAttemptBudget = 2 | 3;
+
 export interface ReviewBudget {
   /** Logical specialist roles before any path sharding. */
   maxSpecialistExecutionGroups: number;
@@ -47,7 +49,7 @@ export interface ReviewBudget {
   maxTurnsPerExecutionGroup?: number;
   /** Legacy review-plan field retained so older plans remain decodable. */
   maxToolCallsPerExecutionGroup?: number;
-  maxAttemptsPerExecutionGroup: 2;
+  maxAttemptsPerExecutionGroup: ReviewAttemptBudget;
   maxReviewerAttempts: number;
   maxScopeAdjudicationAttempts: number;
   maxModelCalls: number;
@@ -267,15 +269,15 @@ export function planReviewPanel(input: {
   const maxLogicalReviewerSessions = executionGroups.length;
   const policy = input.budgetPolicy;
   const maxReviewerAttempts = Math.max(maxLogicalReviewerSessions, Math.min(
-    policy?.maxReviewerAttempts ?? 2 * maxLogicalReviewerSessions,
-    2 * maxLogicalReviewerSessions,
+    policy?.maxReviewerAttempts ?? 3 * maxLogicalReviewerSessions,
+    3 * maxLogicalReviewerSessions,
   ));
   const maxScopeAdjudicationAttempts = Math.max(1, Math.min(policy?.maxScopeAdjudicationAttempts ?? 2, 2));
   const budget: ReviewBudget = {
     maxSpecialistExecutionGroups: specialistBudget,
     maxLogicalReviewerSessions,
     maxParallelSessions: Math.max(1, Math.min(policy?.maxParallelSessions ?? MAX_PARALLEL_REVIEW_SESSIONS, maxLogicalReviewerSessions)),
-    maxAttemptsPerExecutionGroup: 2,
+    maxAttemptsPerExecutionGroup: 3,
     maxReviewerAttempts,
     maxScopeAdjudicationAttempts,
     maxModelCalls: Math.max(maxLogicalReviewerSessions, Math.min(
@@ -390,7 +392,7 @@ export function assertReviewPlan(plan: ReviewPlan): void {
     || (budget.maxToolCallsPerExecutionGroup !== undefined
       && (!Number.isSafeInteger(budget.maxToolCallsPerExecutionGroup)
         || budget.maxToolCallsPerExecutionGroup < 1 || budget.maxToolCallsPerExecutionGroup > 64))
-    || budget.maxAttemptsPerExecutionGroup !== 2
+    || (budget.maxAttemptsPerExecutionGroup !== 2 && budget.maxAttemptsPerExecutionGroup !== 3)
     || budget.maxReviewerAttempts! < budget.maxLogicalReviewerSessions!
     || budget.maxReviewerAttempts! > budget.maxLogicalReviewerSessions! * budget.maxAttemptsPerExecutionGroup
     || budget.maxScopeAdjudicationAttempts! < 1
