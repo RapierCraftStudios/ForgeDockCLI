@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, chmodSync, renameSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -9,7 +9,7 @@ import type { IssueSnapshot, ReviewFindingPublicationFence } from "../../core/po
 import { LeaseContinuityError, type AuthenticatedLeaseCheckpoint, type Lease, type LeaseAcquisitionOptions, type LeaseGuard, type LeaseInspection, type LeaseRepository, type LeaseWitness, type LeaseWitnessSnapshot } from "../../core/ports/lease.js";
 import { findRunningOrchestrationIssueConflicts, MAX_ORCHESTRATION_PAGE_SIZE, OrchestrationIssueOwnershipConflictError, orchestrationRecordIssueIdentities, type OrchestrationExecutionFence, type OrchestrationListCursor, type OrchestrationRecord, type OrchestrationRepository } from "../../core/ports/orchestration.js";
 import { ConcurrentPromotionUpdateError, type PromotionRecord, type PromotionRepository } from "../../core/ports/promotion.js";
-import { ConcurrentRunUpdateError, remediationAdmissionKey, reviewFindingPublicationFenceKey, sameReviewFindingPublicationFence, type ArtifactRepository, type RemediationAdmissionClaim, type RemediationAdmissionKey, type RemediationAdmissionRepository, type ReviewFindingPublicationFenceRepository, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
+import { ConcurrentRunUpdateError, remediationAdmissionKey, reviewFindingPublicationFenceKey, sameReviewFindingPublicationFence, type ArtifactRepository, type RemediationAdmissionClaim, type RemediationAdmissionKey, type RemediationAdmissionRepository, type ReviewFindingPublicationFenceRepository, type ReviewFindingPublicationMutationGuard, type RunProgressRecord, type RunRepository } from "../../core/ports/repositories.js";
 import type { AgentRunReceipt, TelemetryRepository } from "../../core/ports/telemetry.js";
 import { isCacheableVerificationResult, verificationReceiptCacheKey, type VerificationReceiptCache, type VerificationReceiptCacheEntry, type VerificationReceiptCacheKey } from "../../core/ports/verification-receipt-cache.js";
 import type { CheckResult } from "../../core/ports/verification.js";
@@ -134,7 +134,9 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         repository TEXT NOT NULL,
         pull_request INTEGER NOT NULL,
         generation INTEGER NOT NULL,
-        fence_json TEXT NOT NULL
+        fence_json TEXT NOT NULL,
+        guard_token TEXT,
+        guard_expires_at INTEGER
       );
       CREATE TABLE IF NOT EXISTS orchestrations (
         orchestration_id TEXT PRIMARY KEY,
@@ -166,6 +168,8 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
     // inspection, but lease use remains fail-closed until a witness is bound.
     try { this.#database.exec("ALTER TABLE leases ADD COLUMN epoch INTEGER NOT NULL DEFAULT 0"); } catch { /* already migrated */ }
     try { this.#database.exec("ALTER TABLE leases ADD COLUMN binding TEXT"); } catch { /* already migrated */ }
+    try { this.#database.exec("ALTER TABLE review_finding_publication_fences ADD COLUMN guard_token TEXT"); } catch { /* already migrated */ }
+    try { this.#database.exec("ALTER TABLE review_finding_publication_fences ADD COLUMN guard_expires_at INTEGER"); } catch { /* already migrated */ }
   }
 
   readAdmission(key: string, now = Date.now()): { blockedUntil: number; reason: string; updatedAt: number } | undefined {
@@ -470,11 +474,13 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       };
       this.#database.prepare(`
         INSERT INTO review_finding_publication_fences
-          (fence_key, repository, pull_request, generation, fence_json)
-        VALUES (?, ?, ?, ?, ?)
+          (fence_key, repository, pull_request, generation, fence_json, guard_token, guard_expires_at)
+        VALUES (?, ?, ?, ?, ?, NULL, NULL)
         ON CONFLICT(fence_key) DO UPDATE SET
           generation = excluded.generation,
-          fence_json = excluded.fence_json
+          fence_json = excluded.fence_json,
+          guard_token = NULL,
+          guard_expires_at = NULL
         WHERE review_finding_publication_fences.generation = excluded.generation - 1
       `).run(key, input.repo.trim().toLowerCase(), input.pullRequest, fence.generation, JSON.stringify(fence));
       const installed = this.#database.prepare(`
@@ -498,6 +504,46 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
         throw new Error(`Review-finding publication fence is stale for ${fence.repo}#${fence.pullRequest} generation ${fence.generation}`);
       }
     });
+  }
+
+  async acquireReviewFindingPublicationGuard(
+    fence: ReviewFindingPublicationFence,
+    options: { ttlMs?: number } = {},
+  ): Promise<ReviewFindingPublicationMutationGuard> {
+    const key = reviewFindingPublicationFenceKey(fence.repo, fence.pullRequest);
+    const ttlMs = Math.max(1, options.ttlMs ?? 60_000);
+    return withSqliteBusyRetry(() => this.inTransaction(() => {
+      const now = Date.now();
+      const current = this.#database.prepare(`
+        SELECT generation, fence_json, guard_token, guard_expires_at
+        FROM review_finding_publication_fences WHERE fence_key = ?
+      `).get(key) as { generation: number; fence_json: string; guard_token?: string; guard_expires_at?: number } | undefined;
+      const decoded = current ? JSON.parse(current.fence_json) as ReviewFindingPublicationFence : undefined;
+      if (!current || !decoded || current.generation !== fence.generation || !sameReviewFindingPublicationFence(decoded, fence)) {
+        throw new Error(`Review-finding publication fence is stale for ${fence.repo}#${fence.pullRequest} generation ${fence.generation}`);
+      }
+      if (current.guard_token && (current.guard_expires_at ?? 0) > now) {
+        throw new Error(`Review-finding publication mutation is already guarded for ${fence.repo}#${fence.pullRequest}`);
+      }
+      const token = randomUUID();
+      const expiresAt = now + ttlMs;
+      const result = this.#database.prepare(`
+        UPDATE review_finding_publication_fences
+        SET guard_token = ?, guard_expires_at = ?
+        WHERE fence_key = ? AND generation = ? AND fence_json = ?
+          AND (guard_token IS NULL OR guard_expires_at <= ?)
+      `).run(token, expiresAt, key, fence.generation, JSON.stringify(fence), now);
+      if (result.changes !== 1) throw new Error(`Review-finding publication guard acquisition lost for ${fence.repo}#${fence.pullRequest}`);
+      return { token, fence: structuredClone(fence), expiresAt };
+    }));
+  }
+
+  async releaseReviewFindingPublicationGuard(guard: ReviewFindingPublicationMutationGuard): Promise<void> {
+    const key = reviewFindingPublicationFenceKey(guard.fence.repo, guard.fence.pullRequest);
+    await withSqliteBusyRetry(() => this.#database.prepare(`
+      UPDATE review_finding_publication_fences SET guard_token = NULL, guard_expires_at = NULL
+      WHERE fence_key = ? AND guard_token = ?
+    `).run(key, guard.token));
   }
 
   async claim(key: RemediationAdmissionKey): Promise<RemediationAdmissionClaim> {
@@ -526,6 +572,38 @@ export class SqliteRepositories implements ArtifactRepository, RunRepository, Le
       `).run(JSON.stringify(snapshot), admissionKey);
       if (result.changes !== 1) throw new Error(`Unknown remediation admission: ${admissionKey}`);
     });
+  }
+
+  async completeReviewFindingAdmission(
+    key: RemediationAdmissionKey,
+    snapshot: IssueSnapshot,
+    fence: ReviewFindingPublicationFence,
+    guard: ReviewFindingPublicationMutationGuard,
+  ): Promise<void> {
+    const admissionKey = remediationAdmissionKey(key);
+    const fenceKey = reviewFindingPublicationFenceKey(fence.repo, fence.pullRequest);
+    if (key.repo.trim().toLowerCase() !== fence.repo.trim().toLowerCase()
+      || key.parentPullRequest !== fence.pullRequest
+      || key.headSha.trim().toLowerCase() !== fence.headSha.trim().toLowerCase()) {
+      throw new Error(`Review-finding admission identity does not match publication fence for ${fence.repo}#${fence.pullRequest}`);
+    }
+    await withSqliteBusyRetry(() => this.inTransaction(() => {
+      const current = this.#database.prepare(`
+        SELECT generation, fence_json, guard_token, guard_expires_at
+        FROM review_finding_publication_fences WHERE fence_key = ?
+      `).get(fenceKey) as { generation: number; fence_json: string; guard_token?: string; guard_expires_at?: number } | undefined;
+      const decoded = current ? JSON.parse(current.fence_json) as ReviewFindingPublicationFence : undefined;
+      const now = Date.now();
+      if (!current || !decoded || current.generation !== fence.generation || !sameReviewFindingPublicationFence(decoded, fence)
+        || current.guard_token !== guard.token || (current.guard_expires_at ?? 0) <= now || guard.expiresAt <= now) {
+        throw new Error(`Review-finding publication guard is stale for ${fence.repo}#${fence.pullRequest} generation ${fence.generation}`);
+      }
+      const result = this.#database.prepare(`
+        UPDATE remediation_admissions SET status = 'materialized', issue_json = ?
+        WHERE admission_key = ? AND status = 'pending'
+      `).run(JSON.stringify(snapshot), admissionKey);
+      if (result.changes !== 1) throw new Error(`Review-finding admission is not pending: ${admissionKey}`);
+    }));
   }
 
   async invalidateMaterialized(key: RemediationAdmissionKey, expectedIssueNumber: number): Promise<boolean> {

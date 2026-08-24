@@ -890,6 +890,61 @@ describe("GitHub review finding projection", () => {
     assert.equal(mutations, 0);
   });
 
+  it("leaves the old admission pending when the head changes during create and adopts it on the current fence", async () => {
+    const headA = "a".repeat(40);
+    const headB = "b".repeat(40);
+    let live: PullRequestSnapshot = {
+      repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
+      state: "OPEN", headSha: headA, headBranch: "fix", baseBranch: "main",
+    };
+    const finding = {
+      id: "review-1111111111111111", severity: "high" as const, confidence: "high" as const, blocking: true,
+      title: "Fenced finding", evidence: "The create window must be fenced.", location: "src/schema.ts:20",
+      intentRelevance: "Prevents stale authority", remediation: "Hold the publication guard.",
+    };
+    const issues: Array<{ number: number; title: string; body: string; html_url: string; state: "open" | "closed"; labels: string[] }> = [];
+    const admissions = new InMemoryRemediationAdmissionRepository();
+    const client = new GitHubClient(".", admissions);
+    Object.defineProperty(client, "getPullRequest", { value: async () => ({ ...live }) });
+    let creates = 0;
+    Object.defineProperty(client, "gh", { value: async (args: string[], body?: string) => {
+      if (args[0] === "label" && args[1] === "create") return "";
+      if (args[0] === "api" && args[1]?.includes("issues?state=all")) return JSON.stringify([issues]);
+      if (args[0] === "api" && args[1] === "repos/a/b/issues/57") return "{}";
+      if (args[0] === "api" && args[1]?.includes("/comments")) return "[[]]";
+      if (args[0] === "issue" && args[1] === "create") {
+        creates += 1;
+        issues.push({ number: 101, title: args[args.indexOf("--title") + 1] ?? "Finding", body: body ?? "", html_url: "https://github.test/a/b/issues/101", state: "open", labels: ["review-finding", "needs-validation", "priority:P1"] });
+        live = { ...live, headSha: headB };
+        await admissions.beginReviewFindingPublication({ repo: live.repo, pullRequest: live.number, runId: "run-new-head", headSha: live.headSha, headBranch: live.headBranch, baseBranch: live.baseBranch });
+        return "https://github.test/a/b/issues/101\n";
+      }
+      if (args[0] === "issue" && args[1] === "view" && args[2] === "101") {
+        const issue = issues[0]!;
+        return JSON.stringify({ number: issue.number, title: issue.title, body: issue.body, url: issue.html_url, state: issue.state.toUpperCase(), labels: issue.labels.map((name) => ({ name })), milestone: null });
+      }
+      if (args[0] === "issue" && args[1] === "edit" && args[2] === "101") {
+        const issue = issues[0]!;
+        issue.title = args[args.indexOf("--title") + 1] ?? issue.title;
+        issue.body = body ?? issue.body;
+        return "";
+      }
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+    const firstInput = { repo: "a/b", pullRequest: { ...live }, runId: "run-old-head", reviewedHeadSha: headA, reviewerRoles: ["concurrency"], finding };
+    await assert.rejects(client.materializeReviewFinding(firstInput), /exact live PR route|publication fence is stale/);
+    assert.equal(creates, 1);
+    assert.ok([...admissions.records.values()].every(({ status }) => status === "pending"));
+
+    const currentPullRequest = { ...live };
+    const currentFence = await client.beginReviewFindingPublication({ repo: "a/b", pullRequest: currentPullRequest, runId: "run-retry" });
+    const adopted = await client.materializeReviewFinding({ ...firstInput, pullRequest: currentPullRequest, runId: "run-retry", reviewedHeadSha: headB, publicationFence: currentFence });
+    assert.equal(adopted.number, 101);
+    assert.equal(creates, 1);
+    assert.equal(adopted.projection?.status, "adopted");
+    assert.match(issues[0]!.body, new RegExp(headB));
+  });
+
   it("adopts an existing marker-matched root issue across a fresh admission store", async () => {
     const pullRequest = {
       repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",

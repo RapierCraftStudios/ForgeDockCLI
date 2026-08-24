@@ -787,6 +787,27 @@ describe("SQLite operational repositories", () => {
       assert.equal(newer.generation, older.generation + 1);
       await assert.rejects(first.assertReviewFindingPublication(older), /publication fence is stale/);
       await first.assertReviewFindingPublication(newer);
+      const admissionKey = {
+        repo: route.repo, parentIssue: 0, parentPullRequest: route.pullRequest,
+        headSha: newer.headSha, marker: "review-finding:guard-test",
+      };
+      assert.equal((await first.claim(admissionKey)).status, "claimed");
+      const guard = await first.acquireReviewFindingPublicationGuard(newer);
+      await assert.rejects(second.acquireReviewFindingPublicationGuard(newer), /already guarded/);
+      await second.completeReviewFindingAdmission(admissionKey, {
+        repo: route.repo, number: 41, title: "finding", body: "marker", url: "https://github.test/a/b/issues/41", state: "OPEN",
+      }, newer, guard);
+      assert.equal((await first.claim(admissionKey)).status, "materialized");
+      await second.releaseReviewFindingPublicationGuard(guard);
+      const newest = await first.beginReviewFindingPublication({ ...route, runId: "run-newest", headSha: "c".repeat(40) });
+      const recoveryKey = { ...admissionKey, headSha: newest.headSha, marker: "review-finding:expiry-test" };
+      assert.equal((await first.claim(recoveryKey)).status, "claimed");
+      const lost = await first.acquireReviewFindingPublicationGuard(newest, { ttlMs: 1 });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await assert.rejects(first.completeReviewFindingAdmission(recoveryKey, {
+        repo: route.repo, number: 42, title: "finding", body: "marker", url: "https://github.test/a/b/issues/42", state: "OPEN",
+      }, newest, lost), /guard is stale/);
+      await first.releaseReviewFindingPublicationGuard(lost);
     } finally {
       first.close();
       second.close();

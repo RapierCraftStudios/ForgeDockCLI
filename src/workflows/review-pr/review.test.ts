@@ -306,6 +306,18 @@ describe("fresh-context PR review", () => {
     assert.ok(issueProjection > lastReviewerComment, "issue projection must follow every reviewer comment");
   });
 
+  it("retains the planned checkpoint when a finding projection is not OPEN", async () => {
+    const runs = new InMemoryRunRepository();
+    const run = await reviewingRun(runs);
+    const host = new FakeHost();
+    Object.defineProperty(host, "materializeReviewFinding", { value: async (input: { finding: { id: string }; reviewerRoles: readonly string[] }) => ({
+      repo: pr.repo, number: 501, title: input.finding.id, body: "", url: "https://github.test/a/b/issues/501", state: "CLOSED" as const,
+    }) });
+    await assert.rejects(materializeReviewFindings({ run, pullRequest: pr, findings: [{
+      ...inScope, id: "review-3333333333333333", reviewerRoles: ["correctness"],
+    }] }, host), /is not OPEN.*pending reconciliation/);
+  });
+
   it("uses impact-gated projection to keep low-value test gaps in the verdict only", async () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);
