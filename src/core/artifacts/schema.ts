@@ -812,6 +812,9 @@ export const RemediationBlockedPayloadSchema = Type.Object({
   baseBranch: NonEmptyString,
   packetArtifactId: NonEmptyString,
   verdictArtifactId: NonEmptyString,
+  /** Exact source artifacts are required on current checkpoints; optional only for legacy decoding. */
+  buildResultArtifactId: Type.Optional(NonEmptyString),
+  projectionArtifactId: Type.Optional(NonEmptyString),
   reason: Type.Union([Type.Literal("scope-violation"), Type.Literal("remediation-budget")]),
   findings: Type.Array(Type.Object({
     id: NonEmptyString,
@@ -821,6 +824,17 @@ export const RemediationBlockedPayloadSchema = Type.Object({
     location: Type.Optional(NonEmptyString),
     remediation: NonEmptyString,
     acceptanceCriterion: Type.Optional(NonEmptyString),
+    rootId: Type.Optional(NonEmptyString),
+    normalizedRoot: Type.Optional(NonEmptyString),
+    causalRoot: Type.Optional(NonEmptyString),
+    sourceSnapshot: Type.Optional(Type.Object({
+      reviewedHeadSha: NonEmptyString,
+      path: NonEmptyString,
+      excerpt: Type.Optional(Type.String({ minLength: 1, maxLength: 4000 })),
+      digest: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$", minLength: 64, maxLength: 64 })),
+      symbol: Type.Optional(NonEmptyString),
+    })),
+    matchedAcceptanceCriteria: Type.Optional(Type.Array(NonEmptyString)),
   })),
   childIssues: Type.Array(Type.Integer({ minimum: 1 })),
   childRunIds: Type.Array(NonEmptyString),

@@ -31,6 +31,12 @@ import { classifyRetryableError, deterministicOperationKey, retryBackoffMs } fro
 import { reconcileBeforeReplay } from "../../core/retry-operations.js";
 import { isGitHubAuthenticationFailure, refreshConfiguredGitHubApp } from "./github-auth.js";
 import { withExternalOperationRetry, type ExternalOperationCoordinator } from "../../core/external-operation-retry.js";
+import {
+  remediationChildMarker as canonicalRemediationChildMarker,
+  reviewFindingLaneMarker as canonicalReviewFindingLaneMarker,
+  reviewFindingMarker as canonicalReviewFindingMarker,
+  reviewFindingSemanticMarker as canonicalReviewFindingSemanticMarker,
+} from "../../core/remediation-identity.js";
 
 export const repositoryFromRemote = parseRepositoryFromRemote;
 
@@ -2261,27 +2267,16 @@ export function reviewFindingReconciliationCandidates(
 }
 
 export function reviewFindingLaneMarker(repo: string, pullRequest: number): string {
-  const identity = `${repo.toLowerCase()}\n${pullRequest}`;
-  return `<!-- FORGEDOCK:REVIEW-FINDING-LANE v1 ${createHash("sha256").update(identity).digest("hex")} -->`;
+  return canonicalReviewFindingLaneMarker(repo, pullRequest);
 }
 
+/** Adapter compatibility exports delegate to the controller's one identity implementation. */
 export function reviewFindingMarker(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
-  return `<!-- FORGEDOCK:REVIEW-FINDING ${createHash("sha256").update(`${reviewFindingIdentity(repo, pullRequest, finding)}\n${finding.id.trim()}`).digest("hex")} -->`;
+  return canonicalReviewFindingMarker(repo, pullRequest, finding);
 }
 
 export function reviewFindingSemanticMarker(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
-  const root = finding.rootId?.trim() || finding.normalizedRoot?.trim() || finding.causalRoot?.trim() || [finding.location ?? "", finding.title].join("\n");
-  const identity = [repo.trim().toLowerCase(), String(pullRequest), root.replaceAll("\\", "/").replace(/\s+/g, " ").trim().toLowerCase()].join("\n");
-  return `<!-- FORGEDOCK:REVIEW-FINDING-IDENTITY v1 ${createHash("sha256").update(identity).digest("hex")} -->`;
-}
-
-function reviewFindingIdentity(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
-  return [
-    repo.toLowerCase(),
-    String(pullRequest),
-    finding.location?.replaceAll("\\", "/").trim().toLowerCase() ?? "",
-    finding.title.replace(/\s+/g, " ").trim().toLowerCase(),
-  ].join("\n");
+  return canonicalReviewFindingSemanticMarker(repo, pullRequest, finding);
 }
 
 function reviewFindingPriority(severity: ReviewFindingInput["severity"]): "priority:P0" | "priority:P1" | "priority:P2" | "priority:P3" {
@@ -3043,9 +3038,7 @@ function decompositionMarker(repo: string, parentIssue: number, title: string): 
 }
 
 function remediationChildMarker(repo: string, parentRunId: string, parentIssue: number, parentPullRequest: number, headSha: string, findingId: string): string {
-  return createHash("sha256").update([
-    repo.toLowerCase(), parentRunId, String(parentIssue), String(parentPullRequest), headSha.toLowerCase(), findingId,
-  ].join("\n")).digest("hex");
+  return canonicalRemediationChildMarker(repo, parentRunId, parentIssue, parentPullRequest, headSha, findingId);
 }
 
 function orderDecompositionChildren(children: DecompositionChild[]): DecompositionChild[] {

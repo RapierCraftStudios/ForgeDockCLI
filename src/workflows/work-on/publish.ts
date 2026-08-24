@@ -7,7 +7,8 @@ import type { GitWorkspace, GitWorkspaceManager } from "../../core/ports/git-wor
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
 import { transition, type RunState } from "../../core/state/machine.js";
 import { deterministicOutcomeId, WorkflowExecutionError, retryableExternalWorkflowError } from "./investigate.js";
-import { assertRunTargetsBranch } from "./lane.js";
+import { assertRunTargetsBranch, type ParentRemediationTarget } from "./lane.js";
+import { assertParentRemediationArtifactRoute, assertParentRemediationIssueRoute, assertParentRemediationSourceRoute } from "./parent-remediation.js";
 import { normalizedTargetRouteClaim, persistTargetAdvanceCheckpoint } from "./target-recovery.js";
 
 export function assertParentRemediationPullRequestTarget(input: {
@@ -28,15 +29,23 @@ export async function publishPullRequest(
     packet: DurableArtifact<"BuildPacket">;
     buildResult: DurableArtifact<"BuildResult">;
     workspace: GitWorkspace;
-    parentRemediation?: { parentBranch: string; parentPullRequest: number };
+    parentRemediation?: ParentRemediationTarget;
   },
   dependencies: { git: GitWorkspaceManager; host: ForgeHost; runs: RunRepository; artifacts?: ArtifactRepository },
 ): Promise<{ run: RunState; pullRequest: PullRequestSnapshot }> {
   if (input.run.state !== "publishing") throw new Error(`Publication requires publishing state, found ${input.run.state}`);
   let run = input.run;
   try {
+    const issue = run.subject.issue;
+    if (!issue) throw new Error("work-on publication requires an issue subject");
     const targetBranch = input.parentRemediation?.parentBranch ?? run.targetBranch;
     if (!targetBranch) throw new Error(`Run ${run.runId} has no frozen target branch`);
+    if (input.parentRemediation) {
+      if (!dependencies.artifacts) throw new Error("Parent remediation publication requires source artifact authority");
+      await assertParentRemediationArtifactRoute(dependencies.artifacts, input.parentRemediation, run.subject.repo);
+      await assertParentRemediationIssueRoute(dependencies.host, input.parentRemediation, { repo: run.subject.repo, number: issue });
+      await assertParentRemediationSourceRoute(dependencies.host, input.parentRemediation);
+    }
     if (!input.parentRemediation) assertWorkspaceFollowsTarget(input.workspace, targetBranch);
     await assertTargetHeadUnchanged(
       dependencies.host,
@@ -48,11 +57,20 @@ export async function publishPullRequest(
     if (workspaceHead !== input.buildResult.payload.headSha) {
       throw new Error(`Publication workspace head ${workspaceHead} does not match verified build ${input.buildResult.payload.headSha}`);
     }
-    const issue = run.subject.issue;
-    if (!issue) throw new Error("work-on publication requires an issue subject");
     const existing = await dependencies.host.findOpenPullRequest?.(run.subject.repo, input.workspace.branch);
     if (existing && !input.parentRemediation) assertRunTargetsBranch(run, existing.baseBranch);
+    if (input.parentRemediation) {
+      await assertParentRemediationArtifactRoute(dependencies.artifacts!, input.parentRemediation, run.subject.repo);
+      await assertParentRemediationSourceRoute(dependencies.host, input.parentRemediation);
+    }
     await dependencies.git.push(input.workspace);
+    // Re-read the immutable source route after push and immediately before any
+    // child PR create/refresh; a retry must not retarget an unrelated source PR.
+    if (input.parentRemediation) {
+      await assertParentRemediationArtifactRoute(dependencies.artifacts!, input.parentRemediation, run.subject.repo);
+      await assertParentRemediationIssueRoute(dependencies.host, input.parentRemediation, { repo: run.subject.repo, number: issue });
+      await assertParentRemediationSourceRoute(dependencies.host, input.parentRemediation);
+    }
     const body = renderPullRequestHandoff({
       issue,
       packet: input.packet,

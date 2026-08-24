@@ -52,6 +52,7 @@ import type { RemediationFindingInput } from "../orchestrate/remediation.js";
 import type { BatchMemberContract } from "../orchestrate/batching.js";
 import { repositoryPathFromLocation } from "../review-pr/scope.js";
 import { assertParentRemediationTarget, assertRunTargetsBranch, laneEvidence, runTargetForLane, type IssueLane, type ParentRemediationTarget } from "./lane.js";
+import { assertParentRemediationArtifactRoute, assertParentRemediationIssueRoute, assertParentRemediationSourceRoute } from "./parent-remediation.js";
 import { normalizedTargetRouteClaim, persistTargetAdvanceCheckpoint, TARGET_RECOVERY_MAX_ATTEMPTS } from "./target-recovery.js";
 import { persistRetryCheckpoint } from "../../core/state/retry-checkpoint.js";
 import { expandInvariantMatrix } from "./invariant-matrix.js";
@@ -1283,6 +1284,9 @@ export async function workOn(
     await assertFreshIssueOpen(dependencies.host, input.intent.subject.repo, issue);
     if (input.parentRemediation) {
       assertParentRemediationTarget(input.parentRemediation);
+      await assertParentRemediationArtifactRoute(dependencies.artifacts, input.parentRemediation, input.intent.subject.repo);
+      await assertParentRemediationIssueRoute(dependencies.host, input.parentRemediation, { repo: input.intent.subject.repo, number: issue });
+      await assertParentRemediationSourceRoute(dependencies.host, input.parentRemediation);
       if (dependencies.host.getBranchHead) {
         const currentParentHead = await dependencies.host.getBranchHead(input.intent.subject.repo, input.parentRemediation.parentBranch);
         if (!/^[0-9a-f]{7,64}$/i.test(currentParentHead)) {
@@ -2375,7 +2379,7 @@ async function continueBuildDelivery(
   assertLease(dependencies);
   const published = await publishPullRequest({
     run, intent: input.intent, packet: input.packet, buildResult, workspace: input.workspace,
-    ...(input.parentRemediation ? { parentRemediation: { parentBranch: input.parentRemediation.parentBranch, parentPullRequest: input.parentRemediation.parentPullRequest } } : {}),
+    ...(input.parentRemediation ? { parentRemediation: input.parentRemediation } : {}),
   }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts });
   run = published.run;
   let pullRequest = published.pullRequest;
@@ -2634,7 +2638,7 @@ export async function resumeWorkOn(
     let buildResult = verified.buildResult;
     const published = await publishPullRequest({
       run, intent: input.intent, packet: input.packet, buildResult, workspace: input.workspace,
-      ...(input.parentRemediation ? { parentRemediation: { parentBranch: input.parentRemediation.parentBranch, parentPullRequest: input.parentRemediation.parentPullRequest } } : {}),
+      ...(input.parentRemediation ? { parentRemediation: input.parentRemediation } : {}),
     }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts });
     run = published.run;
     let pullRequest = published.pullRequest;
@@ -3275,7 +3279,7 @@ export async function resumePublicationWorkOn(
   try {
     const published = await publishPullRequest({
       run, intent: input.intent, packet: input.packet, buildResult, workspace: input.workspace,
-      ...(input.parentRemediation ? { parentRemediation: { parentBranch: input.parentRemediation.parentBranch, parentPullRequest: input.parentRemediation.parentPullRequest } } : {}),
+      ...(input.parentRemediation ? { parentRemediation: input.parentRemediation } : {}),
     }, { git: dependencies.git, host: dependencies.host, runs: dependencies.runs, artifacts: dependencies.artifacts });
     run = published.run;
     let pullRequest = published.pullRequest;
@@ -4247,12 +4251,31 @@ async function blockForRecursiveRemediation(
     ...(finding.location ? { location: finding.location } : {}),
     remediation: finding.remediation,
     ...(finding.matchedAcceptanceCriteria?.[0] ? { acceptanceCriterion: finding.matchedAcceptanceCriteria[0] } : {}),
+    ...(finding.rootId ? { rootId: finding.rootId } : {}),
+    ...(finding.normalizedRoot ? { normalizedRoot: finding.normalizedRoot } : {}),
+    ...(finding.causalRoot ? { causalRoot: finding.causalRoot } : {}),
+    ...(finding.sourceSnapshot ? { sourceSnapshot: finding.sourceSnapshot } : {}),
+    ...(finding.matchedAcceptanceCriteria ? { matchedAcceptanceCriteria: finding.matchedAcceptanceCriteria } : {}),
   }));
+  const sourceArtifacts = await dependencies.artifacts.list(run.subject);
+  const buildResultId = [...(run.artifactIds.BuildResult ?? [])].at(-1);
+  const buildResult = sourceArtifacts.find((artifact): artifact is DurableArtifact<"BuildResult"> =>
+    artifact.kind === "BuildResult" && artifact.id === buildResultId && artifact.runId === run.runId
+      && artifact.payload.headSha.toLowerCase() === pullRequest.headSha.toLowerCase());
+  const projectionIds = run.artifactIds.ReviewFindingProjection ?? [];
+  const projection = sourceArtifacts.find((artifact): artifact is DurableArtifact<"ReviewFindingProjection"> =>
+    artifact.kind === "ReviewFindingProjection" && projectionIds.includes(artifact.id)
+      && artifact.runId === run.runId && artifact.payload.status === "completed"
+      && artifact.payload.pullRequest === pullRequest.number
+      && artifact.payload.headSha.toLowerCase() === pullRequest.headSha.toLowerCase());
+  if (!buildResult || !projection) throw new Error("Recursive remediation requires an exact BuildResult and completed ReviewFindingProjection");
   const result = await supervisor.begin({
     parentRun: run,
     parentPullRequest: pullRequest,
     packetArtifact: packet,
     verdictArtifact: verdict,
+    buildResultArtifact: buildResult,
+    projectionArtifact: projection,
     reason: "scope-violation",
     findings,
     ...(limits.depth !== undefined ? { remediationDepth: limits.depth } : {}),
