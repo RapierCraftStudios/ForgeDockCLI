@@ -128,6 +128,56 @@ describe("artifact codec", () => {
     assert.deepEqual(findArtifacts(comment)[0], verdict);
   });
 
+  it("round trips and renders the retained revision route in a projection checkpoint", () => {
+    const route = {
+      kind: "retained-revision" as const,
+      repository: "acme/widget",
+      pullRequest: 9,
+      reviewedHeadSha: "a".repeat(40),
+      headBranch: "feature/guard",
+      baseBranch: "main",
+      verifiedBaseSha: "b".repeat(40),
+      deliveryIssue: 42,
+      deliveryRun: "run_delivery",
+      findingId: "review-route",
+      findingRoot: "root-route",
+      matchedAcceptanceCriterion: "Guard passes",
+      matchedAcceptanceCriteria: ["Guard passes"],
+      sourceSnapshot: { reviewedHeadSha: "a".repeat(40), path: "src/auth.ts", excerpt: "guard" },
+      lineage: {
+        kind: "retained-delivery" as const,
+        sourceRunId: "run_delivery",
+        sourceIssue: 42,
+        sourceBranch: "feature/guard",
+        targetBranch: "main",
+      },
+    };
+    const projection = createArtifact({
+      kind: "ReviewFindingProjection", runId: "run_review", subject: { repo: "acme/widget", issue: 42, pr: 9 },
+      producer: { role: "controller" },
+      payload: {
+        checkpoint: "review-finding-publication", status: "completed", pullRequest: 9,
+        headSha: "a".repeat(40), headBranch: "feature/guard", baseBranch: "main",
+        disposition: "request_changes", reviewerRoles: ["correctness"], checks: [],
+        findings: [{
+          id: "review-route", severity: "high", confidence: "high", blocking: true, rootId: "root-route",
+          title: "Guard route", evidence: "Evidence", intentRelevance: "Keeps delivery identity", remediation: "Preserve route",
+          sourceSnapshot: { reviewedHeadSha: "a".repeat(40), path: "src/auth.ts", excerpt: "guard" },
+          matchedAcceptanceCriteria: ["Guard passes"],
+        }],
+        findingProjection: { policy: "all", candidateFindingIds: ["review-route"], materializedFindingIds: ["review-route"], suppressed: [] },
+        route,
+        routes: [route],
+        projections: [{ findingId: "review-route", status: "materialized", route }],
+      },
+    });
+    const comment = renderArtifactComment(projection);
+    assert.match(comment, /run_delivery/);
+    assert.match(comment, /feature\/guard.*main/);
+    assert.match(comment, /RETAINED/);
+    assert.deepEqual(findArtifacts(comment)[0], projection);
+  });
+
   it("compresses and byte-bounds large verdicts without losing durable data", () => {
     const repeatedEvidence = "Unicode evidence → 🔒 ".repeat(4_000);
     const verdict = createArtifact({

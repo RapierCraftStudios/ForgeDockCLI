@@ -48,6 +48,7 @@ function runArtifacts(runId: string, headSha: string, createdAt: string): Durabl
       payload: {
         branch: `forgedock/${runId}`,
         targetBranch: "main",
+        baseSha: "c".repeat(40),
         headSha,
         changedPaths: ["src/a.ts"],
         summary: "Implemented guard",
@@ -74,6 +75,19 @@ describe("standalone review artifact selection", () => {
     assert.equal(selected.investigation.runId, "run_current");
     assert.equal(selected.packet.runId, "run_current");
     assert.equal(selected.buildResult.runId, "run_current");
+  });
+
+  it("keeps the selected delivery run distinct from a newly created review run", () => {
+    const selected = reviewArtifactsForHead(
+      runArtifacts("run_delivery", "b".repeat(40), "2026-01-01T00:00:00.000Z"),
+      "b".repeat(40),
+      "forgedock/run_delivery",
+      "main",
+    );
+    const reviewRunId = "run_review_existing_pr";
+    assert.notEqual(reviewRunId, selected.buildResult.runId);
+    assert.equal(selected.buildResult.runId, "run_delivery");
+    assert.equal(selected.buildResult.payload.baseSha, "c".repeat(40));
   });
 
   it("never borrows a missing packet from another run", () => {

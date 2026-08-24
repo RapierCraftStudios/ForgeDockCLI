@@ -10,7 +10,7 @@ import { AgentRunError, type AgentEventSink, type AgentRunResult, type AgentRunt
 import { FakeAgentRuntime } from "../../runtime/fake-runtime.js";
 import { computeReviewPlanId, planReviewPanel, type ReviewPlan, type ReviewPlanContext } from "./planner.js";
 import { reconcileFindingRootLedger } from "./finding-root-ledger.js";
-import { isTransientReviewerTransportFailure, materializeReviewFindings, renderReviewerSubmissionComment, renderReviewerWaveComment, resolveFindingIssuePolicy, resolveReviewerAttemptTimeoutMs, resumeReviewFindingProjection, reviewPullRequest, ReviewerSubmissionSchema, selectReviewerRoles, type ReviewerSubmission } from "./review.js";
+import { deriveRetainedRevisionRoute, isTransientReviewerTransportFailure, materializeReviewFindings, renderReviewerSubmissionComment, renderReviewerWaveComment, resolveFindingIssuePolicy, resolveReviewerAttemptTimeoutMs, resumeReviewFindingProjection, reviewPullRequest, ReviewerSubmissionSchema, selectReviewerRoles, type ReviewerSubmission } from "./review.js";
 
 const sha = "a".repeat(40);
 const pr: PullRequestSnapshot = { repo: "a/b", number: 4, title: "Fix race", body: "", url: "https://github.test/a/b/pull/4", state: "OPEN", headSha: sha, headBranch: "fix", baseBranch: "main" };
@@ -113,7 +113,7 @@ function artifacts(run: RunState) {
     scope: ["Lock update"], acceptanceCriteria: ["Concurrent updates pass"], context: [], implementationPlan: ["Use lock"], expectedPaths: ["src/lock.ts"], verificationPlan: ["npm test"], risks: [{ risk: "concurrency race", mitigation: "lock" }], outOfScope: [],
   } });
   const buildResult = createArtifact({ ...common, kind: "BuildResult", producer: { role: "controller" }, payload: {
-    branch: "fix", targetBranch: "main", headSha: sha, changedPaths: ["src/lock.ts"], summary: "Locked", acceptanceEvidence: [{ criterion: "Concurrent updates pass", status: "passed", evidence: "test" }], checks: [{ command: "npm test", status: "passed", exitCode: 0, durationMs: 1 }], decisions: [], residualRisks: [],
+    branch: "fix", targetBranch: "main", headSha: sha, baseSha: "b".repeat(40), changedPaths: ["src/lock.ts"], summary: "Locked", acceptanceEvidence: [{ criterion: "Concurrent updates pass", status: "passed", evidence: "test" }], checks: [{ command: "npm test", status: "passed", exitCode: 0, durationMs: 1 }], decisions: [], residualRisks: [],
   } });
   return { intent, investigation, packet, buildResult };
 }
@@ -173,6 +173,55 @@ function priorRootArtifacts(
 }
 
 describe("fresh-context PR review", () => {
+  it("binds an accepted finding to the retained BuildResult run, not the review run", async () => {
+    const runs = new InMemoryRunRepository();
+    const reviewRun = await reviewingRun(runs);
+    const context = artifacts(reviewRun);
+    const deliveryRun = "run_delivery_retained";
+    const buildResult = { ...context.buildResult, runId: deliveryRun };
+    const route = deriveRetainedRevisionRoute({
+      run: reviewRun,
+      pullRequest: pr,
+      buildResult,
+      packet: context.packet,
+      expectedDeliveryRunId: deliveryRun,
+      changedPaths: ["src/lock.ts"],
+      finding: {
+        ...inScope,
+        id: "route-binding",
+        severity: "high",
+        confidence: "high",
+        blocking: true,
+        title: "Retained route binding",
+        evidence: "The review must preserve delivery identity",
+        intentRelevance: "The retained revision is the remediation target",
+        remediation: "Keep the BuildResult run in the route",
+      },
+    });
+    assert.equal(route.deliveryRun, deliveryRun);
+    assert.equal(route.lineage.sourceRunId, deliveryRun);
+    assert.equal(route.pullRequest, pr.number);
+    assert.equal(route.verifiedBaseSha, "b".repeat(40));
+    assert.throws(() => deriveRetainedRevisionRoute({
+      run: reviewRun,
+      pullRequest: pr,
+      buildResult: { ...buildResult, payload: { ...buildResult.payload, baseSha: undefined } },
+      packet: context.packet,
+      expectedDeliveryRunId: deliveryRun,
+      changedPaths: ["src/lock.ts"],
+      finding: {
+        ...inScope,
+        id: "route-missing-base",
+        severity: "high",
+        confidence: "high",
+        blocking: true,
+        title: "Missing base",
+        evidence: "No base",
+        intentRelevance: "Route must be verified",
+        remediation: "Reject the route",
+      },
+    }), /missing its verified base SHA/);
+  });
   it("repairs a stale source head only when the supplied proof validates", async () => {
     const runs = new InMemoryRunRepository();
     const run = await reviewingRun(runs);
