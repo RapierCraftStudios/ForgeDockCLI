@@ -58,7 +58,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node scripts/clean-build-output.mjs && tsc -p tsconfig.json",
     "build:pi": "npm --prefix vendor/pi run build --workspace=@earendil-works/pi-tui && npm --prefix vendor/pi run build:offline --workspace=@earendil-works/pi-ai && npm --prefix vendor/pi run build --workspace=@earendil-works/pi-agent-core && npm --prefix vendor/pi run build --workspace=@earendil-works/pi-storage-sqlite-node && npm --prefix vendor/pi run build --workspace=@earendil-works/pi-coding-agent",
     "stage:pi": "node scripts/stage-pi-fork.mjs",
     "postinstall": "node scripts/patch-pi-subagents-visibility.mjs",
