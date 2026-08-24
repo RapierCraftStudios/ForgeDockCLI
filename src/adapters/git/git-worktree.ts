@@ -6,6 +6,8 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
+import type { DiffManifest, DiffManifestLimits } from "../../core/artifacts/finding-anchor.js";
+import { buildDiffManifest } from "../../core/artifacts/finding-anchor.js";
 import type { GitWorkspace, GitWorkspaceManager, PullRequestRepairWorkspaceManager, ReviewWorkspaceManager } from "../../core/ports/git-workspace.js";
 import { verificationEnvironment } from "../../runtime/controller-environment.js";
 
@@ -105,6 +107,26 @@ export class GitWorktreeManager implements GitWorkspaceManager, ReviewWorkspaceM
     await this.withRepositoryMetadataLock(() => this.git(["worktree", "add", "--detach", path, fetched], this.#repo));
     await this.installDependencies(path);
     return { path, branch: `review/pr-${input.pr}`, baseRef: input.headSha, baseSha: input.headSha };
+  }
+
+  /**
+   * Review identity boundary: a manifest may only be associated with the
+   * detached commit that was fetched for the requested PR head, never with a
+   * dirty or subsequently moved worktree.
+   */
+  async assertReviewFrozen(workspace: GitWorkspace, expectedHeadSha: string): Promise<void> {
+    const actual = await this.head(workspace);
+    if (!workspace.baseSha || actual.toLowerCase() !== expectedHeadSha.toLowerCase() || workspace.baseSha.toLowerCase() !== expectedHeadSha.toLowerCase()) {
+      throw new Error("Review workspace is not bound to the requested frozen head");
+    }
+    const dirty = await this.changedPaths(workspace);
+    if (dirty.length) throw new Error(`Review workspace is dirty; cannot derive frozen manifest (${dirty.join(", ")})`);
+  }
+
+  async frozenDiffManifest(workspace: GitWorkspace, diff: string, limits?: Partial<DiffManifestLimits>): Promise<DiffManifest> {
+    const expected = workspace.baseSha ?? workspace.baseRef;
+    await this.assertReviewFrozen(workspace, expected);
+    return buildDiffManifest({ diff, headSha: expected, limits });
   }
 
   async changedPaths(workspace: GitWorkspace): Promise<string[]> {

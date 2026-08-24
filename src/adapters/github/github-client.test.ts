@@ -6,7 +6,7 @@ import type { Subject } from "../../core/artifacts/schema.js";
 import { renderArtifactComment } from "../../core/artifacts/codec.js";
 import type { PlanMaterializationRequest } from "../../core/ports/forge-host.js";
 import { InMemoryRemediationAdmissionRepository } from "../../core/ports/repositories.js";
-import { GitHubArtifactRepository, GitHubClient, renderPaginatedPullRequestDiff, repositoryFromRemote, reviewFindingLaneMarker, reviewFindingMarker, reviewFindingReconciliationCandidates, reviewFindingSemanticMarker, workflowLabelForState } from "./github-client.js";
+import { GitHubArtifactRepository, GitHubClient, renderPaginatedPullRequestDiff, renderReviewFindingIssue, repositoryFromRemote, reviewFindingLaneMarker, reviewFindingMarker, reviewFindingReconciliationCandidates, reviewFindingSemanticMarker, workflowLabelForState } from "./github-client.js";
 
 class CommentClient {
   comments = new Map<string, string[]>();
@@ -383,6 +383,24 @@ describe("GitHub review finding projection", () => {
     );
     assert.equal(reviewFindingLaneMarker("A/B", 57), reviewFindingLaneMarker("a/b", 57));
     assert.match(reviewFindingLaneMarker("a/b", 57), /^<!-- FORGEDOCK:REVIEW-FINDING-LANE v1 [a-f0-9]{64} -->$/);
+  });
+
+  it("serializes typed anchor fields and classified diagnostics instead of hiding them in prose", () => {
+    const head = "a".repeat(40);
+    const rendered = renderReviewFindingIssue({
+      repo: "a/b", pullRequest: { repo: "a/b", number: 57, title: "Fix", body: "", url: "u", state: "OPEN", headSha: head, headBranch: "fix", baseBranch: "main" },
+      runId: "run-anchor", reviewedHeadSha: head, reviewerRoles: ["correctness"],
+      finding: {
+        id: "typed", severity: "high", confidence: "high", blocking: false, title: "Typed evidence", evidence: "Evidence", intentRelevance: "Criterion", remediation: "Fix",
+        evidenceAnchor: { version: 1, kind: "repository-location", path: "src/a.ts", blobSha: "b".repeat(40), side: "new", range: { start: 2, end: 2 }, snippetHash: "c".repeat(64) },
+        anchorResolution: { status: "wrong-sha", diagnostic: "wrong blob identity", manifestIdentity: "d".repeat(64), path: "src/a.ts", side: "new", range: { start: 2, end: 2 } },
+      },
+      marker: "<!-- marker -->", laneMarker: "<!-- lane -->", priority: "priority:P1",
+    });
+    assert.match(rendered.body, /Typed anchor/);
+    assert.match(rendered.body, /wrong-sha/);
+    assert.match(rendered.body, /Manifest identity/);
+    assert.match(rendered.body, /src\/a\.ts/);
   });
 
   it("retains one issue per active root and reconciles stale or duplicate lane projections", () => {

@@ -24,7 +24,7 @@ class FakeHost implements ForgeHost {
   async materializeDecomposition() { return []; }
   async createPullRequest(): Promise<PullRequestSnapshot> { return pr; }
   async getPullRequest(): Promise<PullRequestSnapshot> { return this.snapshots.shift() ?? pr; }
-  async getPullRequestDiff(): Promise<string> { return "diff --git a/src/lock.ts b/src/lock.ts\n+await lock.run(update)"; }
+  async getPullRequestDiff(): Promise<string> { return `diff --git a/src/lock.ts b/src/lock.ts\nindex ${"c".repeat(40)}..${"b".repeat(40)} 100644\n--- a/src/lock.ts\n+++ b/src/lock.ts\n@@ -1 +1 @@\n-await lock.run(update)\n+await lock.run(update)`; }
   async getChangedPathsBetween(_repo: string, baseSha: string, headSha: string): Promise<readonly string[]> {
     this.remediationDeltaRequests.push({ baseSha, headSha });
     return this.remediationDeltaPaths;
@@ -92,6 +92,7 @@ const inScope = {
   matchedAcceptanceCriteria: ["Concurrent updates pass"],
   matchedPriorFindingIds: [] as string[],
   introducedByRemediation: false,
+  evidenceAnchor: { version: 1 as const, kind: "repository-location" as const, path: "src/lock.ts", blobSha: "b".repeat(40), side: "new" as const, range: { start: 1, end: 1 }, snippetHash: "d".repeat(64) },
   causalRoot: "lock releases before guarded write",
   impact: {
     category: "correctness" as const,

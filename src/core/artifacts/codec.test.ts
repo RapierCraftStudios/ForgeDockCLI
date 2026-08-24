@@ -66,6 +66,34 @@ describe("artifact codec", () => {
     assert.deepEqual(findArtifacts(comment)[0], adjudication);
   });
 
+  it("rejects malformed typed ranges while retaining legacy finding decode compatibility", () => {
+    assert.throws(() => createArtifact({
+      kind: "ReviewVerdict", runId: "run_bad_anchor", subject: { repo: "acme/widget", pr: 9 }, producer: { role: "controller" },
+      payload: {
+        headSha: "a".repeat(40), disposition: "approve", reviewerRoles: ["correctness"], checks: [], findings: [{
+          id: "bad", severity: "high", confidence: "high", blocking: false, title: "Bad", evidence: "Bad", intentRelevance: "Bad", remediation: "Bad",
+          evidenceAnchor: { version: 1, kind: "repository-location", path: "src/a.ts", blobSha: "b".repeat(40), side: "new", range: { start: 2, end: 1 }, snippetHash: "c".repeat(64) },
+        }],
+      },
+    }), /Invalid typed finding anchor/);
+  });
+
+  it("round trips a versioned typed anchor and structured resolver result", () => {
+    const verdict = createArtifact({
+      kind: "ReviewVerdict", runId: "run_anchor", subject: { repo: "acme/widget", pr: 9 }, producer: { role: "controller" },
+      payload: {
+        headSha: "a".repeat(40), manifestIdentity: "b".repeat(64), disposition: "approve", reviewerRoles: ["correctness"], checks: [],
+        findings: [{
+          id: "typed-1", severity: "medium", confidence: "high", blocking: false, title: "Changed line", evidence: "The changed line is evidence.",
+          intentRelevance: "Matches the packet", remediation: "Keep the invariant", reviewerRoles: ["correctness"],
+          evidenceAnchor: { version: 1, kind: "repository-location", path: "src/a.ts", blobSha: "c".repeat(40), side: "new", range: { start: 2, end: 2 }, snippetHash: "d".repeat(64) },
+          anchorResolution: { status: "accepted", diagnostic: "exact frozen evidence", manifestIdentity: "b".repeat(64), path: "src/a.ts", side: "new", range: { start: 2, end: 2 } },
+        }],
+      },
+    });
+    assert.deepEqual(decodeArtifactMarker(encodeArtifactMarker(verdict)), verdict);
+  });
+
   it("renders explainable review routing and consolidated finding lineage", () => {
     const verdict = createArtifact({
       kind: "ReviewVerdict", runId: "run_review", subject: { repo: "acme/widget", issue: 42, pr: 9 },

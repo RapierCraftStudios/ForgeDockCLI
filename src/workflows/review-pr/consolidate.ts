@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHash } from "node:crypto";
+import { canonicalControllerAnchor, type AnchorResolution } from "../../core/artifacts/finding-anchor.js";
 import type { ReviewerRole, ReviewerSubmission } from "./review.js";
 
 export type Finding = ReviewerSubmission["findings"][number];
@@ -19,6 +20,8 @@ export interface FindingPolicyContext {
   verifiedAuthorityReferences?: readonly string[];
   /** Exact controller-observed deterministic check references. */
   verifiedCheckReferences?: readonly string[];
+  /** Frozen-manifest resolver. When supplied, legacy path/prose anchors fail closed. */
+  resolveRepositoryAnchor?: (anchor: unknown) => AnchorResolution;
 }
 
 interface SourceFinding {
@@ -149,8 +152,12 @@ function consolidateCluster(
   const matchedPriorFindingIds = unique(representative.finding.matchedPriorFindingIds);
   const scopeDisposition = representative.finding.scopeDisposition;
   const normalizedRoot = normalizedCausalRoot(representative.finding, matchedAcceptanceCriteria);
+  const resolvedAnchor = policy.resolveRepositoryAnchor ? resolutionForFinding(representative.finding, policy) : undefined;
+  const producedAnchor = policy.resolveRepositoryAnchor ? canonicalControllerReference(representative.finding.evidenceAnchor) : undefined;
   const result: ConsolidatedFinding = {
     ...representative.finding,
+    ...(producedAnchor ? { evidenceAnchor: producedAnchor } : {}),
+    ...(resolvedAnchor?.path && !representative.finding.location ? { location: `${resolvedAnchor.path}:${resolvedAnchor.range?.start ?? 1}` } : {}),
     id: `review-${createHash("sha256").update(normalizedRoot).digest("hex").slice(0, 16)}`,
     normalizedRoot,
     severity,
@@ -167,6 +174,7 @@ function consolidateCluster(
     sourceFindingIds,
     ...(sourceSessionRefs.length ? { sourceSessionRefs } : {}),
     reviewerRoles,
+    ...(resolvedAnchor ? { anchorResolution: resolvedAnchor } : {}),
   };
   result.blocking = qualifying.length > 0 && evaluateFindingBlockingPolicy(result, blockingSeverities, policy);
   return result;
@@ -202,8 +210,14 @@ function validatedAnchor(
 ): NonNullable<Finding["evidenceAnchor"]>["kind"] | undefined {
   const allowed = unique([...policy.reviewedPaths, ...policy.expectedPaths].map(normalizeRepoPath));
   const locationPath = repositoryPath(finding.location);
-  if (locationPath && allowed.some((path) => pathMatches(locationPath, path))) return "repository-location";
   const anchor = finding.evidenceAnchor;
+  if (policy.resolveRepositoryAnchor) {
+    if (isTypedRepositoryAnchor(anchor)) return policy.resolveRepositoryAnchor(anchor).status === "accepted" ? "repository-location" : undefined;
+    if (anchor?.kind === "delivery-authority" && policy.verifiedAuthorityReferences?.includes(anchor.reference)) return anchor.kind;
+    if (anchor?.kind === "deterministic-check" && policy.verifiedCheckReferences?.includes(anchor.reference)) return anchor.kind;
+    return undefined;
+  }
+  if (locationPath && allowed.some((path) => pathMatches(locationPath, path))) return "repository-location";
   if (!anchor) return undefined;
   if (anchor.kind === "repository-location") {
     const referencePath = repositoryPath(anchor.reference);
@@ -213,6 +227,27 @@ function validatedAnchor(
     return policy.verifiedAuthorityReferences?.includes(anchor.reference) ? anchor.kind : undefined;
   }
   return policy.verifiedCheckReferences?.includes(anchor.reference) ? anchor.kind : undefined;
+}
+
+function isTypedRepositoryAnchor(anchor: Finding["evidenceAnchor"]): anchor is Extract<NonNullable<Finding["evidenceAnchor"]>, { version: 1; kind: "repository-location" }> {
+  return Boolean(anchor && "version" in anchor && anchor.version === 1 && anchor.kind === "repository-location" && "path" in anchor);
+}
+
+function canonicalControllerReference(anchor: Finding["evidenceAnchor"]): Finding["evidenceAnchor"] | undefined {
+  if (!anchor || anchor.kind === "repository-location") return undefined;
+  return canonicalControllerAnchor(anchor as Parameters<typeof canonicalControllerAnchor>[0]);
+}
+
+function resolutionForFinding(finding: Finding, policy: FindingPolicyContext): AnchorResolution {
+  const anchor = finding.evidenceAnchor;
+  if (isTypedRepositoryAnchor(anchor)) return policy.resolveRepositoryAnchor!(anchor);
+  if (anchor?.kind === "delivery-authority" || anchor?.kind === "deterministic-check") {
+    const verified = anchor.kind === "delivery-authority" ? policy.verifiedAuthorityReferences : policy.verifiedCheckReferences;
+    return verified?.includes(anchor.reference)
+      ? { status: "accepted", diagnostic: `controller reference ${anchor.kind} is exact and verified` }
+      : { status: "stale", diagnostic: `controller reference ${anchor.kind} is not an exact frozen reference` };
+  }
+  return { status: "missing", diagnostic: "finding has no versioned typed anchor for the frozen manifest" };
 }
 
 function normalizedCausalRoot(finding: Finding, criteria: readonly string[]): string {
@@ -226,7 +261,7 @@ function normalizedCausalRoot(finding: Finding, criteria: readonly string[]): st
 }
 function authorityBoundary(finding: Finding): string {
   return findingPaths(finding).sort()[0]
-    ?? (finding.evidenceAnchor ? `${finding.evidenceAnchor.kind}:${normalize(finding.evidenceAnchor.reference)}` : "");
+    ?? (finding.evidenceAnchor ? `${finding.evidenceAnchor.kind}:${normalize(anchorReference(finding.evidenceAnchor))}` : "");
 }
 
 function combineSourceText(sources: readonly SourceFinding[], select: (source: SourceFinding) => string, maximum: number): string {
@@ -262,8 +297,17 @@ function conceptTags(finding: Finding): Set<string> {
   return tags;
 }
 function findingPaths(finding: Finding): string[] {
-  return unique([repositoryPath(finding.location), repositoryPath(finding.evidenceAnchor?.kind === "repository-location" ? finding.evidenceAnchor.reference : undefined)]
+  const anchor = finding.evidenceAnchor;
+  const anchorPath = anchor?.kind === "repository-location"
+    ? (isTypedRepositoryAnchor(anchor) ? anchor.path : anchor.reference)
+    : undefined;
+  return unique([repositoryPath(finding.location), repositoryPath(anchorPath)]
     .filter((path): path is string => Boolean(path)));
+}
+
+function anchorReference(anchor: NonNullable<Finding["evidenceAnchor"]>): string {
+  if (isTypedRepositoryAnchor(anchor)) return anchor.path;
+  return "reference" in anchor ? anchor.reference : "";
 }
 function repositoryPath(value: string | undefined): string | undefined {
   if (!value) return undefined;

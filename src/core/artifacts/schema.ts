@@ -2,6 +2,7 @@
 
 import { Type, type Static, type TSchema } from "typebox";
 import { Check, Errors } from "typebox/value";
+import { canonicalControllerAnchor, canonicalRepositoryAnchor, normalizeAnchorRange, ControllerReferenceAnchorSchema, RepositoryFindingAnchorSchema, type AnchorResolution, type TypedFindingAnchor } from "./finding-anchor.js";
 
 const NonEmptyString = Type.String({ minLength: 1 });
 const IsoDateTime = Type.String({ format: "date-time" });
@@ -183,6 +184,33 @@ export const FindingImpactSchema = Type.Object({
 });
 export type FindingImpact = Static<typeof FindingImpactSchema>;
 
+const LegacyEvidenceAnchorSchema = Type.Object({
+  kind: Type.Union([
+    Type.Literal("repository-location"),
+    Type.Literal("delivery-authority"),
+    Type.Literal("deterministic-check"),
+  ]),
+  reference: NonEmptyString,
+});
+export const EvidenceAnchorSchema = Type.Union([
+  LegacyEvidenceAnchorSchema,
+  RepositoryFindingAnchorSchema,
+  ControllerReferenceAnchorSchema,
+]);
+export const AnchorResolutionSchema = Type.Object({
+  status: Type.Union([
+    Type.Literal("accepted"), Type.Literal("malformed"), Type.Literal("traversal"), Type.Literal("missing"),
+    Type.Literal("stale"), Type.Literal("wrong-sha"), Type.Literal("impossible"), Type.Literal("out-of-diff"),
+    Type.Literal("rename"), Type.Literal("deletion"), Type.Literal("binary"), Type.Literal("generated"),
+    Type.Literal("omitted-patch"), Type.Literal("concurrent-head"),
+  ]),
+  diagnostic: Type.String({ minLength: 1, maxLength: 1_000 }),
+  manifestIdentity: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$" })),
+  path: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+  side: Type.Optional(Type.Union([Type.Literal("old"), Type.Literal("new")])),
+  range: Type.Optional(Type.Object({ start: Type.Integer({ minimum: 1, maximum: 10_000_000 }), end: Type.Integer({ minimum: 1, maximum: 10_000_000 }) })),
+  hunk: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+});
 export const FindingSchema = Type.Object({
   id: NonEmptyString,
   severity: Type.Union([
@@ -205,14 +233,10 @@ export const FindingSchema = Type.Object({
   /** Structured impact declaration added by the current reviewer contract. */
   impact: Type.Optional(FindingImpactSchema),
   /** Controller-verifiable anchor proposed by a reviewer; prose alone is never an anchor. */
-  evidenceAnchor: Type.Optional(Type.Object({
-    kind: Type.Union([
-      Type.Literal("repository-location"),
-      Type.Literal("delivery-authority"),
-      Type.Literal("deterministic-check"),
-    ]),
-    reference: NonEmptyString,
-  })),
+  /** Legacy anchors remain decodable; controller-produced findings use the versioned union. */
+  evidenceAnchor: Type.Optional(EvidenceAnchorSchema),
+  /** Controller-owned result; absent only on older durable findings. */
+  anchorResolution: Type.Optional(AnchorResolutionSchema),
   sourceFindingIds: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
   sourceSessionRefs: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
   reviewerRoles: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
@@ -225,6 +249,9 @@ export const FindingSchema = Type.Object({
   matchedPriorFindingIds: Type.Optional(Type.Array(NonEmptyString)),
   introducedByRemediation: Type.Optional(Type.Boolean()),
 });
+export type Finding = Static<typeof FindingSchema>;
+export type FindingAnchorResolution = AnchorResolution;
+export type FindingTypedAnchor = TypedFindingAnchor;
 
 const ReviewerRoleSchema = Type.Union([
   Type.Literal("correctness"), Type.Literal("security"), Type.Literal("data"),
@@ -331,6 +358,8 @@ export const ReviewFindingProjectionPayloadSchema = Type.Object({
   status: Type.Union([Type.Literal("planned"), Type.Literal("completed")]),
   pullRequest: Type.Integer({ minimum: 1 }),
   headSha: Sha,
+  /** Identity of the single bounded manifest used for all finding resolution. */
+  manifestIdentity: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$" })),
   headBranch: NonEmptyString,
   baseBranch: NonEmptyString,
   disposition: Type.Union([
@@ -371,6 +400,8 @@ export const ReviewFindingProjectionPayloadSchema = Type.Object({
 
 export const ReviewVerdictPayloadSchema = Type.Object({
   headSha: Sha,
+  /** Identity of the single bounded manifest used for all finding resolution. */
+  manifestIdentity: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$" })),
   headBranch: Type.Optional(NonEmptyString),
   baseBranch: Type.Optional(NonEmptyString),
   disposition: Type.Union([
@@ -609,6 +640,27 @@ export function assertArtifact(value: unknown): asserts value is DurableArtifact
   }
   const payloadSchema = ArtifactPayloadSchemas[candidate.kind];
   if (!Check(payloadSchema, candidate.payload)) throw validationError("payload", payloadSchema, candidate.payload);
+  validateTypedFindingAnchors(candidate.payload);
+}
+
+function validateTypedFindingAnchors(payload: unknown): void {
+  if (!payload || typeof payload !== "object" || !("findings" in payload) || !Array.isArray(payload.findings)) return;
+  for (const finding of payload.findings) {
+    if (!finding || typeof finding !== "object" || !("evidenceAnchor" in finding) || !finding.evidenceAnchor || typeof finding.evidenceAnchor !== "object") continue;
+    const anchor = finding.evidenceAnchor as { version?: unknown; kind?: unknown };
+    if ("anchorResolution" in finding && finding.anchorResolution && typeof finding.anchorResolution === "object" && "range" in finding.anchorResolution && finding.anchorResolution.range) {
+      try { normalizeAnchorRange(finding.anchorResolution.range as { start: number; end: number }); } catch (error) {
+        throw new Error(`Invalid finding anchor resolution: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (anchor.version !== 1) continue; // legacy free-form anchors remain decode-compatible.
+    try {
+      if (anchor.kind === "repository-location") canonicalRepositoryAnchor(finding.evidenceAnchor as Parameters<typeof canonicalRepositoryAnchor>[0]);
+      else if (anchor.kind === "delivery-authority" || anchor.kind === "deterministic-check") canonicalControllerAnchor(finding.evidenceAnchor as Parameters<typeof canonicalControllerAnchor>[0]);
+    } catch (error) {
+      throw new Error(`Invalid typed finding anchor: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
 }
 
 function validationError(label: string, schema: TSchema, value: unknown): Error {

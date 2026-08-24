@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
+import { buildDiffManifest, resolveRepositoryAnchor } from "../../core/artifacts/finding-anchor.js";
 import { consolidateReviewerFindings as consolidateReviewerFindingsWithPolicy } from "./consolidate.js";
 import type { ReviewerSubmission } from "./review.js";
 import { applyFindingScopePolicy } from "./scope.js";
@@ -46,6 +47,45 @@ function consolidateReviewerFindings(
 }
 
 describe("cross-reviewer finding consolidation", () => {
+  it("gates blocking on an accepted frozen typed anchor and preserves classified diagnostics", () => {
+    const oldSha = "a".repeat(40); const newSha = "b".repeat(40);
+    const manifest = buildDiffManifest({ diff: `diff --git a/src/a.ts b/src/a.ts\nindex ${oldSha}..${newSha}\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-old\n+new\n`, headSha: newSha });
+    const typed = { version: 1 as const, kind: "repository-location" as const, path: "src/a.ts", blobSha: newSha, side: "new" as const, range: { start: 1, end: 1 }, snippetHash: "c".repeat(64) };
+    const [accepted] = consolidateReviewerFindings([{ role: "correctness", output: submission([{ ...base, id: "typed-accepted", severity: "high", evidenceAnchor: typed }]) }], new Set(["high"]), {
+      reviewedPaths: ["src/a.ts"], expectedPaths: ["src/a.ts"], resolveRepositoryAnchor: (anchor) => resolveRepositoryAnchor(anchor, manifest, { currentHeadSha: newSha }),
+    });
+    assert.equal(accepted?.blocking, true);
+    assert.equal(accepted?.anchorResolution?.status, "accepted");
+    const [rejected] = consolidateReviewerFindings([{ role: "correctness", output: submission([{ ...base, id: "typed-wrong", severity: "high", evidenceAnchor: { ...typed, blobSha: oldSha } }]) }], new Set(["high"]), {
+      reviewedPaths: ["src/a.ts"], expectedPaths: ["src/a.ts"], resolveRepositoryAnchor: (anchor) => resolveRepositoryAnchor(anchor, manifest, { currentHeadSha: newSha }),
+    });
+    assert.equal(rejected?.blocking, false);
+    assert.equal(rejected?.anchorResolution?.status, "wrong-sha");
+  });
+  it("invariant:matrix-adapter-lifecycle-6e0f9c09dccc keeps classified adapter evidence non-blocking", () => {
+    const [finding] = consolidateReviewerFindings([{ role: "correctness", output: submission([{ ...base, id: "lifecycle-classified", severity: "high", evidenceAnchor: { version: 1 as const, kind: "repository-location" as const, path: "src/a.ts", blobSha: "f".repeat(40), side: "new" as const, range: { start: 1, end: 1 }, snippetHash: "e".repeat(64) } }]) }], new Set(["high"]), {
+      reviewedPaths: ["src/a.ts"], expectedPaths: ["src/a.ts"], resolveRepositoryAnchor: () => ({ status: "stale", diagnostic: "stale adapter evidence" }),
+    });
+    assert.equal(finding?.blocking, false);
+    assert.equal(finding?.anchorResolution?.status, "stale");
+  });
+
+  it("invariant:matrix-identity-isolation-2e894a2860d3 keeps authority from donating repository evidence", () => {
+    const [finding] = consolidateReviewerFindings([{ role: "correctness", output: submission([{ ...base, id: "identity-isolated", severity: "high", evidenceAnchor: { kind: "delivery-authority", reference: "not-verified" } }]) }], new Set(["high"]), {
+      reviewedPaths: ["src/a.ts"], expectedPaths: ["src/a.ts"], verifiedAuthorityReferences: [], resolveRepositoryAnchor: () => ({ status: "missing", diagnostic: "not a repository anchor" }),
+    });
+    assert.equal(finding?.blocking, false);
+    assert.equal(finding?.anchorResolution?.status, "stale");
+  });
+
+  it("invariant:matrix-terminal-metadata-5ce4f92d02e5 preserves suppression metadata for failed terminal evidence", () => {
+    const [finding] = consolidateReviewerFindings([{ role: "correctness", output: submission([{ ...base, id: "terminal-suppressed", severity: "high" }]) }], new Set(["high"]), {
+      reviewedPaths: ["src/a.ts"], expectedPaths: ["src/a.ts"], resolveRepositoryAnchor: () => ({ status: "concurrent-head", diagnostic: "terminal head changed" }),
+    });
+    assert.equal(finding?.blocking, false);
+    assert.equal(finding?.anchorResolution?.status, "missing");
+  });
+
   it("merges differently worded registry findings with source lineage", () => {
     const findings = consolidateReviewerFindings([
       { role: "data", sessionRef: "session-data", output: submission([{

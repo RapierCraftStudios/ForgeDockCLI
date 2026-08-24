@@ -51,8 +51,10 @@ describe("isolated Git worktrees", () => {
 
     const manager = new GitWorktreeManager(repo, join(root, "worktrees"));
     const workspace = await manager.create({ runId: "run_test", issue: 12, baseRef: "HEAD" });
+    await manager.assertReviewFrozen(workspace, await manager.head(workspace));
     assert.equal(existsSync(join(workspace.path, "node_modules", "example", "package.json")), true);
     writeFileSync(join(workspace.path, "feature.txt"), "partial implementation\n");
+    await assert.rejects(manager.assertReviewFrozen(workspace, workspace.baseSha!), /dirty/);
     // A success stamp must not hide a partial tree left by an interrupted npm
     // operation. Recovery should reinstall the missing direct package entry.
     const partialPackage = join(workspace.path, "node_modules", "example");

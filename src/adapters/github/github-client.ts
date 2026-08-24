@@ -3,6 +3,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { findArtifacts, renderArtifactComment } from "../../core/artifacts/codec.js";
+import { normalizeRepositoryPath } from "../../core/artifacts/finding-anchor.js";
 import type { ArtifactKind, DurableArtifact, Subject } from "../../core/artifacts/schema.js";
 import type { RunState, RunStateName } from "../../core/state/machine.js";
 import type {
@@ -1439,7 +1440,7 @@ function reviewFindingPriority(severity: ReviewFindingInput["severity"]): "prior
   return "priority:P3";
 }
 
-function renderReviewFindingIssue(
+export function renderReviewFindingIssue(
   input: ReviewFindingMaterializationInput,
   marker: string,
   laneMarker: string,
@@ -1447,7 +1448,7 @@ function renderReviewFindingIssue(
   regression?: IssueSnapshot,
 ): { title: string; body: string } {
   const title = boundedGitHubText(`fix: ${input.finding.title} (review finding — PR #${input.pullRequest.number})`, 240).replace(/[\r\n]+/g, " ");
-  const affectedFile = reviewFindingPath(input.finding.location);
+  const affectedFile = typedFindingPath(input.finding) ?? reviewFindingPath(input.finding.location);
   const sensitive = /security|auth|billing|payment|stripe|charge|invoice|credential|secret|token/i.test(`${affectedFile ?? ""} ${input.finding.title}`);
   const body = [
     "## Problem",
@@ -1465,6 +1466,13 @@ function renderReviewFindingIssue(
     `**Confidence:** ${input.finding.confidence.toUpperCase()}`,
     `**Severity:** ${input.finding.severity.toUpperCase()}`,
     `**Controller disposition:** ${input.finding.blocking ? "blocking" : "non-blocking"}`,
+    ...(input.finding.evidenceAnchor && "version" in input.finding.evidenceAnchor
+      ? [`**Typed anchor:** \`${boundedGitHubCode(JSON.stringify(input.finding.evidenceAnchor))}\``]
+      : []),
+    ...(input.finding.anchorResolution
+      ? [`**Anchor resolution:** \`${boundedGitHubCode(input.finding.anchorResolution.status)}\` — ${boundedGitHubText(input.finding.anchorResolution.diagnostic, 1_000)}`,
+        ...(input.finding.anchorResolution.manifestIdentity ? [`**Manifest identity:** \`${input.finding.anchorResolution.manifestIdentity}\``] : [])]
+      : []),
     ...(input.finding.scopeDisposition ? [`**Scope disposition:** ${input.finding.scopeDisposition}`] : []),
     ...(input.finding.scopeRationale ? [`**Scope rationale:** ${boundedGitHubText(input.finding.scopeRationale, 3_000)}`] : []),
     ...(input.finding.matchedAcceptanceCriteria?.length
@@ -1603,6 +1611,12 @@ function closingIssueFromPullRequestBody(body: string): number | undefined {
 
 function milestoneTitleSlug(title: string): string {
   return title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+
+function typedFindingPath(finding: ReviewFindingInput): string | undefined {
+  const anchor = finding.evidenceAnchor;
+  if (!anchor || !("version" in anchor) || anchor.kind !== "repository-location") return undefined;
+  try { return normalizeRepositoryPath(anchor.path); } catch { return undefined; }
 }
 
 function reviewFindingPath(location: string | undefined): string | undefined {

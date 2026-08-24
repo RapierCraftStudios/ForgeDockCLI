@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import type { AnchorResolution, ControllerReferenceAnchor, RepositoryFindingAnchor } from "../artifacts/finding-anchor.js";
 export interface IssueMilestone {
   number: number;
   title: string;
@@ -152,10 +153,13 @@ export interface ReviewFindingInput {
   matchedAcceptanceCriteria?: readonly string[];
   matchedPriorFindingIds?: readonly string[];
   introducedByRemediation?: boolean;
-  evidenceAnchor?: {
+  /** Legacy reference anchors remain accepted for decoding and old callers. */
+  evidenceAnchor?: RepositoryFindingAnchor | ControllerReferenceAnchor | {
     kind: "repository-location" | "delivery-authority" | "deterministic-check";
     reference: string;
   };
+  /** Controller-produced typed resolution; classified evidence is non-blocking. */
+  anchorResolution?: AnchorResolution;
 }
 
 export interface PullRequestSnapshot {
