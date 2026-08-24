@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import { createHash } from "node:crypto";
 import { Type, type Static, type TSchema } from "typebox";
 import { Check, Errors } from "typebox/value";
 
@@ -423,6 +424,45 @@ export const FindingImpactSchema = Type.Object({
 });
 export type FindingImpact = Static<typeof FindingImpactSchema>;
 
+/**
+ * Proof carried by a retained review-finding route. FindingSchema remains
+ * legacy-decodable, but this branch is the only shape which may authorize a
+ * retained-revision projection.
+ */
+export const ReviewFindingRouteSourceSnapshotSchema = Type.Object({
+  reviewedHeadSha: NonEmptyString,
+  path: NonEmptyString,
+  excerpt: Type.Optional(Type.String({ minLength: 1, maxLength: 4000 })),
+  digest: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$", minLength: 64, maxLength: 64 })),
+  symbol: Type.Optional(NonEmptyString),
+});
+
+export const ReviewFindingRouteSchema = Type.Object({
+  routeKind: Type.Literal("retained-revision"),
+  repository: NonEmptyString,
+  pullRequest: Type.Integer({ minimum: 1 }),
+  reviewedHeadSha: Sha,
+  headBranch: NonEmptyString,
+  baseBranch: NonEmptyString,
+  baseSha: Sha,
+  deliveryIssue: Type.Integer({ minimum: 1 }),
+  deliveryRun: NonEmptyString,
+  findingId: NonEmptyString,
+  findingRoot: NonEmptyString,
+  matchedCriterion: NonEmptyString,
+  sourceSnapshot: ReviewFindingRouteSourceSnapshotSchema,
+  lineage: Type.Object({
+    repository: NonEmptyString,
+    pullRequest: Type.Integer({ minimum: 1 }),
+    reviewedHeadSha: Sha,
+    deliveryRun: NonEmptyString,
+    findingId: NonEmptyString,
+    findingRoot: NonEmptyString,
+  }),
+});
+export type ReviewFindingRoute = Static<typeof ReviewFindingRouteSchema>;
+export type ReviewFindingRouteSourceSnapshot = Static<typeof ReviewFindingRouteSourceSnapshotSchema>;
+
 export const FindingSchema = Type.Object({
   id: NonEmptyString,
   severity: Type.Union([
@@ -458,13 +498,7 @@ export const FindingSchema = Type.Object({
     reference: NonEmptyString,
   })),
   /** Structured current-source proof bound to the reviewed head; optional for legacy decoding. */
-  sourceSnapshot: Type.Optional(Type.Object({
-    reviewedHeadSha: NonEmptyString,
-    path: NonEmptyString,
-    excerpt: Type.Optional(Type.String({ minLength: 1, maxLength: 4000 })),
-    digest: Type.Optional(Type.String({ pattern: "^[0-9a-f]{64}$", minLength: 64, maxLength: 64 })),
-    symbol: Type.Optional(NonEmptyString),
-  })),
+  sourceSnapshot: Type.Optional(ReviewFindingRouteSourceSnapshotSchema),
   sourceFindingIds: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
   sourceSessionRefs: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
   reviewerRoles: Type.Optional(Type.Array(NonEmptyString, { minItems: 1 })),
@@ -474,6 +508,8 @@ export const FindingSchema = Type.Object({
   ])),
   scopeRationale: Type.Optional(NonEmptyString),
   matchedAcceptanceCriteria: Type.Optional(Type.Array(NonEmptyString)),
+  /** Strict retained-revision authority; absent on legacy findings. */
+  retainedRoute: Type.Optional(ReviewFindingRouteSchema),
   matchedPriorFindingIds: Type.Optional(Type.Array(NonEmptyString)),
   introducedByRemediation: Type.Optional(Type.Boolean()),
   introductionDisposition: Type.Optional(Type.Union([
@@ -488,6 +524,154 @@ export const FindingSchema = Type.Object({
     authorityReferences: Type.Optional(Type.Array(NonEmptyString)),
   })),
 });
+
+export interface RetainedReviewFindingAuthorityInput {
+  route: ReviewFindingRoute;
+  finding?: { id?: string; rootId?: string; normalizedRoot?: string; matchedAcceptanceCriteria?: readonly string[]; sourceSnapshot?: ReviewFindingRouteSourceSnapshot };
+  repository?: string;
+  pullRequest?: number;
+  reviewedHeadSha?: string;
+  headBranch?: string;
+  baseBranch?: string;
+  baseSha?: string;
+  deliveryIssue?: number;
+  deliveryRun?: string;
+  changedPaths?: readonly string[];
+  expectedPaths?: readonly string[];
+  frozenCriteria?: readonly string[];
+  readBlob?: (revision: string, path: string) => Promise<{ content: string; mode: string } | undefined>;
+  requireSourceVerification?: boolean;
+}
+
+function routePathMatches(path: string, expected: string): boolean {
+  const normalizedPath = path.replaceAll("\\", "/").replace(/^\.\//, "");
+  const normalizedExpected = expected.replaceAll("\\", "/").replace(/^\.\//, "");
+  if (normalizedExpected.endsWith("/**")) {
+    const root = normalizedExpected.slice(0, -3).replace(/\/$/, "");
+    return normalizedPath === root || normalizedPath.startsWith(`${root}/`);
+  }
+  return normalizedPath === normalizedExpected || normalizedPath.startsWith(`${normalizedExpected}/`);
+}
+
+/** Return every failed invariant without granting authority to malformed data. */
+export async function validateRetainedReviewFindingAuthority(
+  input: RetainedReviewFindingAuthorityInput,
+): Promise<string[]> {
+  const route = input.route;
+  const diagnostics: string[] = [];
+  if (!Check(ReviewFindingRouteSchema, route)) diagnostics.push("route does not satisfy ReviewFindingRouteSchema");
+  const equal = (label: string, left: unknown, right: unknown, insensitive = false) => {
+    if (left === undefined || right === undefined) return;
+    const matches = insensitive && typeof left === "string" && typeof right === "string"
+      ? left.toLowerCase() === right.toLowerCase() : left === right;
+    if (!matches) diagnostics.push(`${label} does not match the retained route`);
+  };
+  equal("repository", route.repository, input.repository, true);
+  equal("pullRequest", route.pullRequest, input.pullRequest);
+  equal("reviewedHeadSha", route.reviewedHeadSha, input.reviewedHeadSha, true);
+  equal("headBranch", route.headBranch, input.headBranch);
+  equal("baseBranch", route.baseBranch, input.baseBranch);
+  equal("baseSha", route.baseSha, input.baseSha, true);
+  if (input.repository !== undefined && input.baseSha === undefined) diagnostics.push("baseSha observation is missing for retained authority");
+  equal("deliveryIssue", route.deliveryIssue, input.deliveryIssue);
+  if (input.repository !== undefined && input.deliveryRun !== undefined && input.deliveryIssue === undefined) diagnostics.push("delivery issue observation is missing for retained authority");
+  equal("deliveryRun", route.deliveryRun, input.deliveryRun);
+  if (input.finding) {
+    equal("findingId", route.findingId, input.finding.id);
+    const root = input.finding.rootId ?? input.finding.normalizedRoot;
+    if (root !== undefined) equal("findingRoot", route.findingRoot, root);
+    if (!input.finding.matchedAcceptanceCriteria?.includes(route.matchedCriterion)) {
+      diagnostics.push("matchedCriterion is not an exact criterion on the finding");
+    }
+    if (input.finding.sourceSnapshot && !Check(ReviewFindingRouteSourceSnapshotSchema, input.finding.sourceSnapshot)) {
+      diagnostics.push("finding sourceSnapshot is malformed");
+    }
+    if (input.finding.sourceSnapshot) {
+      const findingSnapshot = input.finding.sourceSnapshot;
+      const routeSnapshot = route.sourceSnapshot;
+      if (findingSnapshot.reviewedHeadSha.toLowerCase() !== routeSnapshot.reviewedHeadSha.toLowerCase()
+        || findingSnapshot.path !== routeSnapshot.path
+        || findingSnapshot.excerpt !== routeSnapshot.excerpt
+        || findingSnapshot.digest?.toLowerCase() !== routeSnapshot.digest?.toLowerCase()
+        || findingSnapshot.symbol !== routeSnapshot.symbol) {
+        diagnostics.push("route sourceSnapshot does not equal finding sourceSnapshot");
+      }
+    }
+  }
+  equal("lineage.repository", route.lineage.repository, route.repository, true);
+  equal("lineage.pullRequest", route.lineage.pullRequest, route.pullRequest);
+  equal("lineage.reviewedHeadSha", route.lineage.reviewedHeadSha, route.reviewedHeadSha, true);
+  equal("lineage.deliveryRun", route.lineage.deliveryRun, route.deliveryRun);
+  equal("lineage.findingId", route.lineage.findingId, route.findingId);
+  equal("lineage.findingRoot", route.lineage.findingRoot, route.findingRoot);
+  if (input.frozenCriteria && !input.frozenCriteria.includes(route.matchedCriterion)) {
+    diagnostics.push("matchedCriterion is not an exact frozen packet criterion");
+  }
+  const snapshot = route.sourceSnapshot;
+  equal("sourceSnapshot.reviewedHeadSha", snapshot?.reviewedHeadSha, route.reviewedHeadSha, true);
+  const proofPresent = Boolean(snapshot?.excerpt || snapshot?.digest || snapshot?.symbol);
+  if (!proofPresent) diagnostics.push("sourceSnapshot requires excerpt, digest, or symbol proof");
+  const allowed = [...(input.changedPaths ?? []), ...(input.expectedPaths ?? [])];
+  if (input.requireSourceVerification && allowed.length === 0) diagnostics.push("changed-content scope is missing");
+  if (snapshot?.path && allowed.length && !allowed.some((candidate) => routePathMatches(snapshot.path, candidate))) {
+    diagnostics.push("sourceSnapshot.path is outside changed-content scope");
+  }
+  if (input.requireSourceVerification) {
+    if (!input.readBlob) diagnostics.push("sourceSnapshot cannot be verified without readBlob");
+    else if (snapshot?.path) {
+      try {
+        const blob = await input.readBlob(route.reviewedHeadSha, snapshot.path);
+        if (!blob || !/^100[0-7]{3}$/.test(blob.mode)) diagnostics.push("sourceSnapshot path is not a regular file at reviewed SHA");
+        else {
+          if (snapshot.excerpt && !blob.content.includes(snapshot.excerpt)) diagnostics.push("sourceSnapshot excerpt is absent at reviewed SHA");
+          if (snapshot.symbol && !blob.content.includes(snapshot.symbol)) diagnostics.push("sourceSnapshot symbol is absent at reviewed SHA");
+          if (snapshot.digest && createHashForRoute(blob.content) !== snapshot.digest.toLowerCase()) diagnostics.push("sourceSnapshot digest mismatches reviewed SHA");
+        }
+      } catch { diagnostics.push("sourceSnapshot exact read failed"); }
+    }
+  }
+  return [...new Set(diagnostics)];
+}
+
+function createHashForRoute(content: string): string {
+  // Avoid importing the workflow source verifier into the durable schema.
+  // This is the same SHA-256 proof used by sourceSnapshot.digest.
+  return createHash("sha256").update(content).digest("hex");
+}
+
+export async function assertRetainedReviewFindingAuthority(
+  input: RetainedReviewFindingAuthorityInput,
+): Promise<ReviewFindingRoute> {
+  const diagnostics = await validateRetainedReviewFindingAuthority(input);
+  if (diagnostics.length) throw new Error(`Invalid retained review-finding route: ${diagnostics.join("; ")}`);
+  return input.route;
+}
+
+export function hasRetainedReviewFindingRoute(value: unknown): value is ReviewFindingRoute {
+  return Check(ReviewFindingRouteSchema, value)
+    && Boolean((value as ReviewFindingRoute).sourceSnapshot.excerpt
+      || (value as ReviewFindingRoute).sourceSnapshot.digest
+      || (value as ReviewFindingRoute).sourceSnapshot.symbol);
+}
+
+export function isRetainedReviewFindingRouteForFinding(
+  route: unknown,
+  finding: { id: string; rootId?: string; normalizedRoot?: string; matchedAcceptanceCriteria?: readonly string[] },
+): route is ReviewFindingRoute {
+  if (!hasRetainedReviewFindingRoute(route)) return false;
+  const root = finding.rootId ?? finding.normalizedRoot;
+  return route.findingId === finding.id
+    && (root === undefined || route.findingRoot === root)
+    && route.matchedCriterion.length > 0
+    && finding.matchedAcceptanceCriteria?.includes(route.matchedCriterion) === true
+    && route.sourceSnapshot.reviewedHeadSha.toLowerCase() === route.reviewedHeadSha.toLowerCase()
+    && route.lineage.repository.toLowerCase() === route.repository.toLowerCase()
+    && route.lineage.pullRequest === route.pullRequest
+    && route.lineage.reviewedHeadSha.toLowerCase() === route.reviewedHeadSha.toLowerCase()
+    && route.lineage.deliveryRun === route.deliveryRun
+    && route.lineage.findingId === route.findingId
+    && route.lineage.findingRoot === route.findingRoot;
+}
 
 const ReviewerRoleSchema = Type.Union([
   Type.Literal("correctness"), Type.Literal("security"), Type.Literal("data"),
@@ -589,6 +773,8 @@ const ReviewFindingProjectionEntrySchema = Type.Object({
   marker: Type.Optional(NonEmptyString),
   issueNumber: Type.Optional(Type.Integer({ minimum: 1 })),
   issueUrl: Type.Optional(Type.String()),
+  /** Exact retained authority is duplicated at the projection boundary for auditability. */
+  retainedRoute: Type.Optional(ReviewFindingRouteSchema),
   mismatches: Type.Optional(Type.Array(NonEmptyString)),
 });
 
@@ -604,6 +790,8 @@ export const ReviewFindingProjectionPayloadSchema = Type.Object({
   headSha: Sha,
   headBranch: NonEmptyString,
   baseBranch: NonEmptyString,
+  /** Required for new retained routes; omitted only by legacy checkpoints. */
+  baseSha: Type.Optional(Sha),
   /** Durable host CAS generation; optional only for legacy projection decode. */
   publicationFence: Type.Optional(Type.Object({
     repo: NonEmptyString,
@@ -613,6 +801,7 @@ export const ReviewFindingProjectionPayloadSchema = Type.Object({
     headSha: Sha,
     headBranch: NonEmptyString,
     baseBranch: NonEmptyString,
+    baseSha: Type.Optional(Sha),
   })),
   disposition: Type.Union([
     Type.Literal("approve"),
@@ -654,6 +843,8 @@ export const ReviewVerdictPayloadSchema = Type.Object({
   headSha: Sha,
   headBranch: Type.Optional(NonEmptyString),
   baseBranch: Type.Optional(NonEmptyString),
+  /** Immutable target revision carried by retained findings. */
+  baseSha: Type.Optional(Sha),
   disposition: Type.Union([
     Type.Literal("approve"),
     Type.Literal("request_changes"),
@@ -999,6 +1190,7 @@ export type VerificationRequirement = Static<typeof VerificationRequirementSchem
 export type BuildResultPayload = ArtifactPayloadByKind["BuildResult"];
 export type ReviewVerdictPayload = ArtifactPayloadByKind["ReviewVerdict"];
 export type ReviewFindingProjectionPayload = ArtifactPayloadByKind["ReviewFindingProjection"];
+export type ReviewFindingRoutePayload = ReviewFindingRoute;
 export type FindingRootLedgerPayload = ArtifactPayloadByKind["FindingRootLedger"];
 export type OutcomePayload = ArtifactPayloadByKind["Outcome"];
 export type VerificationAdjudicationPayload = ArtifactPayloadByKind["VerificationAdjudication"];

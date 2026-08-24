@@ -793,6 +793,25 @@ describe("GitHub batch issue projection", () => {
 });
 
 describe("GitHub review finding projection", () => {
+  it("rejects legacy findings before marker admission or any remote mutation", async () => {
+    const client = new GitHubClient(".", new InMemoryRemediationAdmissionRepository());
+    let remoteCalls = 0;
+    Object.defineProperty(client, "gh", { value: async () => { remoteCalls += 1; return ""; } });
+    const pullRequest = {
+      repo: "a/b", number: 57, title: "Fix", body: "", url: "https://github.test/a/b/pull/57",
+      state: "OPEN" as const, headSha: "a".repeat(40), headBranch: "fix", baseBranch: "main", baseSha: "b".repeat(40),
+    };
+    await assert.rejects(client.materializeReviewFinding({
+      repo: "a/b", sourceIssue: 2, pullRequest, runId: "run-legacy", reviewedHeadSha: pullRequest.headSha,
+      reviewerRoles: ["data"], finding: {
+        id: "legacy-finding", severity: "high", confidence: "high", blocking: true,
+        title: "Legacy", evidence: "No retained route", location: "src/schema.ts:1",
+        intentRelevance: "Authority", remediation: "Add proof",
+      },
+    }), /legacy\/non-authoritative/);
+    assert.equal(remoteCalls, 0);
+  });
+
   it("derives a stable deduplication marker from PR, location, and finding identity", () => {
     const finding = {
       id: "security-1", severity: "medium" as const, confidence: "high" as const, blocking: true,

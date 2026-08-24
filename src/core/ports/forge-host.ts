@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+import type { ReviewFindingRoute } from "../artifacts/schema.js";
+
 export interface IssueMilestone {
   number: number;
   title: string;
@@ -153,6 +155,8 @@ export interface ReviewFindingInput {
     digest?: string;
     symbol?: string;
   };
+  /** Only a validated retained route may authorize GitHub remediation. */
+  retainedRoute?: ReviewFindingRoute;
   sourceFindingIds?: readonly string[];
   sourceSessionRefs?: readonly string[];
   reviewerRoles?: readonly string[];
@@ -183,6 +187,8 @@ export interface ReviewFindingPublicationFence {
   headSha: string;
   headBranch: string;
   baseBranch: string;
+  /** Optional for legacy host doubles; required by retained-route validation. */
+  baseSha?: string;
 }
 
 export interface PullRequestSnapshot {
@@ -195,6 +201,8 @@ export interface PullRequestSnapshot {
   headSha: string;
   headBranch: string;
   baseBranch: string;
+  /** GitHub base commit identity; optional for legacy snapshots. */
+  baseSha?: string;
 }
 
 /**
@@ -405,6 +413,7 @@ export interface ForgeHost {
   /** Close review-finding projections superseded by the latest authoritative verdict. */
   reconcileReviewFindings?(input: {
     repo: string;
+    sourceIssue?: number;
     pullRequest: PullRequestSnapshot;
     runId: string;
     publicationFence: ReviewFindingPublicationFence;

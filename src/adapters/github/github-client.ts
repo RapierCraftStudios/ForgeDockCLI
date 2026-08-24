@@ -3,6 +3,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { findArtifacts, renderArtifactComment } from "../../core/artifacts/codec.js";
+import { assertRetainedReviewFindingAuthority } from "../../core/artifacts/schema.js";
 import type { ArtifactKind, DurableArtifact, Subject } from "../../core/artifacts/schema.js";
 import type { RunState, RunStateName } from "../../core/state/machine.js";
 import { pullRequestMergeability } from "../../core/ports/forge-host.js";
@@ -802,6 +803,7 @@ export class GitHubClient implements ForgeHost {
       headSha: live.headSha,
       headBranch: live.headBranch,
       baseBranch: live.baseBranch,
+      ...(live.baseSha ? { baseSha: live.baseSha } : {}),
     });
     await this.assertReviewFindingPublicationBoundary(fence, live);
     return fence;
@@ -818,6 +820,7 @@ export class GitHubClient implements ForgeHost {
       || fence.headSha.toLowerCase() !== live.headSha.toLowerCase()
       || fence.headBranch !== live.headBranch
       || fence.baseBranch !== live.baseBranch
+      || (fence.baseSha !== undefined && live.baseSha?.toLowerCase() !== fence.baseSha.toLowerCase())
       || live.state !== "OPEN") {
       throw new Error(`Review-finding publication fence generation ${fence.generation} does not match the exact live PR route`);
     }
@@ -838,13 +841,31 @@ export class GitHubClient implements ForgeHost {
       || fence.pullRequest !== live.number
       || fence.headSha.toLowerCase() !== live.headSha.toLowerCase()
       || fence.headBranch !== live.headBranch
-      || fence.baseBranch !== live.baseBranch) {
+      || fence.baseBranch !== live.baseBranch
+      || (fence.baseSha !== undefined && live.baseSha?.toLowerCase() !== fence.baseSha.toLowerCase())) {
       throw new Error(`Review-finding publication fence generation ${fence.generation} does not match the exact live PR route`);
     }
     await this.remediationAdmissions.assertReviewFindingPublication(fence);
   }
 
   async materializeReviewFinding(input: ReviewFindingMaterializationInput): Promise<IssueSnapshot> {
+    if (!input.finding.retainedRoute) {
+      throw new Error(`Review finding ${input.finding.id} is legacy/non-authoritative and cannot authorize retained mutation`);
+    }
+    if (input.sourceIssue === undefined) throw new Error(`Review finding ${input.finding.id} has no delivery issue lineage`);
+    await assertRetainedReviewFindingAuthority({
+      route: input.finding.retainedRoute,
+      finding: input.finding,
+      repository: input.repo,
+      pullRequest: input.pullRequest.number,
+      reviewedHeadSha: input.reviewedHeadSha,
+      headBranch: input.pullRequest.headBranch,
+      baseBranch: input.pullRequest.baseBranch,
+      baseSha: input.pullRequest.baseSha,
+      deliveryIssue: input.sourceIssue,
+      deliveryRun: input.runId,
+      requireSourceVerification: false,
+    });
     input.publicationFence ??= await this.beginReviewFindingPublication({
       repo: input.repo,
       pullRequest: input.pullRequest,
@@ -914,6 +935,19 @@ export class GitHubClient implements ForgeHost {
     ];
     if (milestoneTitle) args.push("--milestone", milestoneTitle);
     await this.assertReviewFindingPublicationBoundary(input.publicationFence, input.pullRequest);
+    await assertRetainedReviewFindingAuthority({
+      route: input.finding.retainedRoute!,
+      finding: input.finding,
+      repository: input.repo,
+      pullRequest: input.pullRequest.number,
+      reviewedHeadSha: input.reviewedHeadSha,
+      headBranch: input.pullRequest.headBranch,
+      baseBranch: input.pullRequest.baseBranch,
+      baseSha: input.pullRequest.baseSha,
+      deliveryIssue: input.sourceIssue,
+      deliveryRun: input.runId,
+      requireSourceVerification: false,
+    });
     const url = (await this.gh(args, body)).trim();
     const number = Number(url.split("/").at(-1));
     if (!url || !Number.isSafeInteger(number) || number < 1) throw new Error("GitHub did not return a review-finding issue number");
@@ -941,6 +975,20 @@ export class GitHubClient implements ForgeHost {
   ): Promise<IssueSnapshot> {
     const publicationFence = input.publicationFence;
     if (!publicationFence) throw new Error("Review-finding refresh has no current publication fence");
+    if (!input.finding.retainedRoute) throw new Error(`Review finding ${input.finding.id} lost retained route authority during refresh`);
+    await assertRetainedReviewFindingAuthority({
+      route: input.finding.retainedRoute,
+      finding: input.finding,
+      repository: input.repo,
+      pullRequest: input.pullRequest.number,
+      reviewedHeadSha: input.reviewedHeadSha,
+      headBranch: input.pullRequest.headBranch,
+      baseBranch: input.pullRequest.baseBranch,
+      baseSha: input.pullRequest.baseSha,
+      deliveryIssue: input.sourceIssue,
+      deliveryRun: input.runId,
+      requireSourceVerification: false,
+    });
     await this.publishReviewFindingRecurrence({ ...input, publicationFence }, issue, marker);
     const priority = reviewFindingPriority(input.finding.severity);
     const milestoneTitle = await this.resolveReviewFindingMilestone(input);
@@ -960,6 +1008,19 @@ export class GitHubClient implements ForgeHost {
       if (milestoneTitle) args.push("--milestone", milestoneTitle);
       else if (issue.milestone) args.push("--remove-milestone");
       await this.assertReviewFindingPublicationBoundary(publicationFence, input.pullRequest);
+      await assertRetainedReviewFindingAuthority({
+        route: input.finding.retainedRoute,
+        finding: input.finding,
+        repository: input.repo,
+        pullRequest: input.pullRequest.number,
+        reviewedHeadSha: input.reviewedHeadSha,
+        headBranch: input.pullRequest.headBranch,
+        baseBranch: input.pullRequest.baseBranch,
+        baseSha: input.pullRequest.baseSha,
+        deliveryIssue: input.sourceIssue,
+        deliveryRun: input.runId,
+        requireSourceVerification: false,
+      });
       await this.gh(args, body);
       authoritative = await this.authoritativeIssueSnapshot(issue);
     }
@@ -981,10 +1042,37 @@ export class GitHubClient implements ForgeHost {
     issue: IssueSnapshot,
     marker: string,
   ): Promise<void> {
+    if (!input.finding.retainedRoute) throw new Error(`Review finding ${input.finding.id} lost retained route authority during recurrence`);
+    await assertRetainedReviewFindingAuthority({
+      route: input.finding.retainedRoute,
+      finding: input.finding,
+      repository: input.repo,
+      pullRequest: input.pullRequest.number,
+      reviewedHeadSha: input.reviewedHeadSha,
+      headBranch: input.pullRequest.headBranch,
+      baseBranch: input.pullRequest.baseBranch,
+      baseSha: input.pullRequest.baseSha,
+      deliveryIssue: input.sourceIssue,
+      deliveryRun: input.runId,
+      requireSourceVerification: false,
+    });
     const priorHeadSha = reviewedShaFromFindingBody(issue.body);
     if (priorHeadSha === input.reviewedHeadSha.toLowerCase()) return;
     const recurrenceMarker = reviewFindingRecurrenceMarker(input.repo, input.pullRequest.number, issue.number, input.reviewedHeadSha, marker);
     await this.assertReviewFindingPublicationBoundary(input.publicationFence, input.pullRequest);
+    await assertRetainedReviewFindingAuthority({
+      route: input.finding.retainedRoute,
+      finding: input.finding,
+      repository: input.repo,
+      pullRequest: input.pullRequest.number,
+      reviewedHeadSha: input.reviewedHeadSha,
+      headBranch: input.pullRequest.headBranch,
+      baseBranch: input.pullRequest.baseBranch,
+      baseSha: input.pullRequest.baseSha,
+      deliveryIssue: input.sourceIssue,
+      deliveryRun: input.runId,
+      requireSourceVerification: false,
+    });
     await this.publishIssueComment({
       repo: input.repo,
       issue: issue.number,
@@ -993,6 +1081,13 @@ export class GitHubClient implements ForgeHost {
         `This review finding recurred in PR #${input.pullRequest.number} at reviewed SHA \`${input.reviewedHeadSha}\`.`,
         ...(priorHeadSha ? [`Previously recorded reviewed SHA: \`${priorHeadSha}\`.`] : []),
         `Run: \`${boundedGitHubCode(input.runId)}\``,
+        ...(input.finding.retainedRoute ? [
+          `Route kind: \`${boundedGitHubCode(input.finding.retainedRoute.routeKind)}\``,
+          `Finding root: \`${boundedGitHubCode(input.finding.retainedRoute.findingRoot)}\``,
+          `Matched criterion: ${boundedGitHubText(input.finding.retainedRoute.matchedCriterion, 1_000)}`,
+          `Source snapshot: \`${boundedGitHubCode(input.finding.retainedRoute.sourceSnapshot.path)}\` @ \`${boundedGitHubCode(input.finding.retainedRoute.sourceSnapshot.reviewedHeadSha)}\``,
+          `Remediation lineage: ${boundedGitHubCode(input.finding.retainedRoute.lineage.deliveryRun)} / ${boundedGitHubCode(input.finding.retainedRoute.lineage.findingId)}`,
+        ] : []),
         "",
         `**Current evidence:** ${boundedGitHubText(input.finding.evidence, 4_000)}`,
         "",
@@ -1043,11 +1138,28 @@ export class GitHubClient implements ForgeHost {
 
   async reconcileReviewFindings(input: {
     repo: string;
+    sourceIssue?: number;
     pullRequest: PullRequestSnapshot;
     runId: string;
     publicationFence?: ReviewFindingPublicationFence;
     activeFindings: readonly ReviewFindingInput[];
   }): Promise<readonly number[]> {
+    for (const finding of input.activeFindings) {
+      if (!finding.retainedRoute) throw new Error(`Review finding ${finding.id} is legacy/non-authoritative and cannot reconcile retained projections`);
+      await assertRetainedReviewFindingAuthority({
+        route: finding.retainedRoute,
+        finding,
+        repository: input.repo,
+        pullRequest: input.pullRequest.number,
+        reviewedHeadSha: input.pullRequest.headSha,
+        headBranch: input.pullRequest.headBranch,
+        baseBranch: input.pullRequest.baseBranch,
+        baseSha: input.pullRequest.baseSha,
+        deliveryIssue: input.sourceIssue,
+        deliveryRun: input.runId,
+        requireSourceVerification: false,
+      });
+    }
     input.publicationFence ??= await this.beginReviewFindingPublication({
       repo: input.repo,
       pullRequest: input.pullRequest,
@@ -1057,6 +1169,21 @@ export class GitHubClient implements ForgeHost {
     const stale = reviewFindingReconciliationCandidates(await this.listAllIssues(input.repo), input);
     for (const issue of stale) {
       await this.assertReviewFindingPublicationBoundary(input.publicationFence, input.pullRequest);
+      for (const finding of input.activeFindings) {
+        await assertRetainedReviewFindingAuthority({
+          route: finding.retainedRoute!,
+          finding,
+          repository: input.repo,
+          pullRequest: input.pullRequest.number,
+          reviewedHeadSha: input.pullRequest.headSha,
+          headBranch: input.pullRequest.headBranch,
+          baseBranch: input.pullRequest.baseBranch,
+          baseSha: input.pullRequest.baseSha,
+          deliveryIssue: input.sourceIssue,
+          deliveryRun: input.runId,
+          requireSourceVerification: false,
+        });
+      }
       await this.closeIssue(
         input.repo,
         issue.number,
@@ -1582,7 +1709,7 @@ export class GitHubClient implements ForgeHost {
   async getPullRequest(repo: string, number: number): Promise<PullRequestSnapshot> {
     const result = await this.gh([
       "pr", "view", String(number), "--repo", repo,
-      "--json", "number,title,body,url,state,headRefOid,headRefName,baseRefName",
+      "--json", "number,title,body,url,state,headRefOid,headRefName,baseRefName,baseRefOid",
     ]);
     return pullRequestSnapshotFromGitHub(repo, number, JSON.parse(result));
   }
@@ -2270,17 +2397,33 @@ export function reviewFindingMarker(repo: string, pullRequest: number, finding: 
 }
 
 export function reviewFindingSemanticMarker(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
+  const route = finding.retainedRoute;
   const root = finding.rootId?.trim() || finding.normalizedRoot?.trim() || finding.causalRoot?.trim() || [finding.location ?? "", finding.title].join("\n");
-  const identity = [repo.trim().toLowerCase(), String(pullRequest), root.replaceAll("\\", "/").replace(/\s+/g, " ").trim().toLowerCase()].join("\n");
+  const identity = route
+    ? [repo.trim().toLowerCase(), String(pullRequest), route.routeKind, route.baseSha.toLowerCase(), route.reviewedHeadSha.toLowerCase(), route.deliveryRun, route.findingRoot, root.replaceAll("\\", "/").replace(/\s+/g, " ").trim().toLowerCase()].join("\n")
+    : [repo.trim().toLowerCase(), String(pullRequest), root.replaceAll("\\", "/").replace(/\s+/g, " ").trim().toLowerCase()].join("\n");
   return `<!-- FORGEDOCK:REVIEW-FINDING-IDENTITY v1 ${createHash("sha256").update(identity).digest("hex")} -->`;
 }
 
 function reviewFindingIdentity(repo: string, pullRequest: number, finding: ReviewFindingInput): string {
+  const route = finding.retainedRoute;
+  if (!route) {
+    // Legacy identity remains readable for diagnostics, but never grants
+    // retained authority because materializeReviewFinding rejects it.
+    return [
+      repo.toLowerCase(),
+      String(pullRequest),
+      finding.location?.replaceAll("\\", "/").trim().toLowerCase() ?? "",
+      finding.title.replace(/\s+/g, " ").trim().toLowerCase(),
+    ].join("\n");
+  }
   return [
-    repo.toLowerCase(),
-    String(pullRequest),
-    finding.location?.replaceAll("\\", "/").trim().toLowerCase() ?? "",
-    finding.title.replace(/\s+/g, " ").trim().toLowerCase(),
+    repo.trim().toLowerCase(), String(pullRequest), route.routeKind,
+    route.baseSha.toLowerCase(), route.reviewedHeadSha.toLowerCase(),
+    route.headBranch, route.baseBranch, String(route.deliveryIssue), route.deliveryRun,
+    route.findingId, route.findingRoot, route.matchedCriterion,
+    route.sourceSnapshot.reviewedHeadSha.toLowerCase(), route.sourceSnapshot.path,
+    route.sourceSnapshot.digest ?? route.sourceSnapshot.excerpt ?? route.sourceSnapshot.symbol ?? "",
   ].join("\n");
 }
 
@@ -2310,6 +2453,18 @@ function renderReviewFindingIssue(
     `**Source:** PR #${input.pullRequest.number} — ${boundedGitHubText(input.pullRequest.title, 500)}`,
     ...(input.sourceIssue ? [`**Delivery issue:** #${input.sourceIssue}`] : []),
     `**Reviewed SHA:** \`${input.reviewedHeadSha}\``,
+    `**Target:** ${boundedGitHubCode(input.pullRequest.headBranch)} → ${boundedGitHubCode(input.pullRequest.baseBranch)} at base SHA \`${boundedGitHubCode(input.finding.retainedRoute?.baseSha ?? input.pullRequest.baseSha ?? "unknown")}\``,
+    `**Route kind:** \`${boundedGitHubCode(input.finding.retainedRoute?.routeKind ?? "legacy")}\``,
+    ...(input.finding.retainedRoute ? [
+      `**Finding root:** \`${boundedGitHubCode(input.finding.retainedRoute.findingRoot)}\``,
+      `**Matched criterion:** ${boundedGitHubText(input.finding.retainedRoute.matchedCriterion, 1_000)}`,
+      `**Source snapshot:** \`${boundedGitHubCode(input.finding.retainedRoute.sourceSnapshot.path)}\` at \`${boundedGitHubCode(input.finding.retainedRoute.sourceSnapshot.reviewedHeadSha)}\` (proof: ${[
+        input.finding.retainedRoute.sourceSnapshot.excerpt ? `excerpt=${boundedGitHubCode(input.finding.retainedRoute.sourceSnapshot.excerpt)}` : undefined,
+        input.finding.retainedRoute.sourceSnapshot.digest ? `digest=${boundedGitHubCode(input.finding.retainedRoute.sourceSnapshot.digest)}` : undefined,
+        input.finding.retainedRoute.sourceSnapshot.symbol ? `symbol=${boundedGitHubCode(input.finding.retainedRoute.sourceSnapshot.symbol)}` : undefined,
+      ].filter(Boolean).join("; ")})`,
+      `**Remediation lineage:** ${boundedGitHubCode(input.finding.retainedRoute.lineage.repository)}#${input.finding.retainedRoute.lineage.pullRequest} / run \`${boundedGitHubCode(input.finding.retainedRoute.lineage.deliveryRun)}\` / finding \`${boundedGitHubCode(input.finding.retainedRoute.lineage.findingId)}\``,
+    ] : []),
     `**Run:** \`${boundedGitHubCode(input.runId)}\``,
     `**Reviewers:** ${input.reviewerRoles.map((role) => `\`${boundedGitHubCode(role)}\``).join(", ")}`,
     ...(input.finding.sourceFindingIds?.length ? [`**Source findings:** ${input.finding.sourceFindingIds.map((id) => `\`${boundedGitHubCode(id)}\``).join(", ")}`] : []),
@@ -2538,6 +2693,10 @@ function pullRequestSnapshotFromGitHub(repo: string, requestedNumber: number, ra
   const headSha = requiredString("headRefOid");
   const headBranch = requiredString("headRefName");
   const baseBranch = requiredString("baseRefName");
+  const baseSha = typeof value.baseRefOid === "string" && value.baseRefOid.trim() ? value.baseRefOid : undefined;
+  if (baseSha !== undefined && !/^[a-f0-9]{40,64}$/i.test(baseSha)) {
+    throw new Error(`GitHub returned an invalid base SHA for PR #${requestedNumber}`);
+  }
   if (!/^[a-f0-9]{40,64}$/i.test(headSha)) {
     throw new Error(`GitHub returned an invalid head SHA for PR #${requestedNumber}`);
   }
@@ -2569,6 +2728,7 @@ function pullRequestSnapshotFromGitHub(repo: string, requestedNumber: number, ra
     headSha,
     headBranch,
     baseBranch,
+    ...(baseSha ? { baseSha } : {}),
   };
 }
 
@@ -2582,6 +2742,7 @@ function assertExactReviewPublicationRoute(
     || expected.headSha.toLowerCase() !== actual.headSha.toLowerCase()
     || expected.headBranch !== actual.headBranch
     || expected.baseBranch !== actual.baseBranch
+    || (expected.baseSha !== undefined && actual.baseSha?.toLowerCase() !== expected.baseSha.toLowerCase())
     || actual.state !== "OPEN") {
     throw new Error(
       `Review-finding publication route changed ${boundary}: expected ${expected.repo}#${expected.number}`
