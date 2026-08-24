@@ -918,17 +918,15 @@ export async function reviewPullRequest(
         ...(priorRootLedger ? { supersedes: priorRootLedger.id } : {}),
       },
     });
-    const unverifiedSourceFindings = scopedFindings.some((finding) => sourceVerificationCandidates.has(finding.id) && isUnverifiedSourceFinding(finding));
     const sameHeadRootAuthorityMissing = input.allowSameHeadReassessment === true
       && input.priorVerdict?.payload.headSha === frozen.headSha
       && input.priorVerdict.payload.disposition === "request_changes"
       && priorRootLedger === undefined;
-    // Missing/stale source proof and unresolved omitted roots are review
-    // admission failures, not remediation obligations. Do not copy a prior
-    // root representative into findings merely to manufacture current-head
-    // evidence; the ledger and blocked verdict retain the closure authority.
+    // Missing or stale source proof makes a finding advisory; it must not turn a
+    // non-blocking follow-up into a blocked verdict. Omitted previously-open
+    // roots still retain closure authority until fresh evidence settles them.
     const unresolvedRootAuthority = unresolvedPriorRoots.length > 0 || sameHeadRootAuthorityMissing;
-    const disposition = unverifiedSourceFindings || unresolvedRootAuthority
+    const disposition = unresolvedRootAuthority
       ? "blocked" as const
       : openFindings.some((finding) => finding.mustFix ?? finding.blocking) ? "request_changes" as const : "approve" as const;
     // An omitted root is still open authority, but its prior representative is
