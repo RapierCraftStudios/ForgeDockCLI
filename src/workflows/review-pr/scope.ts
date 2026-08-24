@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHash } from "node:crypto";
-import type { DurableArtifact } from "../../core/artifacts/schema.js";
+import { isRetainedReviewFindingRouteForFinding, type DurableArtifact } from "../../core/artifacts/schema.js";
 
 export type ReviewFinding = DurableArtifact<"ReviewVerdict">["payload"]["findings"][number];
 
@@ -68,6 +68,9 @@ export function findingAuthorityEligible(
 ): boolean {
   if (finding.scopeDisposition !== undefined && finding.scopeDisposition !== "in_scope") return false;
   if (!(finding.mustFix ?? finding.blocking)) return false;
+  // Legacy findings remain decodable and useful as advisory evidence, but
+  // cannot authorize a retained-revision mutation without the strict route.
+  if (!isRetainedReviewFindingRouteForFinding(finding.retainedRoute, finding)) return false;
   const anchor = finding.evidenceAnchor;
   if ((anchor?.kind === "delivery-authority" || anchor?.kind === "deterministic-check")
     && verifiedAuthorityReferences.includes(anchor.reference)) return true;
@@ -342,7 +345,13 @@ export function findingMaterializationReason(
   mode: FindingProjectionMode = "all",
 ): string | undefined {
   if (finding.scopeDisposition === "rejected") return "controller rejected the finding scope";
-  if (mode === "all") return undefined;
+  if (mode === "all") {
+    if ((finding.mustFix ?? finding.blocking) && finding.scopeDisposition === "in_scope"
+      && !isRetainedReviewFindingRouteForFinding(finding.retainedRoute, finding)) {
+      return "finding has no validated retained-revision route authority";
+    }
+    return undefined;
+  }
   if (finding.scopeDisposition !== "in_scope") return "finding is not in the frozen Build Packet scope";
   if (finding.confidence !== "high") return "impact lane requires high-confidence evidence";
   if (!finding.causalRoot?.trim()) return "impact lane requires a causal root";

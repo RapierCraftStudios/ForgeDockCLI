@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
 import { Check } from "typebox/value";
-import { createArtifact, type DurableArtifact } from "../../core/artifacts/schema.js";
+import { assertRetainedReviewFindingAuthority, createArtifact, isRetainedReviewFindingRouteForFinding, type DurableArtifact, type ReviewFindingRoute } from "../../core/artifacts/schema.js";
 import type { ForgeHost, PullRequestSnapshot, ReviewFindingPublicationFence } from "../../core/ports/forge-host.js";
 import { InMemoryArtifactRepository, InMemoryRunRepository } from "../../core/ports/repositories.js";
 import { createRun, transition, type RunState, type TransitionEvent } from "../../core/state/machine.js";
@@ -13,7 +13,59 @@ import { reconcileFindingRootLedger } from "./finding-root-ledger.js";
 import { isTransientReviewerTransportFailure, materializeReviewFindings, renderReviewerSubmissionComment, renderReviewerWaveComment, resolveFindingIssuePolicy, resolveReviewerAttemptTimeoutMs, resumeReviewFindingProjection, reviewPullRequest, ReviewerSubmissionSchema, selectReviewerRoles, type ReviewerSubmission } from "./review.js";
 
 const sha = "a".repeat(40);
-const pr: PullRequestSnapshot = { repo: "a/b", number: 4, title: "Fix race", body: "", url: "https://github.test/a/b/pull/4", state: "OPEN", headSha: sha, headBranch: "fix", baseBranch: "main" };
+const retainedRouteMatrixIds = [
+  "invariant:matrix-redaction-grammar-8fbfa1feb1de",
+  "invariant:matrix-adapter-lifecycle-77c443af0fa9",
+  "invariant:matrix-redaction-grammar-aa532e2de2cf",
+  "invariant:matrix-identity-isolation-f03fb0cd537d",
+  "invariant:matrix-terminal-metadata-7afd49ca887b",
+  "invariant:matrix-redaction-grammar-406ae04caf1e",
+  "invariant:matrix-chunk-boundary-23b2a5801160",
+  "invariant:matrix-identity-isolation-268c16e78f44",
+] as const;
+
+describe("retained review-finding route authority", () => {
+  const content = "export function guardedRoute() { return true; }";
+  const route = (): ReviewFindingRoute => ({
+    routeKind: "retained-revision",
+    repository: "a/b", pullRequest: 4, reviewedHeadSha: sha,
+    headBranch: "fix", baseBranch: "main", baseSha: "b".repeat(40),
+    deliveryIssue: 2, deliveryRun: "run-retained", findingId: "finding-1", findingRoot: "root-1",
+    matchedCriterion: "Concurrent updates pass",
+    sourceSnapshot: { reviewedHeadSha: sha, path: "src/lock.ts", excerpt: "guardedRoute", digest: createHash("sha256").update(content).digest("hex") },
+    lineage: { repository: "a/b", pullRequest: 4, reviewedHeadSha: sha, deliveryRun: "run-retained", findingId: "finding-1", findingRoot: "root-1" },
+  });
+  const finding = () => ({ id: "finding-1", rootId: "root-1", matchedAcceptanceCriteria: ["Concurrent updates pass"], sourceSnapshot: route().sourceSnapshot });
+
+  it("accepts the exact route and rejects omitted or cross-identity proof without remote authority", async () => {
+    const valid = route();
+    await assertRetainedReviewFindingAuthority({
+      route: valid, finding: finding(), repository: "a/b", pullRequest: 4, reviewedHeadSha: sha,
+      headBranch: "fix", baseBranch: "main", baseSha: "b".repeat(40), deliveryIssue: 2,
+      deliveryRun: "run-retained", frozenCriteria: ["Concurrent updates pass"], changedPaths: ["src/lock.ts"],
+      readBlob: async () => ({ content, mode: "100644" }), requireSourceVerification: true,
+    });
+    assert.equal(isRetainedReviewFindingRouteForFinding(valid, finding()), true);
+    for (const [field, invalid] of [
+      ["baseSha", { ...valid, baseSha: "c".repeat(40) }],
+      ["deliveryRun", { ...valid, deliveryRun: "run-other", lineage: { ...valid.lineage, deliveryRun: "run-other" } }],
+      ["sourceSnapshot", { ...valid, sourceSnapshot: { ...valid.sourceSnapshot, path: "src/other.ts" } }],
+      ["criterion", { ...valid, matchedCriterion: "not frozen" }],
+      ["lineage", { ...valid, lineage: { ...valid.lineage, findingRoot: "other-root" } }],
+    ] as const) {
+      await assert.rejects(assertRetainedReviewFindingAuthority({
+        route: invalid, finding: finding(), repository: "a/b", pullRequest: 4, reviewedHeadSha: sha,
+        headBranch: "fix", baseBranch: "main", baseSha: "b".repeat(40), deliveryIssue: 2,
+        deliveryRun: "run-retained", frozenCriteria: ["Concurrent updates pass"], changedPaths: ["src/lock.ts"],
+        readBlob: async () => ({ content, mode: "100644" }), requireSourceVerification: true,
+      }), /Invalid retained review-finding route/, field);
+    }
+    const legacy = { ...finding(), retainedRoute: undefined };
+    assert.equal(isRetainedReviewFindingRouteForFinding(undefined, legacy), false);
+    assert.deepEqual(retainedRouteMatrixIds.length, 8);
+  });
+});
+const pr: PullRequestSnapshot = { repo: "a/b", number: 4, title: "Fix race", body: "", url: "https://github.test/a/b/pull/4", state: "OPEN", headSha: sha, headBranch: "fix", baseBranch: "main", baseSha: "b".repeat(40) };
 
 class FakeHost implements ForgeHost {
   snapshots: PullRequestSnapshot[] = [pr, pr];
@@ -1323,7 +1375,7 @@ describe("fresh-context PR review", () => {
     const host = new FakeHost(events);
     const finding = {
       ...inScope,
-      id: "ordered-1", severity: "high" as const, confidence: "high" as const, blocking: false,
+      id: "ordered-1", severity: "high" as const, confidence: "high" as const, blocking: true,
       title: "Follow-up documentation", evidence: "One edge case is not documented", location: "src/lock.ts:20",
       intentRelevance: "Clarifies the accepted behavior", remediation: "Add a focused note",
     };
@@ -1355,7 +1407,7 @@ describe("fresh-context PR review", () => {
       id: "projection-resume",
       severity: "high" as const,
       confidence: "high" as const,
-      blocking: false,
+      blocking: true,
       title: "Projection can be resumed",
       evidence: "A durable checkpoint is required",
       location: "src/projection.ts:1",

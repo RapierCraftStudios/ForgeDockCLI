@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { Type, type Static } from "typebox";
-import { createArtifact, FindingSchema, type DurableArtifact, type ReviewFindingProjectionPayload } from "../../core/artifacts/schema.js";
+import { assertRetainedReviewFindingAuthority, createArtifact, FindingSchema, type DurableArtifact, type ReviewFindingProjectionPayload, type ReviewFindingRoute } from "../../core/artifacts/schema.js";
 import { loadForgeGuidance } from "../../core/config/project-memory.js";
 import type { ForgeHost, PullRequestSnapshot, ReviewFindingPublicationFence } from "../../core/ports/forge-host.js";
 import type { ArtifactRepository, RunRepository } from "../../core/ports/repositories.js";
@@ -873,7 +873,77 @@ export async function reviewPullRequest(
       remediationDeltaHunks,
       changedRemediationAuthorityReferences,
     });
-    const authoritativeFindings = scopedFindings.filter((finding) => findingAuthorityEligible(finding, verifiedAuthorityReferences));
+    // Materialize the strict route only after source verification, scope
+    // adjudication, and exact criterion membership have all completed. A
+    // legacy or incomplete finding remains in the verdict as advisory data.
+    const baseSha = frozen.baseSha ?? input.buildResult?.payload.baseSha;
+    const routeBoundFindings = await Promise.all(scopedFindings.map(async (finding) => {
+      if (!(finding.mustFix ?? finding.blocking) || finding.scopeDisposition !== "in_scope") return finding;
+      const matchedCriterion = (finding.matchedAcceptanceCriteria ?? []).find((criterion) => input.packet.payload.acceptanceCriteria.includes(criterion));
+      const findingRoot = finding.rootId ?? finding.normalizedRoot ?? finding.id;
+      const snapshot = finding.sourceSnapshot;
+      if (!baseSha || input.run.subject.issue === undefined || !matchedCriterion || !snapshot) {
+        return {
+          ...finding,
+          blocking: false,
+          mustFix: false,
+          scopeDisposition: "follow_up" as const,
+          scopeRationale: [finding.scopeRationale, "Retained route authority requires a delivery issue, base SHA, exact criterion, and verified source snapshot."].filter(Boolean).join(" "),
+        };
+      }
+      const retainedRoute: ReviewFindingRoute = {
+        routeKind: "retained-revision",
+        repository: frozen.repo,
+        pullRequest: frozen.number,
+        reviewedHeadSha: frozen.headSha,
+        headBranch: frozen.headBranch,
+        baseBranch: frozen.baseBranch,
+        baseSha,
+        deliveryIssue: input.run.subject.issue,
+        deliveryRun: expectedDeliveryRunId,
+        findingId: finding.id,
+        findingRoot,
+        matchedCriterion,
+        sourceSnapshot: snapshot,
+        lineage: {
+          repository: frozen.repo,
+          pullRequest: frozen.number,
+          reviewedHeadSha: frozen.headSha,
+          deliveryRun: expectedDeliveryRunId,
+          findingId: finding.id,
+          findingRoot,
+        },
+      };
+      try {
+        await assertRetainedReviewFindingAuthority({
+          route: retainedRoute,
+          finding,
+          repository: frozen.repo,
+          pullRequest: frozen.number,
+          reviewedHeadSha: frozen.headSha,
+          headBranch: frozen.headBranch,
+          baseBranch: frozen.baseBranch,
+          baseSha,
+          deliveryIssue: input.run.subject.issue,
+          deliveryRun: expectedDeliveryRunId,
+          changedPaths,
+          expectedPaths: input.packet.payload.expectedPaths,
+          frozenCriteria: input.packet.payload.acceptanceCriteria,
+          ...(input.readExactBlob ? { readBlob: input.readExactBlob } : {}),
+          requireSourceVerification: true,
+        });
+        return { ...finding, retainedRoute };
+      } catch (error) {
+        return {
+          ...finding,
+          blocking: false,
+          mustFix: false,
+          scopeDisposition: "follow_up" as const,
+          scopeRationale: [finding.scopeRationale, error instanceof Error ? error.message : String(error)].filter(Boolean).join(" "),
+        };
+      }
+    }));
+    const authoritativeFindings = routeBoundFindings.filter((finding) => findingAuthorityEligible(finding, verifiedAuthorityReferences));
     const rootAssessments = collectRootAssessments(reviewerResults, openPriorRoots);
     const roots = reconcileFindingRootLedger({
       ...(priorRootLedger ? { previous: priorRootLedger } : {}),
@@ -900,7 +970,7 @@ export async function reviewPullRequest(
     const activeFindingIds = new Set(roots.filter((root) => activeRootIds.has(root.rootId)).flatMap((root) => root.findingIds));
     const findings = [
       ...openFindings,
-      ...scopedFindings.filter((finding) => !activeFindingIds.has(finding.id)
+      ...routeBoundFindings.filter((finding) => !activeFindingIds.has(finding.id)
         && !(finding.rootId && activeRootIds.has(finding.rootId))
         && !(finding.mustFix && finding.scopeDisposition === "in_scope")),
     ];
@@ -989,6 +1059,7 @@ export async function reviewPullRequest(
       headSha: frozen.headSha,
       headBranch: frozen.headBranch,
       baseBranch: frozen.baseBranch,
+      ...(frozen.baseSha ?? input.buildResult?.payload.baseSha ? { baseSha: frozen.baseSha ?? input.buildResult?.payload.baseSha } : {}),
       ...(publicationFence ? { publicationFence } : {}),
       disposition,
       reviewerRoles: roles,
@@ -1032,6 +1103,7 @@ export async function reviewPullRequest(
         findings: activeProjectionFindings,
         policy: projectionMode,
         publicationFence,
+        ...(input.signal ? { signal: input.signal } : {}),
       }, dependencies.host);
     }
     // A blocked closure-authority omission preserves prior projections. A
@@ -1040,6 +1112,7 @@ export async function reviewPullRequest(
       if (!publicationFence) throw new Error("Review-finding reconciliation has no current publication fence");
       await dependencies.host.reconcileReviewFindings({
         repo: frozen.repo,
+        ...(run.subject.issue !== undefined ? { sourceIssue: run.subject.issue } : {}),
         pullRequest: frozen,
         runId: run.runId,
         publicationFence,
@@ -1075,6 +1148,7 @@ export async function reviewPullRequest(
         headSha: frozen.headSha,
         headBranch: frozen.headBranch,
         baseBranch: frozen.baseBranch,
+        ...(frozen.baseSha ?? input.buildResult?.payload.baseSha ? { baseSha: frozen.baseSha ?? input.buildResult?.payload.baseSha } : {}),
         disposition,
         reviewerRoles: roles,
         findings,
@@ -1331,6 +1405,7 @@ function assertPullRequestRouteStable(
     || current.headSha !== frozen.headSha
     || current.headBranch !== frozen.headBranch
     || current.baseBranch !== frozen.baseBranch
+    || (frozen.baseSha !== undefined && current.baseSha?.toLowerCase() !== frozen.baseSha.toLowerCase())
     || current.state !== frozen.state) {
     throw new Error(
       `PR delivery route changed ${phase}: ${frozen.headBranch}@${frozen.headSha} -> ${frozen.baseBranch} (${frozen.state})`
@@ -1935,6 +2010,7 @@ export async function materializeReviewFindings(
     fallbackReviewerRoles?: readonly string[];
     policy?: FindingProjectionMode;
     publicationFence?: ReviewFindingPublicationFence;
+    signal?: AbortSignal;
   },
   host: ForgeHost,
 ): Promise<ReviewFindingProjectionPayload["projections"]> {
@@ -1946,6 +2022,24 @@ export async function materializeReviewFindings(
   if (!publicationFence) throw new Error("Review-finding materialization requires a durable publication fence");
   const projections: ReviewFindingProjectionPayload["projections"] = [];
   for (const finding of terminalReviewFindings(input.findings, input.policy ?? "all")) {
+    if (input.signal?.aborted) throw new AgentExecutionInterruptedError("Review-finding materialization was cancelled", { reason: "cancelled" });
+    if (!finding.retainedRoute) {
+      if (finding.mustFix ?? finding.blocking) throw new Error(`Finding ${finding.id} has no retained-revision authority route`);
+      continue;
+    }
+    await assertRetainedReviewFindingAuthority({
+      route: finding.retainedRoute,
+      finding,
+      repository: input.pullRequest.repo,
+      pullRequest: input.pullRequest.number,
+      reviewedHeadSha: input.pullRequest.headSha,
+      headBranch: input.pullRequest.headBranch,
+      baseBranch: input.pullRequest.baseBranch,
+      baseSha: input.pullRequest.baseSha,
+      deliveryIssue: input.run.subject.issue,
+      deliveryRun: input.run.runId,
+      requireSourceVerification: false,
+    });
     const issue = await host.materializeReviewFinding({
       repo: input.pullRequest.repo,
       ...(input.run.subject.issue ? { sourceIssue: input.run.subject.issue } : {}),
@@ -1962,6 +2056,7 @@ export async function materializeReviewFindings(
       ...(issue.projection?.marker ? { marker: issue.projection.marker } : {}),
       issueNumber: issue.number,
       issueUrl: issue.url,
+      ...(finding.retainedRoute ? { retainedRoute: finding.retainedRoute } : {}),
       ...(issue.projection?.mismatches?.length ? { mismatches: [...issue.projection.mismatches] } : {}),
     });
   }
@@ -1994,7 +2089,9 @@ export async function resumeReviewFindingProjection(
   if (payload.pullRequest !== input.pullRequest.number
     || payload.headSha.toLowerCase() !== input.pullRequest.headSha.toLowerCase()
     || payload.headBranch !== input.pullRequest.headBranch
-    || payload.baseBranch !== input.pullRequest.baseBranch) {
+    || payload.baseBranch !== input.pullRequest.baseBranch
+    || (payload.baseSha !== undefined && input.pullRequest.baseSha !== undefined
+      && payload.baseSha.toLowerCase() !== input.pullRequest.baseSha.toLowerCase())) {
     throw new Error("Finding-publication checkpoint does not match the authoritative pull request route or head");
   }
   if (!dependencies.host.beginReviewFindingPublication || !dependencies.host.assertReviewFindingPublication) {
@@ -2021,6 +2118,22 @@ export async function resumeReviewFindingProjection(
   if (payload.status === "planned") {
     const activeIds = new Set(payload.findingProjection.materializedFindingIds);
     const activeFindings = payload.findings.filter((finding) => activeIds.has(finding.id));
+    for (const finding of activeFindings) {
+      if (!finding.retainedRoute) throw new Error(`Finding-publication checkpoint contains legacy finding ${finding.id} without retained authority`);
+      await assertRetainedReviewFindingAuthority({
+        route: finding.retainedRoute,
+        finding,
+        repository: input.pullRequest.repo,
+        pullRequest: input.pullRequest.number,
+        reviewedHeadSha: input.pullRequest.headSha,
+        headBranch: input.pullRequest.headBranch,
+        baseBranch: input.pullRequest.baseBranch,
+        baseSha: input.pullRequest.baseSha,
+        deliveryIssue: input.run.subject.issue,
+        deliveryRun: input.run.runId,
+        requireSourceVerification: false,
+      });
+    }
     projections = await materializeReviewFindings({
       run: input.run,
       pullRequest: input.pullRequest,
@@ -2032,6 +2145,7 @@ export async function resumeReviewFindingProjection(
     if (dependencies.host.reconcileReviewFindings) {
       await dependencies.host.reconcileReviewFindings({
         repo: input.pullRequest.repo,
+        ...(input.run.subject.issue !== undefined ? { sourceIssue: input.run.subject.issue } : {}),
         pullRequest: input.pullRequest,
         runId: input.run.runId,
         publicationFence,
@@ -2064,6 +2178,7 @@ export async function resumeReviewFindingProjection(
       headSha: payload.headSha,
       headBranch: payload.headBranch,
       baseBranch: payload.baseBranch,
+      ...(payload.baseSha ? { baseSha: payload.baseSha } : {}),
       disposition: payload.disposition,
       reviewerRoles: payload.reviewerRoles,
       findings: payload.findings,
