@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
@@ -22,10 +23,27 @@ interface ChildOutputState {
 }
 
 const childOutputStates = new WeakMap<ReturnType<typeof spawn>, ChildOutputState>();
+const childClosePromises = new WeakMap<ReturnType<typeof spawn>, Promise<void>>();
+
+function observeChildClose(child: ReturnType<typeof spawn>): Promise<void> {
+  let closePromise = childClosePromises.get(child);
+  if (!closePromise) {
+    closePromise = new Promise<void>((resolve) => child.once("close", () => resolve()));
+    childClosePromises.set(child, closePromise);
+  }
+  return closePromise;
+}
+
+async function terminateChild(child: ReturnType<typeof spawn>): Promise<void> {
+  const closePromise = observeChildClose(child);
+  if (child.exitCode === null && child.signalCode === null) child.kill();
+  await closePromise;
+}
 
 function waitForChildOutput(child: ReturnType<typeof spawn>, marker: string): Promise<string> {
   let state = childOutputStates.get(child);
   if (!state) {
+    observeChildClose(child);
     state = { buffer: "", stderr: "", waiter: undefined };
     childOutputStates.set(child, state);
     child.stdout?.on("data", (chunk) => {
@@ -120,46 +138,57 @@ async function assertConcurrentConstructors(moduleUrl: string, className: string
     await Promise.all(ready);
   } finally {
     writeFileSync(goPath, "go");
-    for (const child of children) child.kill();
+    await Promise.all(children.map((child) => terminateChild(child)));
   }
 }
 
 describe("SQLite operational repositories", () => {
   it("treats admission as optional for current and legacy read-only stores", () => {
-    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-admission-readonly-"));
-    const currentPath = join(root, "current.db");
-    const writable = new SqliteRepositories(currentPath);
-    writable.writeAdmission("github.com:a/b", { blockedUntil: Date.now() + 60_000, reason: "primary", updatedAt: Date.now() });
-    writable.close();
-    const current = new SqliteRepositories(currentPath, { readOnly: true });
-    assert.equal(current.readAdmission("github.com:a/b")?.reason, "primary");
-    current.close();
+    const root = mkdtempSync(join(tmpdir(), "forgedock-admission-readonly-"));
+    let writable: SqliteRepositories | undefined;
+    let current: SqliteRepositories | undefined;
+    let legacy: DatabaseSync | undefined;
+    let legacyReader: SqliteRepositories | undefined;
+    try {
+      const currentPath = join(root, "current.db");
+      writable = new SqliteRepositories(currentPath);
+      writable.writeAdmission("github.com:a/b", { blockedUntil: Date.now() + 60_000, reason: "primary", updatedAt: Date.now() });
+      current = new SqliteRepositories(currentPath, { readOnly: true });
+      assert.equal(current.readAdmission("github.com:a/b")?.reason, "primary");
 
-    const legacyPath = join(root, "legacy.db");
-    const legacy = new DatabaseSync(legacyPath);
-    legacy.exec("CREATE TABLE runs (run_id TEXT PRIMARY KEY, version INTEGER NOT NULL, state_json TEXT NOT NULL)");
-    legacy.close();
-    const legacyReader = new SqliteRepositories(legacyPath, { readOnly: true });
-    assert.equal(legacyReader.readAdmission("github.com:a/b"), undefined);
-    legacyReader.close();
-    rmSync(root, { recursive: true, force: true });
+      const legacyPath = join(root, "legacy.db");
+      legacy = new DatabaseSync(legacyPath);
+      legacy.exec("CREATE TABLE runs (run_id TEXT PRIMARY KEY, version INTEGER NOT NULL, state_json TEXT NOT NULL)");
+      legacyReader = new SqliteRepositories(legacyPath, { readOnly: true });
+      assert.equal(legacyReader.readAdmission("github.com:a/b"), undefined);
+    } finally {
+      legacyReader?.close();
+      legacy?.close();
+      current?.close();
+      writable?.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("prunes expired admission rows only through writable instances", () => {
-    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-admission-prune-"));
-    const path = join(root, "state.db");
-    const store = new SqliteRepositories(path);
-    const now = Date.now();
-    store.writeAdmission("github.com:expired", { blockedUntil: now - 1, reason: "primary", updatedAt: now - 10 });
-    store.writeAdmission("github.com:live", { blockedUntil: now + 60_000, reason: "secondary", updatedAt: now });
-    assert.equal(store.readAdmission("github.com:expired"), undefined);
-    assert.equal(store.readAdmission("github.com:live")?.reason, "secondary");
-    store.close();
-    rmSync(root, { recursive: true, force: true });
+    const root = mkdtempSync(join(tmpdir(), "forgedock-admission-prune-"));
+    let store: SqliteRepositories | undefined;
+    try {
+      const path = join(root, "state.db");
+      store = new SqliteRepositories(path);
+      const now = Date.now();
+      store.writeAdmission("github.com:expired", { blockedUntil: now - 1, reason: "primary", updatedAt: now - 10 });
+      store.writeAdmission("github.com:live", { blockedUntil: now + 60_000, reason: "secondary", updatedAt: now });
+      assert.equal(store.readAdmission("github.com:expired"), undefined);
+      assert.equal(store.readAdmission("github.com:live")?.reason, "secondary");
+    } finally {
+      store?.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("waits for simultaneous repository and observation-store constructors", async () => {
-    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-sqlite-constructor-race-"));
+    const root = mkdtempSync(join(tmpdir(), "forgedock-sqlite-constructor-race-"));
     try {
       await assertConcurrentConstructors(new URL("./sqlite-repositories.js", import.meta.url).href, "SqliteRepositories", join(root, "state.db"), root);
       await assertConcurrentConstructors(new URL("../../observability/sqlite-store.js", import.meta.url).href, "SqliteObservationStore", join(root, "observations.db"), root);
@@ -169,7 +198,7 @@ describe("SQLite operational repositories", () => {
   });
 
   it("waits for a concurrent writer before recording operational progress", async () => {
-    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-sqlite-lock-"));
+    const root = mkdtempSync(join(tmpdir(), "forgedock-sqlite-lock-"));
     const path = join(root, "state.db");
     const store = new SqliteRepositories(path);
     let holder: ReturnType<typeof spawn> | undefined;
@@ -183,22 +212,23 @@ describe("SQLite operational repositories", () => {
         'process.stdout.write("locked\\n");',
         'setTimeout(() => { db.exec("COMMIT"); db.close(); }, 250);',
       ].join(""), path], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+      observeChildClose(holder);
       await new Promise<void>((resolve, reject) => {
         holder!.stdout!.once("data", () => resolve());
         holder!.once("error", reject);
       });
       await store.recordProgress({ runId: run.runId, phase: "controller.lock-test", message: "Recovered after a concurrent writer", occurredAt: "2026-01-01T00:00:00.000Z" });
-      await new Promise<void>((resolve, reject) => {
-        holder!.once("close", () => resolve());
-        holder!.once("error", reject);
-      });
+      await observeChildClose(holder);
       holder = undefined;
       assert.equal((await store.listProgress(run.runId)).length, 1);
     } finally {
-      holder?.kill();
+      if (holder) {
+        const child = holder;
+        holder = undefined;
+        await terminateChild(child);
+      }
       store.close();
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      try { rmSync(root, { recursive: true, force: true }); } catch { /* Windows may release SQLite handles shortly after close. */ }
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -279,7 +309,7 @@ describe("SQLite operational repositories", () => {
   });
 
   it("atomically rejects a fresh DAG that overlaps an active generated batch", async () => {
-    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-sqlite-orchestration-conflict-"));
+    const root = mkdtempSync(join(tmpdir(), "forgedock-sqlite-orchestration-conflict-"));
     const path = join(root, "state.db");
     const store = new SqliteRepositories(path);
     const active: OrchestrationRecord = {
@@ -607,7 +637,7 @@ describe("SQLite operational repositories", () => {
   });
 
   it("serializes continuity verification across a concurrent checkpoint advance", async () => {
-    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-lease-race-"));
+    const root = mkdtempSync(join(tmpdir(), "forgedock-lease-race-"));
     const path = join(root, "state.db");
     const checkpointPath = join(root, "checkpoint");
     const firstGo = join(root, "first.go");
@@ -672,8 +702,7 @@ describe("SQLite operational repositories", () => {
       assert.deepEqual(secondResult, { ok: true, epoch: 2 });
     } finally {
       writeFileSync(release, "release");
-      first.kill();
-      second.kill();
+      await Promise.all([terminateChild(first), terminateChild(second)]);
       rmSync(root, { recursive: true, force: true });
     }
   });
@@ -725,7 +754,7 @@ describe("SQLite operational repositories", () => {
   });
 
   it("retains fencing epochs across a repository restart and expiry recovery", () => {
-    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-sqlite-restart-"));
+    const root = mkdtempSync(join(tmpdir(), "forgedock-sqlite-restart-"));
     const path = join(root, "state.db");
     const witness = new InMemoryLeaseWitness();
     const firstStore = new SqliteRepositories(path, { witness });
@@ -746,7 +775,7 @@ describe("SQLite operational repositories", () => {
   });
 
   it("atomically shares remediation admission across repository instances", async () => {
-    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-admission-"));
+    const root = mkdtempSync(join(tmpdir(), "forgedock-admission-"));
     const path = join(root, "state.db");
     const first = new SqliteRepositories(path);
     const second = new SqliteRepositories(path);
@@ -772,7 +801,7 @@ describe("SQLite operational repositories", () => {
   });
 
   it("persists a monotonic per-PR review publication fence across instances", async () => {
-    const root = mkdtempSync(join(process.env.TEMP ?? process.env.TMP ?? ".", "forgedock-review-fence-"));
+    const root = mkdtempSync(join(tmpdir(), "forgedock-review-fence-"));
     const path = join(root, "state.db");
     const first = new SqliteRepositories(path);
     const second = new SqliteRepositories(path);
