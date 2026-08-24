@@ -10,7 +10,8 @@ import { AgentRunError } from "../../runtime/agent-runtime.js";
 import { scopeManifestFor, type AgentEventSink, type AgentRunResult, type AgentRuntime, type AgentTask } from "../../runtime/agent-runtime.js";
 import { WorkflowExecutionError } from "../work-on/investigate.js";
 import { consolidateReviewerFindings, type ConsolidatedFinding } from "./consolidate.js";
-import { assertReviewPlan, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, freezeReviewPlan, planReviewPanel, reviewerToolCallBudget, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
+import { resolveRepositoryAnchor } from "../../core/artifacts/finding-anchor.js";
+import { assertReviewPlan, buildReviewDiffManifest, canonicalReviewDigest, computeReviewPlanId, DEPLOYMENT_MAX_INITIAL_REVIEW_DIFF_CHARS, freezeReviewPlan, planReviewPanel, reviewerToolCallBudget, scopedReviewDiff, type ReviewPlan, type ReviewPlanContext, type ReviewerRole } from "./planner.js";
 import { applyFindingScopePolicy, findingMaterializationReason, shouldMaterializeFinding, type FindingProjectionMode } from "./scope.js";
 
 const ReviewerFindingSchema = Type.Object({
@@ -326,6 +327,15 @@ export async function reviewPullRequest(
       host: dependencies.host,
     });
     const diff = await dependencies.host.getPullRequestDiff(frozen.repo, frozen.number);
+    // The manifest is constructed once, after the exact PR head freeze. It is
+    // immutable review evidence; all repository anchors below resolve against
+    // this identity rather than against reviewer-declared changed paths.
+    const manifest = buildReviewDiffManifest({ diff, headSha: frozen.headSha, changedPaths });
+    if (!manifest.entries.length) throw new Error("Frozen review diff produced no bounded manifest entries");
+    const assertManifestStable = async (point: string): Promise<void> => {
+      const currentManifest = buildReviewDiffManifest({ diff: await dependencies.host.getPullRequestDiff(frozen.repo, frozen.number), headSha: frozen.headSha, changedPaths });
+      if (currentManifest.identity !== manifest.identity) throw new Error(`Frozen review manifest changed ${point}`);
+    };
     const priorReviewPlan = input.priorVerdict?.payload.reviewPlan;
     const reviewPlan = isReusableFrozenReviewPlan(input.priorVerdict, priorReviewPlan, {
       run: input.run, pullRequest: frozen, packet: input.packet, context: planContext,
@@ -439,7 +449,7 @@ export async function reviewPullRequest(
               "Report only actionable findings caused or exposed by this change.",
               "Every finding needs concrete evidence, intent relevance, remediation, and a concise causalRoot failure-mode label.",
               "Every finding must include a structured impact declaration: choose one category (correctness, security, data-integrity, availability, performance, compatibility, operability, test-gap, advisory) and state the concrete trigger, the affected invariant or acceptance criterion, and the observable consequence. Do not promote style, preference, speculative cleanup, or a test gap with no concrete consequence; report no finding or classify it advisory.",
-              "Anchor a potentially blocking finding with a repository location or a typed evidenceAnchor. Delivery-authority/check anchors must quote an exact controller-observed reference; vague prose cannot block.",
+              "Anchor a potentially blocking finding with a version 1 typed repository evidenceAnchor containing canonical path, exact blobSha, side old/new, bounded inclusive range, 64-hex snippetHash, and optional hunk identity. Compute snippetHash over the bounded evidence text. Delivery-authority/check anchors must use version 1 and quote an exact controller-observed reference; legacy location/prose alone cannot block.",
               "Classify scopeDisposition=in_scope only when the minimal fix is wholly required by the frozen Build Packet and does not add a new guarantee, entity, protocol, or behavior excluded from it; otherwise use follow_up or rejected.",
               "For every in_scope finding, copy at least one Build Packet acceptance criterion verbatim into matchedAcceptanceCriteria. A broad consistency criterion does not authorize transitive redesign beyond the packet's explicit scope and exclusions.",
               input.priorVerdict
@@ -630,6 +640,7 @@ export async function reviewPullRequest(
       expectedPaths: input.packet.payload.expectedPaths,
       verifiedAuthorityReferences,
       verifiedCheckReferences,
+      resolveRepositoryAnchor: (anchor) => resolveRepositoryAnchor(anchor, manifest, { currentHeadSha: frozen.headSha }),
     });
     const prefiltered = applyFindingScopePolicy(consolidated, input.packet, input.priorVerdict, {
       remediationDeltaPaths,
@@ -666,6 +677,7 @@ export async function reviewPullRequest(
     const disposition = findings.some((finding) => finding.blocking) ? "request_changes" as const : "approve" as const;
     const finalSnapshot = await dependencies.host.getPullRequest(frozen.repo, frozen.number);
     assertPullRequestRouteStable(frozen, finalSnapshot, "before verdict publication");
+    await assertManifestStable("before verdict publication");
     await input.beforeVerdictPublication?.();
     const findingIssuePolicy = resolveFindingIssuePolicy(input.findingIssuePolicy);
     const projectionEnabled = findingIssuePolicy === "all"
@@ -702,6 +714,7 @@ export async function reviewPullRequest(
       checkpoint: "review-finding-publication" as const,
       pullRequest: frozen.number,
       headSha: frozen.headSha,
+      manifestIdentity: manifest.identity,
       headBranch: frozen.headBranch,
       baseBranch: frozen.baseBranch,
       disposition,
@@ -767,6 +780,7 @@ export async function reviewPullRequest(
     }
     const publicationSnapshot = await dependencies.host.getPullRequest(frozen.repo, frozen.number);
     assertPullRequestRouteStable(frozen, publicationSnapshot, "immediately before verdict publication");
+    await assertManifestStable("immediately before verdict publication");
     const verdict = createArtifact({
       kind: "ReviewVerdict",
       runId: run.runId,
@@ -774,6 +788,7 @@ export async function reviewPullRequest(
       producer: { role: "controller", runtime: "forgedock" },
       payload: {
         headSha: frozen.headSha,
+        manifestIdentity: manifest.identity,
         headBranch: frozen.headBranch,
         baseBranch: frozen.baseBranch,
         disposition,
@@ -1534,6 +1549,10 @@ export async function resumeReviewFindingProjection(
     || payload.headBranch !== input.pullRequest.headBranch
     || payload.baseBranch !== input.pullRequest.baseBranch) {
     throw new Error("Finding-publication checkpoint does not match the authoritative pull request route or head");
+  }
+  if (payload.manifestIdentity) {
+    const resumedManifest = buildReviewDiffManifest({ diff: await dependencies.host.getPullRequestDiff(input.pullRequest.repo, input.pullRequest.number), headSha: input.pullRequest.headSha });
+    if (resumedManifest.identity !== payload.manifestIdentity) throw new Error("Finding-publication checkpoint manifest is stale");
   }
   const planId = input.projection.id.endsWith(":completed")
     ? input.projection.id.slice(0, -":completed".length)

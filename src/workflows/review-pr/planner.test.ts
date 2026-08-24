@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { createArtifact } from "../../core/artifacts/schema.js";
-import { assertReviewPlan, computeReviewPlanId, MAX_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP, planReviewPanel, reviewerToolCallBudget, scopedReviewDiff, type ReviewBudget, type ReviewPlan } from "./planner.js";
+import { assertReviewPlan, buildReviewDiffManifest, computeReviewPlanId, MAX_REVIEW_TOOL_CALLS_PER_EXECUTION_GROUP, planReviewPanel, reviewerToolCallBudget, scopedReviewDiff, type ReviewBudget, type ReviewPlan } from "./planner.js";
 
 function packet(risks: Array<{ risk: string; mitigation: string }> = []) {
   return createArtifact({
@@ -32,6 +32,18 @@ const authorityDiff = [
 ].join("\n");
 
 describe("evidence-backed review planning", () => {
+  it("builds one bounded normalized manifest for the frozen review head", () => {
+    const head = "a".repeat(40);
+    const manifest = buildReviewDiffManifest({
+      headSha: head,
+      changedPaths: ["src/a.ts"],
+      diff: `diff --git a/src/a.ts b/src/a.ts\nindex ${"b".repeat(40)}..${"c".repeat(40)}\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-old\n+new\n`,
+    });
+    assert.equal(manifest.headSha, head);
+    assert.equal(manifest.entries[0]?.path, "src/a.ts");
+    assert.match(manifest.identity, /^[0-9a-f]{64}$/);
+    assert.throws(() => buildReviewDiffManifest({ diff: "x".repeat(10), limits: { maxPatchBytes: 5 } }), /bounded manifest/);
+  });
   it("routes the authority-contract PR to four independent risk surfaces without docs/frontend or prose/infra false positives", () => {
     const plan = planReviewPanel({
       changedPaths: ["SECURITY.md", "docs/forgedock-next.html", "docs/next/VERIFIABLE-WORKFLOW-AUTHORITY.md"],

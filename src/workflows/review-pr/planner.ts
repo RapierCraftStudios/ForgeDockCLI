@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 import { createHash } from "node:crypto";
+import { buildDiffManifest, type DiffManifest, type DiffManifestLimits } from "../../core/artifacts/finding-anchor.js";
 import type { DurableArtifact } from "../../core/artifacts/schema.js";
 
 export type ReviewerRole = "correctness" | "security" | "data" | "api-compatibility" | "frontend" | "infrastructure" | "concurrency";
@@ -514,6 +515,16 @@ function boundInitialDiff(diff: string, sections: readonly DiffSection[], maximu
 
 export function parseDiffPaths(diff: string): string[] {
   return parseDiffSections(diff).map((section) => section.path);
+}
+
+/** Build the one bounded manifest used by review setup and anchor resolution. */
+export function buildReviewDiffManifest(input: {
+  diff: string;
+  headSha?: string;
+  changedPaths?: readonly string[];
+  limits?: Partial<DiffManifestLimits>;
+}): DiffManifest {
+  return buildDiffManifest(input);
 }
 
 function parseDiffSections(diff: string): DiffSection[] {
