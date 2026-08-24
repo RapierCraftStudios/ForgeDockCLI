@@ -1,35 +1,69 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { buildOrchestrationSnapshot, renderOrchestrationBoard, renderWaitReason } from "./view-model.js";
+import { buildOrchestrationSnapshot, isOrchestrationTerminalStatus, renderOrchestrationBoard, renderWaitReason } from "./view-model.js";
 
 describe("orchestration status presentation", () => {
-  it("keeps failed, blocked, invalid, and suspended nodes visibly distinct", () => {
+  it("keeps completed, failed, blocked, skipped, and invalid terminal rows distinct (invariant:matrix-adapter-lifecycle-001b10e09501; invariant:matrix-terminal-metadata-fed2f01d6d2e)", () => {
     const snapshot = buildOrchestrationSnapshot({
       orchestrationId: "orch-status",
       items: [
-        { id: "failed", issue: 1, priority: 1, dependencies: [], claims: [] },
-        { id: "blocked", issue: 2, priority: 1, dependencies: [], claims: [] },
-        { id: "invalid", issue: 3, priority: 1, dependencies: [], claims: [] },
-        { id: "suspended", issue: 4, priority: 1, dependencies: [], claims: [] },
+        { id: "completed", issue: 1, priority: 1, dependencies: [], claims: [] },
+        { id: "failed", issue: 2, priority: 1, dependencies: [], claims: [] },
+        { id: "blocked", issue: 3, priority: 1, dependencies: [], claims: [] },
+        { id: "skipped", issue: 4, priority: 1, dependencies: [], claims: [] },
+        { id: "invalid", issue: 5, priority: 1, dependencies: [], claims: [] },
+        { id: "dependent", issue: 6, priority: 1, dependencies: ["invalid"], claims: [] },
       ],
       result: {
         status: new Map([
+          ["completed", "completed"],
           ["failed", "failed"],
           ["blocked", "blocked"],
+          ["skipped", "skipped"],
           ["invalid", "invalid"],
-          ["suspended", "suspended"],
+          ["dependent", "queued"],
         ]),
         errors: new Map(),
       },
     });
     const rendered = renderOrchestrationBoard(snapshot);
-    assert.match(rendered, /✕ #1 \[failed\]/);
-    assert.match(rendered, /■ #2 \[blocked\]/);
-    assert.match(rendered, /! #3 \[invalid\]/);
-    assert.match(rendered, /Ⅱ #4 \[suspended\]/);
-    assert.deepEqual(snapshot.blockedNodes, ["failed", "blocked"]);
+    assert.match(rendered, /✓ #1 \[completed\]/);
+    assert.match(rendered, /✕ #2 \[failed\]/);
+    assert.match(rendered, /■ #3 \[blocked\]/);
+    assert.match(rendered, /↷ #4 \[skipped\]/);
+    assert.match(rendered, /! #5 \[invalid\]/);
+    assert.equal(snapshot.nodes.filter((node) => isOrchestrationTerminalStatus(node.status)).length, 5);
+    assert.deepEqual(snapshot.readyNodes, []);
+    assert.deepEqual(snapshot.blockedNodes, ["failed", "blocked", "skipped"]);
     assert.deepEqual(snapshot.invalidNodes, ["invalid"]);
-    assert.deepEqual(snapshot.suspendedNodes, ["suspended"]);
+  });
+
+  it("preserves invalid as terminal metadata without projecting it as queued (invariant:matrix-adapter-lifecycle-30a2b50d1812; invariant:matrix-terminal-metadata-e15b5fbd4dc0)", () => {
+    const snapshot = buildOrchestrationSnapshot({
+      orchestrationId: "orch-invalid",
+      items: [{ id: "invalid", issue: 7, priority: 1, dependencies: [], claims: [] }],
+      result: { status: new Map([["invalid", "invalid"]]), errors: new Map() },
+    });
+    assert.equal(snapshot.nodes[0]?.status, "invalid");
+    assert.deepEqual(snapshot.invalidNodes, ["invalid"]);
+    assert.equal(snapshot.readyNodes.includes("invalid"), false);
+    assert.equal(isOrchestrationTerminalStatus(snapshot.nodes[0]?.status), true);
+  });
+
+  it("does not authorize semantic dependents after an invalid predecessor reaches terminal projection (invariant:matrix-adapter-lifecycle-9ef6bb59a14e; invariant:matrix-terminal-metadata-0132b8ac0789)", () => {
+    const snapshot = buildOrchestrationSnapshot({
+      orchestrationId: "orch-dependency-invalid",
+      items: [
+        { id: "invalid", issue: 20, priority: 1, dependencies: [], claims: [] },
+        { id: "dependent", issue: 21, priority: 1, dependencies: ["invalid"], claims: [] },
+      ],
+      result: {
+        status: new Map([["invalid", "invalid"], ["dependent", "queued"]]),
+        errors: new Map(),
+      },
+    });
+    assert.deepEqual(snapshot.invalidNodes, ["invalid"]);
+    assert.deepEqual(snapshot.readyNodes, []);
   });
 
   it("projects issue slots, routes, titles, and same-route serialization chains with paths", () => {

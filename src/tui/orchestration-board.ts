@@ -4,7 +4,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { OrchestrationEvent, OrchestrationIssueSlots, OrchestrationNode, OrchestrationRoute, OrchestrationSnapshot } from "../workflows/orchestrate/events.js";
 import type { ScheduledStatus } from "../workflows/orchestrate/scheduler.js";
-import { renderSerializationLines, renderWaitReason } from "../workflows/orchestrate/view-model.js";
+import { isOrchestrationTerminalStatus, renderSerializationLines, renderWaitReason } from "../workflows/orchestrate/view-model.js";
 
 export const FORGEDOCK_ORCHESTRATION_WIDGET_KEY = "forgedock-orchestration-board";
 
@@ -136,11 +136,14 @@ export class OrchestrationBoardController {
     if (this.disposed) return;
     const previous = this.records.get(event.orchestrationId);
     if (previous && event.at < previous.updatedAt) return;
+    const projectedSnapshot = previous && event.at === previous.updatedAt
+      ? preserveProjectedInvalidTerminal(previous.snapshot, event.snapshot)
+      : event.snapshot;
     const record: BoardRecord = {
       orchestrationId: event.orchestrationId,
-      phase: event.snapshot.orchestrationStatus === "cancelled" ? "cancelled" : "active",
+      phase: projectedSnapshot.orchestrationStatus === "cancelled" ? "cancelled" : "active",
       invocationLabel: previous?.invocationLabel ?? invocationLabel,
-      snapshot: event.snapshot,
+      snapshot: projectedSnapshot,
       ...(previous?.repository !== undefined ? { repository: previous.repository } : repository !== undefined ? { repository } : {}),
       ...(previous?.summary !== undefined ? { summary: previous.summary } : {}),
       updatedAt: event.at,
@@ -242,10 +245,15 @@ export class OrchestrationBoardController {
       .slice(0, MAX_DAG_ROWS);
     for (const record of records) {
       const completed = record.snapshot.nodes.filter((node) => node.status === "completed").length;
-      const terminal = record.snapshot.nodes.filter((node) => ["completed", "skipped", "failed", "blocked", "invalid"].includes(node.status)).length;
+      const terminal = record.snapshot.nodes.filter((node) => isOrchestrationTerminalStatus(node.status)).length;
       const active = record.snapshot.nodes.filter((node) => node.status === "running").length;
       const total = record.snapshot.nodes.length;
-      const progress = record.phase === "completed" ? `${completed}/${total} complete` : record.phase === "cancelled" ? `${completed}/${total} complete · stopped` : `${terminal}/${total} terminal`;
+      const hasNonDeliveryTerminal = terminal > completed;
+      const progress = record.phase === "completed" && !hasNonDeliveryTerminal
+        ? `${completed}/${total} complete`
+        : record.phase === "cancelled"
+          ? `${completed}/${total} complete · stopped`
+          : `${terminal}/${total} terminal`;
       lines.push(truncateToWidth(`${phaseGlyph(record.phase, theme)} ${record.orchestrationId} · ${record.phase} · ${progress}${active ? ` · ${active} active` : ""}`, width));
       lines.push(truncateToWidth(`  ${formatOrchestrationIssueSlots(record.snapshot.issueSlots, selectedIssueCount(record.snapshot), undefined)}`, width));
       for (const node of record.snapshot.nodes) lines.push(truncateToWidth(`  ${renderNodeRow(node, theme)}`, width));
@@ -357,6 +365,29 @@ function renderNodeRow(node: OrchestrationNode, theme: Theme): string {
   const wait = node.waitReason ? ` · wait=${renderWaitReason(node.waitReason)}` : "";
   const error = node.error ? ` · ${safeInline(node.error)}` : "";
   return `${statusGlyph(node.status, theme)} #${node.issue} ${node.status}${members}${title}${dependencies}${route}${wait}${error}`;
+}
+
+function preserveProjectedInvalidTerminal(
+  previous: OrchestrationSnapshot,
+  incoming: OrchestrationSnapshot,
+): OrchestrationSnapshot {
+  const previousInvalid = new Map<string, OrchestrationNode>(previous.nodes
+    .filter((node) => node.status === "invalid")
+    .map((node): [string, OrchestrationNode] => [node.id, node]));
+  const regressed = new Set(incoming.nodes
+    .filter((node) => {
+      const prior = previousInvalid.get(node.id);
+      return prior !== undefined && (node.status === "queued" || node.status === "running");
+    })
+    .map((node) => node.id));
+  if (!regressed.size) return incoming;
+
+  return {
+    ...incoming,
+    nodes: incoming.nodes.map((node) => regressed.has(node.id) ? previousInvalid.get(node.id)! : node),
+    readyNodes: incoming.readyNodes.filter((id) => !regressed.has(id)),
+    invalidNodes: [...new Set([...incoming.invalidNodes, ...regressed])],
+  };
 }
 
 function selectedIssueCount(snapshot: OrchestrationSnapshot): number {

@@ -5,6 +5,15 @@ import type { Lease } from "../../core/ports/lease.js";
 import { scheduledWorkItemIssueSlots, type ClaimSerializationEdge, type ScheduledWorkItem, type ScheduleResult, type ScheduledStatus, type WaitReason } from "./scheduler.js";
 import type { OrchestrationNode, OrchestrationRoute, OrchestrationSerializationChain, OrchestrationSerializationEdge, OrchestrationSnapshot } from "./events.js";
 
+/** Terminal for orchestration projection/progress, but not semantic dependency success. */
+export function isOrchestrationTerminalStatus(status: ScheduledStatus | undefined): boolean {
+  return status === "completed"
+    || status === "failed"
+    || status === "blocked"
+    || status === "skipped"
+    || status === "invalid";
+}
+
 export function buildOrchestrationSnapshot(input: {
   orchestrationId: string;
   orchestrationStatus?: OrchestrationSnapshot["orchestrationStatus"];
@@ -48,14 +57,9 @@ export function buildOrchestrationSnapshot(input: {
   for (const edge of input.serializationEdges ?? []) {
     appendAdjacency(serializationPredecessors, edge.successor, edge.predecessor);
   }
-  const isTerminal = (value: ScheduledStatus | undefined): boolean => value === "completed"
-    || value === "failed"
-    || value === "blocked"
-    || value === "skipped"
-    || value === "invalid";
   const readyNodes = nodes.filter((node) => node.status === "queued"
     && node.dependencies.every((dependency) => status.get(dependency) === "completed")
-    && (serializationPredecessors.get(node.id) ?? []).every((predecessor) => isTerminal(status.get(predecessor)))).map((node) => node.id);
+    && (serializationPredecessors.get(node.id) ?? []).every((predecessor) => isOrchestrationTerminalStatus(status.get(predecessor)))).map((node) => node.id);
   const selectedIssueNumbers = normalizeSelectedIssues(input.selectedIssueNumbers
     ?? nodes.flatMap((node) => node.memberIssues?.length ? [...node.memberIssues] : [node.issue]));
   const ready = new Set(readyNodes);

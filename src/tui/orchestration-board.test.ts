@@ -14,7 +14,7 @@ const theme = {
   bold: (text: string) => text,
 } as any;
 
-function snapshot(orchestrationId: string, issue: number, status: "queued" | "running" | "completed" | "blocked", updatedAt: string) {
+function snapshot(orchestrationId: string, issue: number, status: "queued" | "running" | "completed" | "blocked" | "failed" | "skipped" | "invalid", updatedAt: string) {
   return {
     orchestrationId,
     nodes: [{
@@ -27,8 +27,8 @@ function snapshot(orchestrationId: string, issue: number, status: "queued" | "ru
       ...(status === "blocked" ? { error: "predecessor failed" } : {}),
     }],
     readyNodes: status === "queued" ? [`issue-${issue}`] : [],
-    blockedNodes: status === "blocked" ? [`issue-${issue}`] : [],
-    invalidNodes: [],
+    blockedNodes: ["blocked", "failed", "skipped"].includes(status) ? [`issue-${issue}`] : [],
+    invalidNodes: status === "invalid" ? [`issue-${issue}`] : [],
     suspendedNodes: [],
     activeLeases: [],
     remediationCheckpoints: [],
@@ -85,6 +85,76 @@ test("board registry renders concurrent DAGs without overwriting either snapshot
   }, "/orchestrate #68", "owner/repo");
   assert.equal(renderRequests, requestsBeforeLateEvent);
   assert.equal(widgets.has(FORGEDOCK_ORCHESTRATION_WIDGET_KEY), false);
+});
+
+test("completed persisted invalid DAGs retain invalid metadata and terminal progress (invariant:matrix-adapter-lifecycle-30a2b50d1812; invariant:matrix-terminal-metadata-e15b5fbd4dc0)", () => {
+  const widgets = new Map<string, unknown>();
+  const board = new OrchestrationBoardController();
+  board.attach({ hasUI: true, ui: { setWidget: (key: string, value: unknown) => value === undefined ? widgets.delete(key) : widgets.set(key, value) } } as any);
+  const persisted = snapshot("dag_invalid", 566, "invalid", "2030-01-01T00:00:04.000Z");
+  board.complete("dag_invalid", "completed", persisted, "/orchestrate #566", "owner/repo");
+  const factory = widgets.get(FORGEDOCK_ORCHESTRATION_WIDGET_KEY) as (tui: { requestRender(): void }, theme: unknown) => { render(width: number): string[] };
+  const rendered = factory({ requestRender: () => undefined }, theme).render(160).join("\n");
+  assert.match(rendered, /dag_invalid · completed · 1\/1 terminal/);
+  assert.doesNotMatch(rendered, /0\/1 complete/);
+  assert.match(rendered, /! #566 invalid/);
+  assert.deepEqual(persisted.invalidNodes, ["issue-566"]);
+  board.dispose();
+});
+
+test("live invalid projection survives stale and equal-time activity events (invariant:matrix-adapter-lifecycle-4fea9a5e77c3; invariant:matrix-terminal-metadata-490e3ad7d7e1)", () => {
+  const widgets = new Map<string, unknown>();
+  let renderRequests = 0;
+  const board = new OrchestrationBoardController();
+  board.attach({ hasUI: true, ui: { setWidget: (key: string, value: unknown) => value === undefined ? widgets.delete(key) : widgets.set(key, value) } } as any);
+  board.updateEvent({ name: "queued", orchestrationId: "dag_live_invalid", at: "2030-01-01T00:00:01.000Z", snapshot: snapshot("dag_live_invalid", 581, "queued", "2030-01-01T00:00:01.000Z") }, "/orchestrate #581");
+  const factory = widgets.get(FORGEDOCK_ORCHESTRATION_WIDGET_KEY) as (tui: { requestRender(): void }, theme: unknown) => { render(width: number): string[] };
+  const component = factory({ requestRender: () => { renderRequests++; } }, theme);
+  board.updateEvent({ name: "started", orchestrationId: "dag_live_invalid", at: "2030-01-01T00:00:02.000Z", snapshot: snapshot("dag_live_invalid", 581, "running", "2030-01-01T00:00:02.000Z") }, "/orchestrate #581");
+  board.updateEvent({ name: "invalid", orchestrationId: "dag_live_invalid", at: "2030-01-01T00:00:03.000Z", snapshot: snapshot("dag_live_invalid", 581, "invalid", "2030-01-01T00:00:03.000Z") }, "/orchestrate #581");
+  const requestsAfterInvalid = renderRequests;
+  board.updateEvent({ name: "queued", orchestrationId: "dag_live_invalid", at: "2030-01-01T00:00:03.000Z", snapshot: snapshot("dag_live_invalid", 581, "queued", "2030-01-01T00:00:03.000Z") }, "/orchestrate #581");
+  board.updateEvent({ name: "started", orchestrationId: "dag_live_invalid", at: "2030-01-01T00:00:02.000Z", snapshot: snapshot("dag_live_invalid", 581, "running", "2030-01-01T00:00:02.000Z") }, "/orchestrate #581");
+  assert.equal(renderRequests, requestsAfterInvalid);
+  assert.match(component.render(160).join("\n"), /! #581 invalid/);
+  assert.doesNotMatch(component.render(160).join("\n"), /#581 (queued|running)/);
+  board.dispose();
+});
+
+test("board keeps the terminal status matrix distinct and counts each terminal once (invariant:matrix-adapter-lifecycle-001b10e09501; invariant:matrix-terminal-metadata-fed2f01d6d2e)", () => {
+  const widgets = new Map<string, unknown>();
+  const board = new OrchestrationBoardController();
+  board.attach({ hasUI: true, ui: { setWidget: (key: string, value: unknown) => value === undefined ? widgets.delete(key) : widgets.set(key, value) } } as any);
+  const statuses = ["completed", "failed", "blocked", "skipped", "invalid"] as const;
+  const nodes = statuses.map((status, index) => ({
+    id: `matrix-${status}`,
+    issue: index + 1,
+    memberIssues: [index + 1],
+    status,
+    dependencies: [],
+    claims: [],
+  }));
+  const matrix = {
+    orchestrationId: "dag_matrix",
+    nodes,
+    readyNodes: [],
+    blockedNodes: ["matrix-failed", "matrix-blocked", "matrix-skipped"],
+    invalidNodes: ["matrix-invalid"],
+    suspendedNodes: [],
+    activeLeases: [],
+    remediationCheckpoints: [],
+    updatedAt: "2030-01-01T00:00:05.000Z",
+  };
+  board.complete("dag_matrix", "completed", matrix, "/orchestrate matrix");
+  const factory = widgets.get(FORGEDOCK_ORCHESTRATION_WIDGET_KEY) as (tui: { requestRender(): void }, theme: unknown) => { render(width: number): string[] };
+  const rendered = factory({ requestRender: () => undefined }, theme).render(240).join("\n");
+  assert.match(rendered, /dag_matrix · completed · 5\/5 terminal/);
+  assert.match(rendered, /✓ #1 completed/);
+  assert.match(rendered, /✕ #2 failed/);
+  assert.match(rendered, /■ #3 blocked/);
+  assert.match(rendered, /↷ #4 skipped/);
+  assert.match(rendered, /! #5 invalid/);
+  board.dispose();
 });
 
 test("board renders cancelled DAGs as stopped without active attention", () => {
