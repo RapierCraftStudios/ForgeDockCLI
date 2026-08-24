@@ -20,12 +20,26 @@ export type IssueLane =
   };
 
 export interface ParentRemediationTarget {
+  /** Immutable source-lineage proof carried from retained-route admission. */
+  sourceRepo?: string;
   parentRunId: string;
+  checkpointKey?: string;
   parentIssue: number;
   parentPullRequest: number;
   parentBranch: string;
   parentHeadSha: string;
+  sourceBaseBranch?: string;
+  sourceBaseSha?: string;
+  sourceBuildResultArtifactId?: string;
+  sourceVerdictArtifactId?: string;
+  sourceProjectionArtifactId?: string;
+  sourceSnapshotReviewedSha?: string;
+  sourceReviewFindingMarker?: string;
+  sourceReviewFindingSemanticMarker?: string;
+  remediationMarker?: string;
   findingId: string;
+  findingRootId?: string;
+  findingCriterion?: string;
   findingLocation?: string;
   remediationDepth: number;
   maxRemediationDepth: number;
@@ -291,6 +305,12 @@ export function assertParentRemediationTarget(target: ParentRemediationTarget): 
   assertBranchName(target.parentBranch, "parent remediation branch");
   if (!/^[0-9a-f]{7,64}$/i.test(target.parentHeadSha)) throw new Error("Parent remediation target requires a captured head SHA");
   if (!target.findingId.trim()) throw new Error("Parent remediation target requires a finding ID");
+  if (!target.sourceRepo || !target.sourceBaseBranch || !target.sourceBaseSha || !target.sourceBuildResultArtifactId
+    || !target.checkpointKey || !target.sourceVerdictArtifactId || !target.sourceProjectionArtifactId || !target.sourceSnapshotReviewedSha
+    || !target.sourceReviewFindingMarker || !target.sourceReviewFindingSemanticMarker || !target.remediationMarker
+    || !target.findingRootId || !target.findingCriterion) {
+    throw new Error("Parent remediation target requires complete immutable source lineage");
+  }
   if (target.findingLocation !== undefined && (!target.findingLocation.trim() || target.findingLocation.startsWith("/") || target.findingLocation.includes(".."))) {
     throw new Error("Parent remediation target requires a repository-relative finding location");
   }

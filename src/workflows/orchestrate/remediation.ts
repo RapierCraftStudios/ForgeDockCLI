@@ -8,6 +8,7 @@ import type { ArtifactRepository, RunRepository } from "../../core/ports/reposit
 import { transition, type RunState } from "../../core/state/machine.js";
 import type { CheckResult, VerificationCommand, VerificationRunner } from "../../core/ports/verification.js";
 import { canonicalizeConcreteScopePaths } from "../../runtime/agent-runtime.js";
+import { canonicalReviewFindingMarkers } from "../../core/remediation-identity.js";
 import { repositoryPathFromLocation } from "../review-pr/scope.js";
 import { uncoveredVerificationCommands } from "../work-on/verify.js";
 
@@ -25,6 +26,17 @@ export interface RemediationFindingInput {
   location?: string;
   remediation: string;
   acceptanceCriterion?: string;
+  rootId?: string;
+  normalizedRoot?: string;
+  causalRoot?: string;
+  sourceSnapshot?: {
+    reviewedHeadSha: string;
+    path: string;
+    excerpt?: string;
+    digest?: string;
+    symbol?: string;
+  };
+  matchedAcceptanceCriteria?: readonly string[];
 }
 
 export interface RemediationBlockedInput {
@@ -32,6 +44,9 @@ export interface RemediationBlockedInput {
   parentPullRequest: PullRequestSnapshot;
   packetArtifact: DurableArtifact<"BuildPacket">;
   verdictArtifact: DurableArtifact<"ReviewVerdict">;
+  /** The exact BuildResult and completed projection that authorize this checkpoint. */
+  buildResultArtifact?: DurableArtifact<"BuildResult">;
+  projectionArtifact?: DurableArtifact<"ReviewFindingProjection">;
   reason: RemediationBlockedPayload["reason"];
   findings: readonly RemediationFindingInput[];
   remediationDepth?: number;
@@ -63,13 +78,20 @@ export class RemediationSupervisor {
   ) {}
 
   async begin(input: RemediationBlockedInput): Promise<RemediationCheckpointResult> {
+    if (!input.buildResultArtifact || !input.projectionArtifact) {
+      throw new Error("Remediation checkpoint requires an exact BuildResult and completed ReviewFindingProjection");
+    }
+    const buildResultArtifact = input.buildResultArtifact;
+    const projectionArtifact = input.projectionArtifact;
     const depth = input.remediationDepth ?? 0;
     const maxDepth = input.maxRemediationDepth ?? this.limits.maxDepth ?? DEFAULT_REMEDIATION_LIMITS.maxDepth;
     const maxChildren = input.maxRemediationChildren ?? this.limits.maxChildren ?? DEFAULT_REMEDIATION_LIMITS.maxChildren;
     const actionable = actionableFindings(input.findings);
     const eligible = actionable.slice(0, maxChildren);
-    const authorizedInput = {
+    const authorizedInput: RemediationBlockedInput = {
       ...input,
+      buildResultArtifact,
+      projectionArtifact,
       findings: eligible,
       remediationDepth: depth,
       maxRemediationDepth: maxDepth,
@@ -83,6 +105,7 @@ export class RemediationSupervisor {
       await this.dependencies.artifacts.append(terminal);
       return { checkpoint: terminal, childIssues: [] };
     }
+    await assertRemediationSourceStillCurrent(this.dependencies.host, input.parentRun.subject.repo, input.parentPullRequest, buildResultArtifact, projectionArtifact);
     const awaiting = createCheckpoint(input, base);
     await this.dependencies.artifacts.append(awaiting);
     if (!this.dependencies.host.materializeRemediationChildren) throw new Error("ForgeHost does not support recursive remediation child materialization");
@@ -127,6 +150,11 @@ export class RemediationSupervisor {
       throw new Error("Remediation recovery pull request identity does not match the persisted checkpoint");
     }
     if (!this.dependencies.host.materializeRemediationChildren) throw new Error("ForgeHost does not support recursive remediation child materialization");
+    const sourceArtifacts = await this.dependencies.artifacts.list(input.checkpoint.subject);
+    const buildResult = sourceArtifacts.find((artifact): artifact is DurableArtifact<"BuildResult"> => artifact.kind === "BuildResult" && artifact.id === awaiting.buildResultArtifactId);
+    const projection = sourceArtifacts.find((artifact): artifact is DurableArtifact<"ReviewFindingProjection"> => artifact.kind === "ReviewFindingProjection" && artifact.id === awaiting.projectionArtifactId);
+    if (!buildResult || !projection) throw new Error("Remediation recovery references missing source artifacts");
+    await assertRemediationSourceStillCurrent(this.dependencies.host, input.checkpoint.subject.repo, input.parentPullRequest, buildResult, projection);
     const findings = awaiting.findings.map((finding) => {
       if (!finding.location || !finding.acceptanceCriterion) {
         throw new Error(`Remediation checkpoint ${awaiting.checkpointKey} contains an ineligible finding`);
@@ -382,11 +410,18 @@ function remediationPayload(
     baseBranch: input.parentPullRequest.baseBranch,
     packetArtifactId: input.packetArtifact.id,
     verdictArtifactId: input.verdictArtifact.id,
+    buildResultArtifactId: input.buildResultArtifact?.id ?? (() => { throw new Error("Remediation checkpoint has no BuildResult authority"); })(),
+    projectionArtifactId: input.projectionArtifact?.id ?? (() => { throw new Error("Remediation checkpoint has no projection authority"); })(),
     reason: input.reason,
     findings: input.findings.slice(0, 32).map((finding) => ({
       id: finding.id, severity: finding.severity, title: finding.title, evidence: finding.evidence.slice(0, 8_000),
       ...(finding.location ? { location: finding.location } : {}), remediation: finding.remediation.slice(0, 4_000),
       ...(finding.acceptanceCriterion ? { acceptanceCriterion: finding.acceptanceCriterion } : {}),
+      ...(finding.rootId ? { rootId: finding.rootId } : {}),
+      ...(finding.normalizedRoot ? { normalizedRoot: finding.normalizedRoot } : {}),
+      ...(finding.causalRoot ? { causalRoot: finding.causalRoot } : {}),
+      ...(finding.sourceSnapshot ? { sourceSnapshot: finding.sourceSnapshot } : {}),
+      ...(finding.matchedAcceptanceCriteria?.length ? { matchedAcceptanceCriteria: [...finding.matchedAcceptanceCriteria] } : {}),
     })),
     childIssues: [...childIssues],
     childRunIds: [...childRunIds],
@@ -426,6 +461,36 @@ function createCheckpointFromExisting(
     producer: existing.producer,
     payload,
   }, { id: `rem_${payload.checkpointKey}_${payload.checkpointSequence}` });
+}
+
+async function assertRemediationSourceStillCurrent(
+  host: ForgeHost,
+  repo: string,
+  expected: PullRequestSnapshot,
+  buildResult: DurableArtifact<"BuildResult">,
+  projection: DurableArtifact<"ReviewFindingProjection">,
+): Promise<void> {
+  if (!host.getPullRequest || !host.getBranchHead) throw new Error("Remediation materialization requires authoritative source readers");
+  const live = await host.getPullRequest(repo, expected.number);
+  if (live.repo.trim().toLowerCase() !== repo.trim().toLowerCase() || live.number !== expected.number || live.state !== "OPEN"
+    || live.headSha.toLowerCase() !== expected.headSha.toLowerCase() || live.headBranch !== expected.headBranch || live.baseBranch !== expected.baseBranch) {
+    throw new Error(`Remediation source PR #${expected.number} changed before child materialization`);
+  }
+  if (!buildResult.payload.baseSha || buildResult.payload.headSha.toLowerCase() !== expected.headSha.toLowerCase()
+    || buildResult.payload.branch !== expected.headBranch || buildResult.payload.targetBranch !== expected.baseBranch
+    || (await host.getBranchHead(repo, expected.baseBranch)).toLowerCase() !== buildResult.payload.baseSha.toLowerCase()
+    || projection.payload.status !== "completed" || projection.payload.pullRequest !== expected.number
+    || projection.payload.headSha.toLowerCase() !== expected.headSha.toLowerCase()
+    || projection.payload.headBranch !== expected.headBranch || projection.payload.baseBranch !== expected.baseBranch) {
+    throw new Error("Remediation source artifact lineage changed before child materialization");
+  }
+  for (const entry of projection.payload.projections) {
+    if (entry.status !== "materialized" && entry.status !== "adopted") continue;
+    const finding = projection.payload.findings.find((candidate) => candidate.id === entry.findingId);
+    if (!finding || entry.marker !== canonicalReviewFindingMarkers(repo, expected.number, finding)[0]) {
+      throw new Error(`Remediation source projection marker is not canonical for ${entry.findingId}`);
+    }
+  }
 }
 
 async function nextCheckpointSequence(artifacts: ArtifactRepository, subject: { repo: string; issue?: number }, key: string): Promise<number> {

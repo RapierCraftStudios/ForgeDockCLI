@@ -468,7 +468,7 @@ async function workOn(
   const runId = `run_${crypto.randomUUID()}`;
   const subject = { repo: issue.repo, issue: issue.number };
   let authoritativeArtifacts = new GitHubArtifactRepository(github);
-  const parentRemediation = await resolveParentRemediationTargetFromIssue(issue, authoritativeArtifacts);
+  const parentRemediation = await resolveParentRemediationTargetFromIssue(issue, authoritativeArtifacts, github);
   const deliveryTargetBranch = parentRemediation?.parentBranch ?? lane.targetBranch;
   const baseRef = `origin/${deliveryTargetBranch}`;
   const verificationPolicy = argv.includes("--resume") ? undefined : discoverVerificationCommands(process.cwd(), baseRef);
@@ -2575,7 +2575,7 @@ async function orchestrate(argv: string[], signal?: AbortSignal): Promise<void> 
           return;
         }
         const { issue, lane } = requiredOrchestrationRoute(routedIssues, { repository: itemRepository, issue: item.issue });
-        const parentRemediation = await resolveParentRemediationTargetFromIssue(issue, artifacts);
+        const parentRemediation = await resolveParentRemediationTargetFromIssue(issue, artifacts, github);
         const batchMembers = item.memberIssues ? [...item.memberIssues] : [];
         const batchMemberContracts = batchMembers.length ? parseBatchContract(issue.body) : [];
         const intent = createArtifact({
