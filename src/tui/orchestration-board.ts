@@ -245,7 +245,11 @@ export class OrchestrationBoardController {
       const terminal = record.snapshot.nodes.filter((node) => ["completed", "skipped", "failed", "blocked", "invalid"].includes(node.status)).length;
       const active = record.snapshot.nodes.filter((node) => node.status === "running").length;
       const total = record.snapshot.nodes.length;
-      const progress = record.phase === "completed" ? `${completed}/${total} complete` : record.phase === "cancelled" ? `${completed}/${total} complete · stopped` : `${terminal}/${total} terminal`;
+      const allCompleted = record.snapshot.nodes.every((node) => node.status === "completed");
+      const stopped = record.phase === "cancelled" ? " · stopped" : "";
+      const progress = allCompleted
+        ? `${completed}/${total} complete${stopped}`
+        : `${terminal}/${total} terminal${stopped}`;
       lines.push(truncateToWidth(`${phaseGlyph(record.phase, theme)} ${record.orchestrationId} · ${record.phase} · ${progress}${active ? ` · ${active} active` : ""}`, width));
       lines.push(truncateToWidth(`  ${formatOrchestrationIssueSlots(record.snapshot.issueSlots, selectedIssueCount(record.snapshot), undefined)}`, width));
       for (const node of record.snapshot.nodes) lines.push(truncateToWidth(`  ${renderNodeRow(node, theme)}`, width));
