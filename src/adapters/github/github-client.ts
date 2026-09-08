@@ -43,6 +43,8 @@ const MAX_GITHUB_ISSUE_BODY_CHARS = 65_000;
 const MAX_GITHUB_PULL_REQUEST_FILES = 3_000;
 const MAX_FALLBACK_PATCH_CHARS = 1_500_000;
 const MAX_FALLBACK_PATCH_CHARS_PER_FILE = 16_384;
+const SHADOW_MIGRATION_CHECK_NAME = "Shadow-Database Migration Dry Run";
+const SKIPPED_CHECK_STATES = new Set(["SKIPPED", "SKIPPING"]);
 
 const REVIEW_FINDING_LABELS = [
   { name: "review-finding", color: "D93F0B", description: "Defect or improvement found during independent PR review" },
@@ -136,6 +138,29 @@ function pullRequestDiffPath(value: unknown, field: string): string {
 
 function pullRequestFileCount(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function isMigrationPath(path: string): boolean {
+  return path === "infra/migrations" || path.startsWith("infra/migrations/");
+}
+
+function isShadowMigrationCheck(name: string): boolean {
+  return name === SHADOW_MIGRATION_CHECK_NAME;
+}
+
+function isSkippedCheckState(value: unknown): boolean {
+  return typeof value === "string" && SKIPPED_CHECK_STATES.has(value.toUpperCase());
+}
+
+function containsSkippedShadowCheck(result: string): boolean {
+  const parsed: unknown = JSON.parse(result);
+  if (!Array.isArray(parsed)) throw new Error("GitHub checks response is not an array");
+  return parsed.some((entry: unknown) => {
+    if (!entry || typeof entry !== "object") throw new Error("GitHub checks response contains an invalid entry");
+    const check = entry as { name?: unknown; state?: unknown };
+    const name = typeof check.name === "string" ? check.name.trim() : "";
+    return isShadowMigrationCheck(name) && isSkippedCheckState(check.state);
+  });
 }
 
 export function renderPaginatedPullRequestDiff(raw: string): string {
@@ -963,6 +988,40 @@ export class GitHubClient implements ForgeHost {
     return pullRequestSnapshotFromGitHub(repo, number, JSON.parse(result));
   }
 
+  private async pullRequestHasMigrationChanges(repo: string, number: number): Promise<boolean> {
+    const raw = await this.gh([
+      "api", `repos/${repo}/pulls/${number}/files?per_page=100`, "--paginate", "--slurp",
+    ]);
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(raw);
+    } catch (error) {
+      throw new Error(`GitHub returned malformed changed-file data for PR #${number}`, { cause: error });
+    }
+    if (!Array.isArray(decoded) || decoded.some((page) => !Array.isArray(page))) {
+      throw new Error(`GitHub returned an invalid changed-file response for PR #${number}`);
+    }
+    const files = decoded.flat();
+    if (!files.length) throw new Error(`GitHub returned no changed files while proving PR #${number} has no migrations`);
+    if (files.length >= MAX_GITHUB_PULL_REQUEST_FILES) {
+      throw new Error(`PR #${number} has at least ${MAX_GITHUB_PULL_REQUEST_FILES} changed files; GitHub cannot prove the migration-free file set`);
+    }
+
+    let hasMigrationChanges = false;
+    for (const value of files) {
+      if (!value || typeof value !== "object") throw new Error(`GitHub returned an invalid changed-file entry for PR #${number}`);
+      const file = value as GitHubPullRequestFile;
+      const filename = pullRequestDiffPath(file.filename, "filename");
+      const previousFilename = file.previous_filename === undefined || file.previous_filename === null
+        ? undefined
+        : pullRequestDiffPath(file.previous_filename, "previous_filename");
+      if (isMigrationPath(filename) || (previousFilename !== undefined && isMigrationPath(previousFilename))) {
+        hasMigrationChanges = true;
+      }
+    }
+    return hasMigrationChanges;
+  }
+
   async getPullRequestMergeGate(repo: string, number: number, expectedHeadSha: string, expectedBaseBranch: string): Promise<PullRequestMergeGate> {
     const pullRequest = await this.getPullRequest(repo, number);
     if (pullRequest.headSha !== expectedHeadSha) {
@@ -990,7 +1049,7 @@ export class GitHubClient implements ForgeHost {
       mergeable = false;
     }
 
-    const parseChecks = (result: string, omitInapplicable = false): PullRequestMergeGate["requiredChecks"] => {
+    const parseChecks = (result: string, omitInapplicable = false, acceptSkippedShadow = false): PullRequestMergeGate["requiredChecks"] => {
       const parsed: unknown = JSON.parse(result);
       if (!Array.isArray(parsed)) throw new Error("GitHub checks response is not an array");
       // A push run and a pull_request run can publish the same check name at
@@ -1002,13 +1061,19 @@ export class GitHubClient implements ForgeHost {
         const name = typeof check.name === "string" ? check.name.trim() : "";
         const state = typeof check.state === "string" ? check.state : undefined;
         const detailsUrl = typeof check.link === "string" ? check.link : undefined;
-        if (omitInapplicable && ["SKIPPED", "NEUTRAL"].includes(String(state ?? "").toUpperCase())) return [];
+        const isSkippedShadow = isShadowMigrationCheck(name) && isSkippedCheckState(state);
+        if (omitInapplicable && !isSkippedShadow && ["SKIPPED", "SKIPPING", "NEUTRAL"].includes(String(state ?? "").toUpperCase())) return [];
+        const normalizedState = isSkippedShadow && acceptSkippedShadow ? "SUCCESS" : state;
         return [{
           name: name || "unnamed-required-check",
-          state: mergeCheckState(state),
+          state: mergeCheckState(normalizedState),
           ...(detailsUrl ? { detailsUrl } : {}),
         }];
       });
+    };
+    const acceptSkippedShadow = async (result: string): Promise<boolean> => {
+      if (!containsSkippedShadowCheck(result)) return false;
+      return !(await this.pullRequestHasMigrationChanges(repo, number));
     };
     let requiredChecks: PullRequestMergeGate["requiredChecks"] = [];
     try {
@@ -1016,7 +1081,7 @@ export class GitHubClient implements ForgeHost {
         "pr", "checks", String(number), "--repo", repo, "--required",
         "--json", "name,state,link,completedAt,startedAt",
       ]);
-      requiredChecks = parseChecks(result);
+      requiredChecks = parseChecks(result, false, await acceptSkippedShadow(result));
     } catch (error) {
       if (error instanceof Error && /no required checks reported/i.test(error.message)) {
         try {
@@ -1027,7 +1092,7 @@ export class GitHubClient implements ForgeHost {
             "pr", "checks", String(number), "--repo", repo,
             "--json", "name,state,link,completedAt,startedAt",
           ]);
-          requiredChecks = parseChecks(result, true);
+          requiredChecks = parseChecks(result, true, await acceptSkippedShadow(result));
         } catch (fallbackError) {
           requiredChecks = [{
             name: "required-checks-query",

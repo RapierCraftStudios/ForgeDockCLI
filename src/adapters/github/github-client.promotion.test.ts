@@ -40,6 +40,71 @@ describe("GitHub promotion transport", () => {
     assert.deepEqual(gate.requiredChecks.map((check) => [check.name, check.state]), [["Unit Tests", "passed"], ["Docs", "pending"]]);
   });
 
+  it("accepts a skipped shadow migration check only after proving no migrations changed", async () => {
+    for (const reported of ["SKIPPED", "SKIPPING"] as const) {
+      const client = new GitHubClient();
+      const calls: string[][] = [];
+      Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+        calls.push(args);
+        if (args[0] === "pr" && args[1] === "view" && args.join(" ").includes("mergeable")) return JSON.stringify({ mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
+        if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ number: 8, title: pr.title, body: pr.body, url: pr.url, state: "OPEN", headRefOid: sha, headRefName: "staging", baseRefName: "main" });
+        if (args[0] === "pr" && args[1] === "checks") return JSON.stringify([
+          { name: "CI", state: "SUCCESS", link: "https://github.test/actions/runs/ci" },
+          { name: "Shadow-Database Migration Dry Run", state: reported, link: "https://github.test/actions/runs/shadow" },
+        ]);
+        if (args[0] === "api" && args[1] === "repos/a/b/pulls/8/files?per_page=100") return JSON.stringify([[{ filename: "src/a.ts", previous_filename: null }]]);
+        throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+      } });
+
+      const gate = await client.getPullRequestMergeGate("a/b", 8, sha, "main");
+      assert.deepEqual(gate.requiredChecks.map((check) => [check.name, check.state]), [
+        ["CI", "passed"],
+        ["Shadow-Database Migration Dry Run", "passed"],
+      ]);
+      assert.ok(calls.some((args) => args[0] === "api" && args[1] === "repos/a/b/pulls/8/files?per_page=100"));
+    }
+  });
+
+  it("keeps a skipped shadow migration check blocking when migrations changed", async () => {
+    const client = new GitHubClient();
+    const calls: string[][] = [];
+    Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === "pr" && args[1] === "view" && args.join(" ").includes("mergeable")) return JSON.stringify({ mergeable: "MERGEABLE", mergeStateStatus: "CLEAN" });
+      if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ number: 8, title: pr.title, body: pr.body, url: pr.url, state: "OPEN", headRefOid: sha, headRefName: "staging", baseRefName: "main" });
+      if (args[0] === "pr" && args[1] === "checks") return JSON.stringify([{ name: "Shadow-Database Migration Dry Run", state: "SKIPPED", link: "https://github.test/actions/runs/shadow" }]);
+      if (args[0] === "api" && args[1] === "repos/a/b/pulls/8/files?per_page=100") return JSON.stringify([[{ filename: "infra/migrations/0400_new.sql" }]]);
+      throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+    } });
+
+    const gate = await client.getPullRequestMergeGate("a/b", 8, sha, "main");
+    assert.equal(gate.requiredChecks[0]?.state, "unavailable");
+    assert.ok(calls.some((args) => args[0] === "api" && args[1] === "repos/a/b/pulls/8/files?per_page=100"));
+  });
+
+  it("keeps failed, cancelled, and pending shadow checks blocking without migration proof", async () => {
+    const cases = [
+      ["FAILURE", "failed"],
+      ["CANCELLED", "cancelled"],
+      ["PENDING", "pending"],
+    ] as const;
+    for (const [reported, expected] of cases) {
+      const client = new GitHubClient();
+      const calls: string[][] = [];
+      Object.defineProperty(client, "gh", { value: async (args: string[]) => {
+        calls.push(args);
+        if (args[0] === "pr" && args[1] === "view" && args.join(" ").includes("mergeable")) return JSON.stringify({ mergeable: "MERGEABLE" });
+        if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ number: 8, title: pr.title, body: pr.body, url: pr.url, state: "OPEN", headRefOid: sha, headRefName: "staging", baseRefName: "main" });
+        if (args[0] === "pr" && args[1] === "checks") return JSON.stringify([{ name: "Shadow-Database Migration Dry Run", state: reported }]);
+        throw new Error(`Unexpected gh call: ${args.join(" ")}`);
+      } });
+
+      const gate = await client.getPullRequestMergeGate("a/b", 8, sha, "main");
+      assert.equal(gate.requiredChecks[0]?.state, expected, reported);
+      assert.equal(calls.some((args) => args[0] === "api" && args[1]?.includes("/pulls/8/files")), false, reported);
+    }
+  });
+
   it("does not merge when legacy CodeQL remains pending beside a passing default-setup replacement", async () => {
     const client = new GitHubClient();
     const calls: string[][] = [];
